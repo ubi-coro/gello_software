@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -109,15 +109,236 @@ class URRobot(Robot):
             self._free_drive = False
             self.robot.endFreedriveMode()
 
-    def get_observations(self) -> Dict[str, np.ndarray]:
+    def get_joint_torques(self) -> np.ndarray:
+        """Get the current joint torques of the robot.
+
+        Returns the torques of all joints, corrected by the torque needed to move
+        the robot itself (gravity, friction, etc.).
+
+        Returns:
+            np.ndarray: The joint torque vector in Nm [Base, Shoulder, Elbow, Wrist1, Wrist2, Wrist3]
+        """
+        return np.array(self.r_inter.getActualJointTorques())
+    
+    def get_ft_wrench(self) -> np.ndarray:
+        """Get the raw force and torque measurement from the UR's built-in F/T sensor.
+
+        Not compensated for forces and torques caused by the payload.
+
+        Returns:
+            np.ndarray: The raw wrench [fx, fy, fz, tx, ty, tz] in N and Nm.
+        """
+        return np.array(self.r_inter.getFtRawWrench())
+
+    def get_joint_torques_jacobian_calcualted(self) -> np.ndarray:
+        """Calculate joint torques from end-effector wrench using Jacobian transpose.
+
+        Uses the UR's built-in F/T sensor via getFtRawWrench() and computes:
+        τ = J^T * F_ee
+
+        Where:
+            τ = joint torques (6x1)
+            J = geometric Jacobian (6x6)
+            F_ee = end-effector wrench [fx, fy, fz, tx, ty, tz] (6x1)
+
+        Returns:
+            np.ndarray: Estimated joint torques in Nm (length 6)
+
+        Note:
+            The direct method `get_joint_torques()` is preferred as the UR controller
+            provides gravity/friction compensated torques directly from motor currents.
+        """
+        # Get current joint positions for Jacobian calculation
+        q = np.array(self.r_inter.getActualQ())
+
+        # UR5e DH parameters (standard/classical DH convention as per UR documentation)
+        # d: link offset along z, a: link length along x, alpha: link twist about x
+        d = [0.1625, 0, 0, 0.1333, 0.0997, 0.0996]  # meters
+        a = [0, -0.425, -0.3922, 0, 0, 0]  # meters
+        alpha = [np.pi / 2, 0, 0, np.pi / 2, -np.pi / 2, 0]  # radians
+
+        # Compute transformation matrices and Jacobian
+        # Standard DH: T_i = Rz(θ) * Tz(d) * Tx(a) * Rx(α)
+        # T_0_i: transformation from base to joint i
+        T = np.eye(4)
+        transforms = [T.copy()]
+
+        for i in range(6):
+            c = np.cos(q[i])
+            s = np.sin(q[i])
+            ca = np.cos(alpha[i])
+            sa = np.sin(alpha[i])
+
+            # Modified DH transformation matrix
+            T_i = np.array([
+                [c, -s * ca, s * sa, a[i] * c],
+                [s, c * ca, -c * sa, a[i] * s],
+                [0, sa, ca, d[i]],
+                [0, 0, 0, 1]
+            ])
+            T = T @ T_i
+            transforms.append(T.copy())
+
+        # End-effector position
+        p_ee = transforms[6][:3, 3]
+
+        # Build geometric Jacobian (in base frame)
+        J = np.zeros((6, 6))
+        for i in range(6):
+            # z-axis of joint i (rotation axis)
+            z_i = transforms[i][:3, 2]
+            # Position of joint i origin
+            p_i = transforms[i][:3, 3]
+
+            # Linear velocity contribution: z_i x (p_ee - p_i)
+            J[:3, i] = np.cross(z_i, p_ee - p_i)
+            # Angular velocity contribution: z_i
+            J[3:, i] = z_i
+
+        # Get end-effector wrench from UR's built-in F/T sensor
+        # F_ee = [fx, fy, fz, tx, ty, tz] - raw, not payload compensated
+        F_ee = self.get_ft_wrench()
+
+        # Calculate joint torques: τ = J^T * F_ee
+        joint_torques = J.T @ F_ee
+
+        return joint_torques
+    
+    def get_jacobian(
+        self, q: Optional[np.ndarray] = None, tcp: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """Get the Jacobian matrix from the UR controller.
+
+        Args:
+            q (np.ndarray, optional): Joint positions. Defaults to current pose.
+            tcp (np.ndarray, optional): TCP offset. Defaults to active TCP.
+
+        Returns:
+            np.ndarray: The 6x6 Jacobian matrix.
+        """
+        pos = q.tolist() if q is not None else []
+        tcp_offset = tcp.tolist() if tcp is not None else []
+        # getJacobian returns a flat list of 36 elements (6x6 matrix row-major)
+        jacobian_flat = self.r_inter.getJacobian(pos, tcp_offset)
+        return np.array(jacobian_flat).reshape(6, 6)
+
+    def get_joint_torques_jacobian(self) -> np.ndarray:
+        """Calculate joint torques from end-effector wrench using Jacobian transpose.
+
+        Uses the UR's built-in Jacobian via getJacobian() and F/T sensor via getFtRawWrench():
+        τ = J^T * F_ee
+
+        Where:
+            τ = joint torques (6x1)
+            J = geometric Jacobian from UR controller (6x6)
+            F_ee = end-effector wrench [fx, fy, fz, tx, ty, tz] (6x1)
+
+        Returns:
+            np.ndarray: Estimated joint torques in Nm (length 6)
+
+        Note:
+            The direct method `get_joint_torques()` is preferred as the UR controller
+            provides gravity/friction compensated torques directly from motor currents.
+        """
+        # Get Jacobian directly from UR controller (more accurate than manual DH calculation)
+        J = self.get_jacobian()
+
+        # Get end-effector wrench from UR's built-in F/T sensor
+        # F_ee = [fx, fy, fz, tx, ty, tz] - raw, not payload compensated
+        F_ee = self.get_ft_wrench()
+
+        # Calculate joint torques: τ = J^T * F_ee
+        joint_torques = J.T @ F_ee
+
+        return joint_torques
+
+    def command_joint_torques(
+        self, torques: np.ndarray, friction_comp: bool = True
+    ) -> None:
+        """Command joint torques using Direct Joint Torque Control.
+
+        This function must be called continuously at each robot time step (500Hz);
+        otherwise, the robot will return to position control mode.
+        The function always compensates for gravity internally.
+
+        Args:
+            torques (np.ndarray): Target joint torques in Nm (length 6).
+            friction_comp (bool): Enable internal friction compensation. Default is True.
+
+        Note:
+            - This is an advanced low-level function that bypasses compliance features.
+            - You are responsible for keeping the robot within safety limits.
+            - When returning to position control mode, use speedj() or stopj().
+        """
+        assert len(torques) == 6, "Torques must be a vector of length 6"
+        self.robot.directTorque(torques.tolist(), friction_comp)
+
+    def get_gripper_feedback(self) -> Dict[str, float]:
+        """Get gripper feedback for force-feedback teleoperation.
+
+        The Robotiq 2F-85 uses internal motor current limiting for force control.
+        From manual: FOR setting 0-255 maps linearly to 20-235 N grip force.
+        When object is detected (OBJ status), the gripper reached current limit.
+
+        Returns:
+            Dict with:
+                - 'position': Current normalized position [0=open, 1=closed]
+                - 'is_gripping': Whether an object is detected
+                - 'position_error': Normalized error between commanded and actual position
+                - 'force_N': Estimated grip force in Newtons (0 or 20-235 N)
+                - 'force_normalized': Normalized grip force [0.0, 1.0]
+                - 'commanded_force_N': Currently commanded force limit in Newtons
+        """
+        if not self._use_gripper:
+            return {
+                "position": 0.0,
+                "is_gripping": False,
+                "position_error": 0.0,
+                "force_N": 0.0,
+                "force_normalized": 0.0,
+                "commanded_force_N": 20.0,
+            }
+
+        try:
+            position = self._get_gripper_pos()
+            is_gripping = self.gripper.is_gripping()
+            position_error = self.gripper.get_position_error()
+            force_N = self.gripper.get_grip_force_estimate()  # Returns Newtons
+            force_normalized = self.gripper.get_grip_force_normalized()
+            commanded_force_N = self.gripper.get_commanded_force_N()
+
+            return {
+                "position": position,
+                "is_gripping": is_gripping,
+                "position_error": position_error,
+                "force_N": force_N,
+                "force_normalized": force_normalized,
+                "commanded_force_N": commanded_force_N,
+            }
+        except Exception as e:
+            print(f"Warning: Failed to get gripper feedback: {e}")
+            return {
+                "position": 0.0,
+                "is_gripping": False,
+                "position_error": 0.0,
+                "force_N": 0.0,
+                "force_normalized": 0.0,
+                "commanded_force_N": 20.0,
+            }
+
+    def get_observations(self) -> Dict[str, Any]:
         joints = self.get_joint_state()
         pos_quat = np.zeros(7)
         gripper_pos = np.array([joints[-1]])
+        joint_torques = self.get_joint_torques()
+        gripper_feedback = self.get_gripper_feedback()
         return {
             "joint_positions": joints,
             "joint_velocities": joints,
             "ee_pos_quat": pos_quat,
             "gripper_position": gripper_pos,
+            "joint_torques": joint_torques,
+            "gripper_feedback": gripper_feedback,
         }
 
 

@@ -14,7 +14,7 @@ dynamixel:
 arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
   # GELLO-specific path 
-  leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V3_1/robot.urdf"
+  leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V3_1/GELLO_Assembly_URDF_V3.urdf"
   num_arm_joints: 6
   arm_joint_limits_max: [3.14159, 3.14159, 3.14159, 3.14159, 3.14159, 3.14159]
   arm_joint_limits_min: [-3.14159, -3.14159, -3.14159, -3.14159, -3.14159, -3.14159]
@@ -60,6 +60,8 @@ controller:
 
   gripper_feedback:
     enable: False
+    gain: 1.0
+    damping: 0.1
 
 teleop:
   enable: true

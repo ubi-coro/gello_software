@@ -63,7 +63,7 @@ class UR5eGelloConfig:
     )  # 7 elements including gripper
 
     # URDF configuration
-    urdf_path: str = "gello/factr/urdf/ur5e_active_gello/robot.urdf"
+    urdf_path: str = "gello/factr/urdf/GELLO_Axxembly_URDF_V3_1/GELLO_Axxembly_URDF_V3_1.urdf"
 
     control_frequency: float = 500.0
     gravity_gain: float = 1.0  # Full strength

@@ -38,12 +38,14 @@ POSITION_CONTROL_MODE = 3
 TORQUE_TO_CURRENT_MAPPING = {
     "XC330_T288_T": 1158.73,
     "XM430_W210_T": 1000 / 2.69,
+    "XM430_W350_T": 208.5,
 }
 
 # Servo specifications for current limits (in mA)
 SERVO_CURRENT_LIMITS = {
     "XC330_T288_T": 1193,
     "XM430_W210_T": 1263,
+    "XM430_W350_T": 1193,
 }
 
 

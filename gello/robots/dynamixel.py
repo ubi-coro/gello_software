@@ -127,6 +127,26 @@ class DynamixelRobot(Robot):
     def command_joint_state(self, joint_state: np.ndarray) -> None:
         self._driver.set_joints((joint_state + self._joint_offsets).tolist())
 
+    def command_joint_torques(self, torques: np.ndarray) -> None:
+        """Command joint torques to the robot.
+
+        Args:
+            torques (np.ndarray): The torques to command.
+        """
+        # Apply joint signs to torques
+        # Note: offsets don't affect torques, but signs do
+        driver_torques = torques * self._joint_signs
+        self._driver.set_torque(driver_torques.tolist())
+
+    def get_joint_velocities(self) -> np.ndarray:
+        """Get the current joint velocities of the robot.
+
+        Returns:
+            np.ndarray: The joint velocities.
+        """
+        _, vels = self._driver.get_positions_and_velocities()
+        return vels * self._joint_signs
+
     def set_torque_mode(self, mode: bool):
         if mode == self._torque_on:
             return
@@ -134,4 +154,7 @@ class DynamixelRobot(Robot):
         self._torque_on = mode
 
     def get_observations(self) -> Dict[str, np.ndarray]:
-        return {"joint_state": self.get_joint_state()}
+        return {
+            "joint_state": self.get_joint_state(),
+            "joint_velocities": self.get_joint_velocities(),
+        }

@@ -32,6 +32,7 @@ class RobotiqGripper:
     PRE = "PRE"  # position request (echo of last commanded position)
     OBJ = "OBJ"  # object detection (0 = moving, 1 = outer grip, 2 = inner grip, 3 = no object at rest)
     FLT = "FLT"  # fault (0=ok, see manual for errors if not zero)
+    COU = "COU"  # current (motor current, proportional to applied force)
 
     ENCODING = "UTF-8"  # ASCII and UTF-8 both seem to work
 
@@ -61,6 +62,12 @@ class RobotiqGripper:
         self._max_speed = 255
         self._min_force = 0
         self._max_force = 255
+
+        # Force calibration constants for Robotiq 2F-85
+        # From manual: Force setting 0-255 maps to 20-235 N
+        self._force_min_N = 20.0   # Force at FOR=0
+        self._force_max_N = 235.0  # Force at FOR=255
+        self._last_commanded_force = 0  # Track last commanded force setting
 
     def connect(self, hostname: str, port: int, socket_timeout: float = 10.0) -> None:
         """Connects to a gripper at the given address.
@@ -240,6 +247,93 @@ class RobotiqGripper:
         """Returns the current position as returned by the physical hardware."""
         return self._get_var(self.POS)
 
+    def get_object_status(self) -> ObjectStatus:
+        """Returns the current object detection status.
+
+        Returns:
+            ObjectStatus: MOVING (0), STOPPED_OUTER_OBJECT (1), STOPPED_INNER_OBJECT (2), AT_DEST (3)
+        """
+        return RobotiqGripper.ObjectStatus(self._get_var(self.OBJ))
+
+    def is_gripping(self) -> bool:
+        """Returns whether the gripper has detected an object (inner or outer grip).
+
+        This is useful for force-feedback: when gripping, the follower gripper
+        position will differ from the commanded position.
+        """
+        status = self.get_object_status()
+        return status in (
+            RobotiqGripper.ObjectStatus.STOPPED_OUTER_OBJECT,
+            RobotiqGripper.ObjectStatus.STOPPED_INNER_OBJECT,
+        )
+
+    def get_position_error(self) -> float:
+        """Get the difference between requested and actual position.
+
+        This can be used for position-position force feedback:
+        - When not gripping: error ≈ 0
+        - When gripping an object: error > 0 (gripper stopped before reaching target)
+
+        Returns:
+            float: Normalized position error in range [0.0, 1.0]
+        """
+        try:
+            requested = self._get_var(self.PRE)  # Position request echo
+            actual = self._get_var(self.POS)  # Actual position
+            error = abs(requested - actual)
+            # Normalize to 0-1 range (max error is 255)
+            return min(error / 255.0, 1.0)
+        except Exception:
+            return 0.0
+
+    def get_grip_force_estimate(self) -> float:
+        """Estimate grip force based on commanded force setting and object status.
+
+        The Robotiq 2F-85 uses motor current limiting internally:
+        - FOR setting (0-255) maps linearly to grasp force (20-235 N)
+        - When OBJ status indicates gripping, the motor reached current limit
+        - The actual grip force is approximately the commanded force setting
+
+        From Robotiq manual:
+        "The force setting defines the final gripping force. The force will fix
+        the maximum current sent to the motor while in motion. If the current
+        limit is exceeded, the fingers stop and trigger object detection."
+
+        Returns:
+            float: Estimated grip force in Newtons (0 if not gripping, 20-235 N if gripping)
+        """
+        if not self.is_gripping():
+            return 0.0
+
+        # When gripping, the gripper stopped because it reached the current limit
+        # for the commanded force setting. The actual force is approximately
+        # the force corresponding to the FOR setting.
+        # Linear mapping: FOR 0-255 -> Force 20-235 N
+        force_range = self._force_max_N - self._force_min_N  # 215 N
+        force_N = self._force_min_N + (self._last_commanded_force / 255.0) * force_range
+        return force_N
+
+    def get_grip_force_normalized(self) -> float:
+        """Get normalized grip force in range [0.0, 1.0].
+
+        Returns:
+            float: 0.0 if not gripping, normalized force (0-1) if gripping
+        """
+        force_N = self.get_grip_force_estimate()
+        if force_N <= 0:
+            return 0.0
+        # Normalize: 20 N -> 0, 235 N -> 1
+        return (force_N - self._force_min_N) / (self._force_max_N - self._force_min_N)
+
+    def get_commanded_force_N(self) -> float:
+        """Get the currently commanded force setting in Newtons.
+
+        Returns:
+            float: Force in Newtons corresponding to the last FOR setting (20-235 N)
+        """
+        force_range = self._force_max_N - self._force_min_N
+        return self._force_min_N + (self._last_commanded_force / 255.0) * force_range
+
     def auto_calibrate(self, log: bool = True) -> None:
         """Attempts to calibrate the open and closed positions, by slowly closing and opening the gripper.
 
@@ -294,6 +388,9 @@ class RobotiqGripper:
         clip_pos = clip_val(self._min_position, position, self._max_position)
         clip_spe = clip_val(self._min_speed, speed, self._max_speed)
         clip_for = clip_val(self._min_force, force, self._max_force)
+
+        # Track commanded force for force estimation
+        self._last_commanded_force = clip_for
 
         # moves to the given position with the given speed and force
         var_dict = OrderedDict(

@@ -189,9 +189,30 @@ class FACTRGravityCompensation:
         self.null_space_kp = self.config["controller"]["null_space_regulation"]["kp"]
         self.null_space_kd = self.config["controller"]["null_space_regulation"]["kd"]
 
+        # Torque feedback (force-feedback from follower robot)
+        torque_feedback_cfg = self.config["controller"].get("torque_feedback", {})
+        self.enable_torque_feedback = torque_feedback_cfg.get("enable", False)
+        self.torque_feedback_gain = torque_feedback_cfg.get("gain", 1.0)
+        self.torque_feedback_motor_scalar = torque_feedback_cfg.get("motor_scalar", 1.0)
+        self.torque_feedback_damping = torque_feedback_cfg.get("damping", 0.0)
+        self._follower_torques = np.zeros(self.num_arm_joints)  # Cache for follower torques
+
+        # Gripper feedback (position-position or position-force feedback)
+        gripper_feedback_cfg = self.config["controller"].get("gripper_feedback", {})
+        self.enable_gripper_feedback = gripper_feedback_cfg.get("enable", False)
+        self.gripper_feedback_gain = gripper_feedback_cfg.get("gain", 1.0)
+        self.gripper_feedback_damping = gripper_feedback_cfg.get("damping", 0.1)
+        self._follower_gripper_feedback: Dict[str, Any] = {}  # Cache for follower gripper state
+
         print(f"Control frequency: {1 / self.dt:.1f} Hz")
         print(
             f"Gravity compensation: {'enabled' if self.enable_gravity_comp else 'disabled'}"
+        )
+        print(
+            f"Torque feedback: {'enabled' if self.enable_torque_feedback else 'disabled'}"
+        )
+        print(
+            f"Gripper feedback: {'enabled' if self.enable_gripper_feedback else 'disabled'}"
         )
 
     def _prepare_dynamixel(self) -> None:
@@ -785,6 +806,176 @@ class FACTRGravityCompensation:
         )
         return tau_n
 
+    def get_follower_joint_torques(self) -> np.ndarray:
+        """Get external joint torques from the follower robot.
+
+        This method retrieves the current joint torques from the follower robot
+        for force-feedback. The torques are gravity/friction compensated by the
+        follower's controller (e.g., UR5e's getActualJointTorques()).
+
+        Returns:
+            np.ndarray: External joint torques from follower (length num_arm_joints)
+        """
+        if not self.teleop_enabled or self.teleop_robot_server is None:
+            return np.zeros(self.num_arm_joints)
+
+        try:
+            # Try to get joint torques from the follower robot
+            follower = self.teleop_robot_server
+
+            # Handle ZMQServerRobot wrapper
+            if hasattr(follower, "robot"):
+                follower = follower.robot
+
+            # Check if the follower robot has a get_joint_torques method
+            if hasattr(follower, "get_joint_torques"):
+                torques = follower.get_joint_torques()
+                # Ensure we only get arm joint torques (not gripper)
+                if len(torques) >= self.num_arm_joints:
+                    return np.array(torques[: self.num_arm_joints])
+                return np.array(torques)
+
+            # Alternative: check for getActualJointTorques (ur-rtde style)
+            if hasattr(follower, "r_inter") and hasattr(
+                follower.r_inter, "getActualJointTorques"
+            ):
+                torques = follower.r_inter.getActualJointTorques()
+                return np.array(torques[: self.num_arm_joints])
+
+            # Fallback: return zeros if no torque sensing available
+            return np.zeros(self.num_arm_joints)
+
+        except Exception as e:
+            print(f"Warning: Failed to get follower torques: {e}")
+            return np.zeros(self.num_arm_joints)
+
+    def torque_feedback(
+        self,
+        external_torque: npt.NDArray[np.float64],
+        arm_joint_vel: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        """Compute joint torque for force-feedback based on follower's external torques.
+
+        This implements the force-feedback loop from FACTR (Equation 1 in Section III.A):
+        τ_ff = -gain/motor_scalar * τ_ext - damping * q̇
+
+        The external torques from the follower robot are scaled and applied to the
+        leader arm to provide haptic feedback of contact forces.
+
+        Args:
+            external_torque: External joint torques from follower robot (Nm)
+            arm_joint_vel: Current leader arm joint velocities (rad/s)
+
+        Returns:
+            np.ndarray: Force-feedback torques to apply to leader arm (Nm)
+        """
+        # Apply feedback gain and motor scaling (as per FACTR paper Eq. 1)
+        tau_ff = (
+            -1.0
+            * self.torque_feedback_gain
+            / self.torque_feedback_motor_scalar
+            * external_torque
+        )
+        # Add velocity damping for stability
+        tau_ff -= self.torque_feedback_damping * arm_joint_vel
+        return tau_ff
+
+    def get_follower_gripper_feedback(self) -> Dict[str, Any]:
+        """Get gripper feedback from the follower robot.
+
+        For Robotiq 2F-85, this includes:
+        - position: Current normalized position
+        - is_gripping: Whether an object is detected
+        - position_error: Error between commanded and actual position
+        - force_estimate: Estimated grip force
+
+        Returns:
+            Dict with gripper feedback data
+        """
+        if not self.teleop_enabled or self.teleop_robot_server is None:
+            return {"position": 0.0, "is_gripping": False, "force_estimate": 0.0}
+
+        try:
+            follower = self.teleop_robot_server
+
+            # Handle ZMQServerRobot wrapper
+            if hasattr(follower, "robot"):
+                follower = follower.robot
+
+            # Check for get_gripper_feedback method (UR5e with Robotiq)
+            if hasattr(follower, "get_gripper_feedback"):
+                return follower.get_gripper_feedback()
+
+            # Alternative: check observations for gripper_feedback
+            if hasattr(follower, "get_observations"):
+                obs = follower.get_observations()
+                if "gripper_feedback" in obs:
+                    return obs["gripper_feedback"]
+
+            # Fallback: return empty feedback
+            return {"position": 0.0, "is_gripping": False, "force_estimate": 0.0}
+
+        except Exception as e:
+            print(f"Warning: Failed to get follower gripper feedback: {e}")
+            return {"position": 0.0, "is_gripping": False, "force_N": 0.0, "force_normalized": 0.0}
+
+    def gripper_feedback(
+        self,
+        leader_gripper_pos: float,
+        leader_gripper_vel: float,
+        follower_feedback: Dict[str, Any],
+    ) -> float:
+        """Compute gripper torque for force-feedback based on follower gripper state.
+
+        Implements position-position force feedback for the gripper:
+        - When follower gripper is gripping an object, the motor current limit is reached
+        - The Robotiq FOR setting (0-255) maps to 20-235 N grip force
+        - This force is fed back as resistance torque to the leader gripper
+
+        Args:
+            leader_gripper_pos: Current leader gripper position (rad)
+            leader_gripper_vel: Current leader gripper velocity (rad/s)
+            follower_feedback: Feedback dict from follower gripper containing:
+                - 'is_gripping': Whether object detected
+                - 'force_N': Grip force in Newtons (0 or 20-235 N)
+                - 'force_normalized': Normalized force [0, 1]
+                - 'position': Current gripper position [0, 1]
+
+        Returns:
+            float: Force-feedback torque to apply to leader gripper (Nm)
+        """
+        # Get follower gripper state
+        follower_pos = follower_feedback.get("position", 0.0)
+        is_gripping = follower_feedback.get("is_gripping", False)
+        
+        # Use normalized force for feedback (0-1 range based on 20-235 N)
+        force_normalized = follower_feedback.get("force_normalized", 0.0)
+        # Fallback to old format if new format not available
+        if force_normalized == 0.0 and "force_estimate" in follower_feedback:
+            force_normalized = follower_feedback.get("force_estimate", 0.0)
+
+        if not is_gripping:
+            # No object detected - no feedback torque needed
+            return 0.0
+
+        # Position-position feedback: resist leader movement when follower is blocked
+        # Normalize leader gripper position to [0, 1] range for comparison
+        leader_pos_normalized = leader_gripper_pos / max(self.gripper_limit_max, 0.01)
+        leader_pos_normalized = np.clip(leader_pos_normalized, 0.0, 1.0)
+
+        # Position error: how much the leader has moved beyond follower
+        position_error = leader_pos_normalized - follower_pos
+
+        # Apply feedback torque proportional to position error and force
+        # force_normalized is 0-1 based on motor current limit (20-235 N)
+        # Negative sign: resist the leader from closing further when object is gripped
+        tau_gripper = -self.gripper_feedback_gain * position_error * (1.0 + force_normalized)
+
+        # Add velocity damping
+        tau_gripper -= self.gripper_feedback_damping * leader_gripper_vel
+
+        return float(tau_gripper)
+
     def control_loop_step(self) -> None:
         """Execute one step of the control loop."""
         # Get current joint states
@@ -808,6 +999,20 @@ class FACTRGravityCompensation:
         if self.enable_gravity_comp:
             torque_arm += self.gravity_compensation(leader_arm_pos, leader_arm_vel)
             torque_arm += self.friction_compensation(leader_arm_vel)
+
+        # Torque feedback (force-feedback from follower robot arm)
+        if self.enable_torque_feedback:
+            external_joint_torque = self.get_follower_joint_torques()
+            self._follower_torques = external_joint_torque  # Cache for debugging
+            torque_arm += self.torque_feedback(external_joint_torque, leader_arm_vel)
+
+        # Gripper feedback (force-feedback from follower gripper)
+        if self.enable_gripper_feedback:
+            follower_gripper_fb = self.get_follower_gripper_feedback()
+            self._follower_gripper_feedback = follower_gripper_fb  # Cache for debugging
+            torque_gripper += self.gripper_feedback(
+                leader_gripper_pos, leader_gripper_vel, follower_gripper_fb
+            )
 
         # Apply torques only if GC is enabled (torque mode is off otherwise)
         if self.enable_gravity_comp:

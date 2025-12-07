@@ -13,7 +13,7 @@ dynamixel:
 
 arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
-  leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V3_1/robot.urdf"
+  leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V3_1/GELLO_Assembly_URDF_V3.urdf"
   num_arm_joints: 6
   arm_joint_limits_max: [3.14159, 3.14159, 3.14159, 3.14159, 3.14159, 3.14159]
   arm_joint_limits_min: [-3.14159, -3.14159, -3.14159, -3.14159, -3.14159, -3.14159]
@@ -53,16 +53,18 @@ controller:
     kd: 0.04315069084
 
   gripper_feedback:
-    enable: True
+    enable: False
+    gain: 1.0      # Force-feedback strength for gripper
+    damping: 0.1   # Velocity damping for gripper feedback
 
 teleop:
   enable: true
   hz: 30
   wait_for_server_timeout_s: 5.0
   robot:
-    _target_: gello.robots.ur.URRobot
-    gripper: 
-    channel: can_right
+    _target_: gello.robots.ur5e.URRobot
+    robot_ip: "192.168.1.10"
+    no_gripper: false
   mapping:
     # Map leader joints to follower joints
     index_map: [0, 1, 2, 3, 4, 5]
