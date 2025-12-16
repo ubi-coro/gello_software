@@ -212,3 +212,108 @@ Das passt sehr gut zur FACTR-Idee: URDF liefert zuverlässige Basis (Geometrie, 
 
 Weiterführend (optional) können Gravity/CoM-Korrekturen oder vollständige Inertial-Identifikation ergänzt werden, was allerdings deutlich mehr Aufwand für Trajektorien-Design, Constraints und Validierung bedeutet.
 
+---
+
+## 9. Einordnung zur Doku-Passage (Code-Referenzen, Stand vs. offene Punkte)
+
+Dieser Abschnitt ordnet die im Text beschriebenen Konzepte direkt der aktuellen Codebase zu und markiert, was bereits umgesetzt ist bzw. was für die vollständige Umsetzung noch fehlt.
+
+### 9.1 „URDF als Basis“ (CAD → URDF → Pinocchio)
+
+**Im Text:** Das URDF beschreibt kinematische Kette + dynamische Parameter (Masse, CoM, Trägheit). Korrekturen der Inertial-Tags erfolgen offline (CAD + Satz von Steiner) und das URDF wird anschließend in Pinocchio geladen.
+
+**In der Codebase (umgesetzt):**
+
+- Das URDF wird als Pfad in YAML konfiguriert und für die Modellrechnung geladen.
+	- Beispielkonfig (Leader URDF): [configs/ur5e_gello_factr_hw.yaml](configs/ur5e_gello_factr_hw.yaml)
+	- Loader & Modellnutzung: [gello/factr/gravity_compensation.py](gello/factr/gravity_compensation.py)
+
+**In der Codebase (nicht enthalten / extern):**
+
+- Der CAD-Workflow (Fusion 360, ACDC4Robot) und die Steiner-Korrektur sind **nicht** Teil dieses Repos. Die Software setzt voraus, dass das URDF bereits physikalisch plausibel ist.
+
+### 9.2 „Interne vs. externe Kräfte unterscheiden“
+
+**Im Text:** Für haptische Transparenz muss das System interne Dynamik (z.B. Gravitation/Reibung) von Umweltinteraktion (extern) trennen.
+
+**In der Codebase (teilweise umgesetzt):**
+
+- **Interne Terme (Leader):**
+	- Gravitation / inverse Dynamik via Pinocchio RNEA ist implementiert:
+		- [gello/factr/gravity_compensation.py](gello/factr/gravity_compensation.py)
+
+- **Externe Terme (Follower → Leader Force Feedback):**
+	- Eine Force-Feedback-Struktur existiert: Follower-Joint-Torques können abgefragt und als Feedback-Torque auf den Leader gemappt werden.
+		- Follower torque acquisition + Feedback-Gesetz: [gello/factr/gravity_compensation.py](gello/factr/gravity_compensation.py)
+	- Voraussetzung: der Follower-Robot muss Joint-Torques liefern (z.B. UR über RTDE „ActualJointTorques“ oder eigene Methode).
+
+**Offen / abhängig von Hardware/API (noch zu vervollständigen):**
+
+- Falls der Follower nur einen TCP-Wrench liefert (6D), fehlt im Kern noch die standardisierte Pipeline „Wrench → Joint Torque“ (Jacobian-Transpose bzw. wrench-to-torque mapping). Das gehört zu deinen UR5e-Extensions.
+
+### 9.3 Gravitationsterm und Reibungsterm (low-frequency Fokus)
+
+**Im Text:** Low-frequency: \(\tau \approx g(q) + \tau_{fric}(\dot q, t)\). Reibung wird in kinetisch (viskos + Coulomb) und statisch (Dithering) aufgeteilt.
+
+**In der Codebase (umgesetzt):**
+
+- **Gravitation (und mehr):**
+	- RNEA-basierte Gravity Compensation ist implementiert:
+		- [gello/factr/gravity_compensation.py](gello/factr/gravity_compensation.py)
+
+- **Statische Reibung / Dithering (Haftreibungskompensation):**
+	- Ein stiction/dither Ansatz ist implementiert und in den FACTR-Loop integrierbar:
+		- [gello/factr/gravity_compensation.py](gello/factr/gravity_compensation.py)
+	- Zusätzlich existieren Standalone-Skripte, die das Verhalten demonstrieren:
+		- [gello/factr/run_UR5e_gello_gravity_comp.py](gello/factr/run_UR5e_gello_gravity_comp.py)
+
+**In der Codebase (noch nicht als „kinetisches Reibungsmodell“ im Controller integriert):**
+
+- Ein explizites Modell \(F_v \dot q + F_c\,\mathrm{sgn}(\dot q) + b\) ist als Offline-Identifikation vorbereitet, aber noch nicht in den FACTR-Laufzeitcontroller eingebunden.
+	- Identifikation (offline): [gello/4Ch_Bilat/computeJointTorqueRegressor.py](gello/4Ch_Bilat/computeJointTorqueRegressor.py)
+
+### 9.4 Parameteridentifikation (Ridge Regression) und „hybrides Modell“
+
+**Im Text:** Reibung + Bias werden datengetrieben identifiziert, nicht ins URDF zurückgeschrieben, sondern als Laufzeit-Erweiterung im Controller genutzt.
+
+**In der Codebase (umgesetzt / vorbereitet):**
+
+- Ridge/Least-Squares-basierte Identifikation ist implementiert:
+	- friction-only (empfohlen für low-frequency): `identify_friction_only(...)` in
+		- [gello/4Ch_Bilat/computeJointTorqueRegressor.py](gello/4Ch_Bilat/computeJointTorqueRegressor.py)
+	- full regressor (für weiterführende Forschung): `identify_dynamics(...)` in
+		- [gello/4Ch_Bilat/computeJointTorqueRegressor.py](gello/4Ch_Bilat/computeJointTorqueRegressor.py)
+
+- Das Dokumentationsartefakt zum Hybrid-Ansatz liegt als Standnotiz vor:
+	- [HYBRID_FACTR_STATUS.md](HYBRID_FACTR_STATUS.md)
+
+**Offen (noch zu implementieren, minimalinvasiv möglich):**
+
+- Logger/Datenerfassung für (q, dq, tau_meas) als reproduzierbarer Workflow.
+- Speichern/Laden der identifizierten Parameter (z.B. `.npz`) und Anwendung im FACTR-Loop.
+- Optional: Validierungs-Tooling (tau_pred vs. tau_meas) für Fit-Qualität.
+
+### 9.5 Disturbance Observer (Leader ohne F/T Sensor)
+
+**Im Text:** Trennung intern/extern kann über Modell + Beobachter erfolgen.
+
+**In der Codebase (Custom Extension, prototypisch umgesetzt):**
+
+- Ein erster Leader-Disturbance-Observer existiert als eigenständiges Modul:
+	- [gello/4Ch_Bilat/gello_ur5e_observer.py](gello/4Ch_Bilat/gello_ur5e_observer.py)
+
+**Offen:**
+
+- Integration in den FACTR-Loop (z.B. Observer nutzt tau_cmd und geschätzte Modellterme; liefert tau_ext_hat zurück).
+- Abstimmung mit tatsächlichen Messgrößen des Leaders (Torque aus Strommessung, Motor-Konstanten, Getriebe, etc.).
+
+### 9.6 UR5e-bezogene FACTR-Erweiterungen (Custom)
+
+Für deine UR5e-Arbeit existieren bereits agent-nahe Komponenten, die als „nicht Original“ zu sehen sind.
+Beispiel:
+
+- UR5e-spezifischer FACTR-Agent: [gello/factr/ur5e_gello_factr_agent.py](gello/factr/ur5e_gello_factr_agent.py)
+
+Diese Teile sollten in der Doku als Erweiterung eingeordnet werden (und ggf. im Zuge der Stabilisierung/Tests bereinigt), da die ursprüngliche Architektur generischer Agent/Robot/Env-basiert ist.
+
+
