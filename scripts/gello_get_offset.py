@@ -28,6 +28,9 @@ class Args:
     gripper: bool = True
     """Whether or not the gripper is attached."""
 
+    baudrate: int = 57600
+    """The baudrate for the Dynamixel servos."""
+
     def __post_init__(self):
         assert len(self.joint_signs) == len(self.start_joints)
         for idx, j in enumerate(self.joint_signs):
@@ -47,7 +50,13 @@ class Args:
 
 def get_config(args: Args) -> None:
     joint_ids = list(range(1, args.num_joints + 1))
-    driver = DynamixelDriver(joint_ids, port=args.port, baudrate=57600)
+    # Handle mixed servo types if needed, but for offset reading default is usually fine unless torque mode fails
+    # We'll add servo_types support just in case, matching the user's config
+    servo_types = ["XC330_T288_T", "XM430_W350_T", "XM430_W350_T", "XC330_T288_T", "XC330_T288_T", "XC330_T288_T"]
+    if args.gripper:
+        servo_types.append("XC330_T288_T")
+        
+    driver = DynamixelDriver(joint_ids, port=args.port, baudrate=args.baudrate, servo_types=servo_types)
 
     # assume that the joint state shouold be args.start_joints
     # find the offset, which is a multiple of np.pi/2 that minimizes the error between the current joint state and args.start_joints
