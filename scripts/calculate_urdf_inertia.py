@@ -39,7 +39,7 @@ def get_motor_inertia(motor_type="XC330"):
 # Beispiel für Link 4 (Forearm)
 # 1. Daten des PLASTIK-TEILS (aus CAD Inertial Properties)
 m_L4_plastic = 0.0179  # kg (Link 4 Masse ohne Motor)
-r_L4_plastic = np.array([-18.817, 0.032, 2.98]) # mm (Schwerpunkt Plastik)
+r_L4_plastic = np.array([2.98, 0.032, -18.817]) # mm (Schwerpunkt Plastik)
 
 # Trägheitstensor des Plastiks (am Schwerpunkt des Plastiks!)
 # Bitte Werte aus CAD hier einsetzen (in kg*m^2 !!)
