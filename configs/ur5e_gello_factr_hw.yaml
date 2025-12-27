@@ -3,6 +3,7 @@ name: grav_comp_hw
 dynamixel:
   # USB port name given by the command: ls /dev/serial/by-id/
   dynamixel_port: "/dev/ttyDXL_gello"
+  baudrate: 1000000
   # Servo types
   servo_types: [
     "XC330_T288_T", "XM430_W350_T", "XM430_W350_T",
@@ -14,14 +15,14 @@ dynamixel:
 arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
   leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V4/GELLO_Assembly_URDF_V4.urdf"
-  num_arm_joints: 6
-  arm_joint_limits_max: [3.14159, 3.14159, 3.14159, 3.14159, 3.14159, 3.14159]
-  arm_joint_limits_min: [-3.14159, -3.14159, -3.14159, -3.14159, -3.14159, -3.14159]
+  num_arm_joints: 7
+  arm_joint_limits_max: [3.14159, 3.14159, 3.14159, 3.14159, 3.14159, 3.14159, 3.14159]
+  arm_joint_limits_min: [-3.14159, -3.14159, -3.14159, -3.14159, -3.14159, -3.14159, -3.14159]
   arm_joint_limits_safety_margin: 0.1
   initialization:
     # These are your start positions (URDF coordinates) - offsets will be auto-calculated
-    calibration_joint_pos: [-1.570796, 4.712389, 3.141593, 7.853982, 9.424778, 3.141593]
-    initial_match_joint_pos: [-1.570796, 4.712389, 3.141593, 7.853982, 9.424778, 3.141593]
+    calibration_joint_pos: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0, 0.0]
+    initial_match_joint_pos: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0, 0.0]
 
 gripper_teleop:
   # The maximum range (in rad) of the leader gripper trigger
@@ -38,7 +39,7 @@ controller:
     enable: True
     gain: 0.6
   null_space_regulation:
-    null_space_joint_target: [-1.570796, 4.712389, 3.141593, 7.853982, 9.424778, 3.141593, 1.0]
+    null_space_joint_target: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0, 0.0, 1.0]
     kp: 0.0
     kd: 0.0
   static_friction_comp:

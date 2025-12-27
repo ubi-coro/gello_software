@@ -254,11 +254,12 @@ class FACTRGravityCompensation:
 
         # Initialize driver
         joint_ids = (np.arange(self.num_motors) + 1).tolist()
+        baudrate = self.config["dynamixel"].get("baudrate", 57600)
         try:
             self.driver = DynamixelDriver(
-                joint_ids, self.servo_types, self.dynamixel_port
+                joint_ids, self.servo_types, self.dynamixel_port, baudrate=baudrate
             )
-            print(f"Connected to Dynamixel servos on {self.dynamixel_port}")
+            print(f"Connected to Dynamixel servos on {self.dynamixel_port} with baudrate {baudrate}")
         except Exception as e:
             raise RuntimeError(f"Failed to connect to Dynamixel servos: {e}") from e
 
@@ -593,6 +594,20 @@ class FACTRGravityCompensation:
             return np.concatenate([arm_cmd, np.array([gripper_norm], dtype=float)])
 
         if follower_dofs == len(arm_cmd):
+            # Special case: If we have 7 joints (incl gripper) and follower has 7,
+            # but we have explicit gripper config, override the last joint with normalized value.
+            if self.gripper_open_rad is not None and self.gripper_close_rad is not None:
+                denom = self.gripper_close_rad - self.gripper_open_rad
+                if abs(denom) < 1e-6:
+                    gripper_norm = 0.0
+                else:
+                    gripper_norm = (
+                        self.leader_gripper_raw_rad - self.gripper_open_rad
+                    ) / denom
+                gripper_norm = float(np.clip(gripper_norm, 0.0, 1.0))
+                # Override the last element (gripper joint)
+                arm_cmd[-1] = gripper_norm
+            
             return arm_cmd
         if follower_dofs < len(arm_cmd):
             return arm_cmd[:follower_dofs]
