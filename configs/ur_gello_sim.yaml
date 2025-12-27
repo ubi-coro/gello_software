@@ -1,0 +1,20 @@
+robot:
+  _target_: gello.robots.sim_robot.MujocoRobotServer
+  xml_path: /home/lennart/Python_Projects/gello_software/third_party/mujoco_menagerie/universal_robots_ur5e/ur5e.xml
+  gripper_xml_path: /home/lennart/Python_Projects/gello_software/third_party/mujoco_menagerie/robotiq_2f85/2f85.xml
+  host: 127.0.0.1
+  port: 6001
+agent:
+  _target_: gello.agents.gello_agent.GelloAgent
+  port: /dev/ttyDXL_gello
+  dynamixel_config:
+    _target_: gello.agents.gello_agent.DynamixelRobotConfig
+    joint_ids: [1, 2, 3, 4, 5, 6]
+    joint_offsets: [-1.570796, 4.712389, 3.141593, 7.853982, 9.424778, 3.141593]
+    joint_signs: [1.0, 1.0, -1.0, 1.0, 1.0, 1.0]
+    gripper_config: [7, 197, 155]
+    servo_types: ["XC330_T288_T", "XM430_W350_T", "XM430_W350_T", "XC330_T288_T", "XC330_T288_T", "XC330_T288_T"]
+    baudrate: 1000000
+  start_joints: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0, 0.0]
+hz: 30
+max_steps: 1000

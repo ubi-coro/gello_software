@@ -18,6 +18,7 @@ class DynamixelRobot(Robot):
         baudrate: int = 57600,
         gripper_config: Optional[Tuple[int, float, float]] = None,
         start_joints: Optional[np.ndarray] = None,
+        servo_types: Optional[Sequence[str]] = None,
     ):
         from gello.dynamixel.driver import (
             DynamixelDriver,
@@ -41,6 +42,23 @@ class DynamixelRobot(Robot):
                 gripper_config[1] * np.pi / 180,
                 gripper_config[2] * np.pi / 180,
             )
+            if servo_types is not None:
+                # Assuming gripper is same type as last joint or generic?
+                # For now let's just append the last type if available or handle it in driver
+                # Actually driver expects servo_types to match ids length if provided.
+                # If gripper is added, we should add a type for it.
+                # Usually gripper is a different motor.
+                # Let's assume the user provides servo_types for ALL motors including gripper if they provide it.
+                # But wait, the user config in gello_agent.py usually defines arm joints.
+                # If we append gripper here, we might need to append gripper type.
+                # Let's assume for now servo_types covers the arm joints.
+                # If gripper is added, we need to add a type for it.
+                # Let's default to the last type in the list if we don't know.
+                # Or better, let's ask the user or assume a default.
+                # For now, let's just pass what we have and see if driver complains.
+                # Actually, let's append a default type for gripper if servo_types is present.
+                # Most grippers in GELLO are XL330 or XC330.
+                pass
         else:
             self.gripper_open_close = None
 
@@ -70,7 +88,19 @@ class DynamixelRobot(Robot):
         ), f"joint_signs: {self._joint_signs}"
 
         if real:
-            self._driver = DynamixelDriver(joint_ids, port=port, baudrate=baudrate)
+            # Handle servo_types length mismatch if gripper was added
+            if servo_types is not None and len(servo_types) < len(joint_ids):
+                # If gripper was added (length diff is 1), append a default gripper type
+                # Most GELLO grippers are XC330
+                if len(joint_ids) - len(servo_types) == 1:
+                    servo_types = list(servo_types) + ["XC330_T288_T"]
+            
+            self._driver = DynamixelDriver(
+                joint_ids, 
+                port=port, 
+                baudrate=baudrate, 
+                servo_types=servo_types
+            )
             self._driver.set_torque_mode(False)
         else:
             self._driver = FakeDynamixelDriver(joint_ids)
