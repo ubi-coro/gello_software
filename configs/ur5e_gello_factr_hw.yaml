@@ -2,26 +2,26 @@ name: grav_comp_hw
 
 dynamixel:
   # USB port name given by the command: ls /dev/serial/by-id/
-  dynamixel_port: "usb-FTDI_USB__-__Serial_Converter_FTA2U4GA-if00-port0"
+  dynamixel_port: "/dev/ttyDXL_gello"
   # Servo types
   servo_types: [
     "XC330_T288_T", "XM430_W350_T", "XM430_W350_T",
     "XC330_T288_T", "XC330_T288_T", "XC330_T288_T", "XC330_T288_T"
   ]
   # Servo joint directions to match that of the leader arm
-  joint_signs: [1, -1, -1, -1, 1, 1, 1]
+  joint_signs: [1, 1, -1, 1, 1, 1, 1]
 
 arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
-  leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V3_1/GELLO_Assembly_URDF_V3.urdf"
+  leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V4/GELLO_Assembly_URDF_V4.urdf"
   num_arm_joints: 6
   arm_joint_limits_max: [3.14159, 3.14159, 3.14159, 3.14159, 3.14159, 3.14159]
   arm_joint_limits_min: [-3.14159, -3.14159, -3.14159, -3.14159, -3.14159, -3.14159]
   arm_joint_limits_safety_margin: 0.1
   initialization:
     # These are your start positions (URDF coordinates) - offsets will be auto-calculated
-    calibration_joint_pos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    initial_match_joint_pos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    calibration_joint_pos: [-1.570796, 4.712389, 3.141593, 7.853982, 9.424778, 3.141593]
+    initial_match_joint_pos: [-1.570796, 4.712389, 3.141593, 7.853982, 9.424778, 3.141593]
 
 gripper_teleop:
   # The maximum range (in rad) of the leader gripper trigger
@@ -38,7 +38,7 @@ controller:
     enable: True
     gain: 0.6
   null_space_regulation:
-    null_space_joint_target: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    null_space_joint_target: [-1.570796, 4.712389, 3.141593, 7.853982, 9.424778, 3.141593, 1.0]
     kp: 0.0
     kd: 0.0
   static_friction_comp:
@@ -69,10 +69,10 @@ teleop:
     # Map leader joints to follower joints
     index_map: [0, 1, 2, 3, 4, 5]
     # Signs to align sim/hardware with leader frames
-    signs: [1, 1, -1, -1, 1, 1]
+    signs: [1, 1, 1, 1, 1, 1]
     # Additional offsets (radians) applied to follower after signs
     offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     # Auto-align offsets at startup so follower matches current leader pose
     auto_align: true
   # Explicit gripper config for teleop normalization: [id, open_deg, close_deg]
-  gripper_config: [7, 241.4375, 300.9375] 
+  gripper_config: [7, 197, 155] 
