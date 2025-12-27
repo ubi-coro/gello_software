@@ -40,7 +40,7 @@ controller:
     damping: 0.0
     motor_scalar: 94.5652173913
   gravity_comp:
-    enable: True
+    enable: False
     gain: 0.8
   null_space_regulation:
     # Target position when not actively performing tasks (matches your new start position)

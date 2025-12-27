@@ -222,9 +222,12 @@ class FACTRGravityCompensation:
         self.joint_signs = np.array(
             self.config["dynamixel"]["joint_signs"], dtype=float
         )
-        self.dynamixel_port = (
-            "/dev/serial/by-id/" + self.config["dynamixel"]["dynamixel_port"]
-        )
+        
+        port_config = self.config["dynamixel"]["dynamixel_port"]
+        if port_config.startswith("/"):
+            self.dynamixel_port = port_config
+        else:
+            self.dynamixel_port = "/dev/serial/by-id/" + port_config
 
         # Check latency timer
         try:
