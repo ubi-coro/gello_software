@@ -60,7 +60,7 @@ gripper_teleop:
   actuation_range: 0.8
 
 controller:
-  frequency: 300
+  frequency: 350
   torque_feedback:
     enable: False
     gain: 3.0
@@ -77,7 +77,7 @@ controller:
   gravity_comp:
     enable: True
     gain: 0.9  
-    gain_per_joint: [1.0, 1.0, 1.0, 2.0, 2.0, 2.5]
+    gain_per_joint: [1.0, 1.0, 1.0, 2.0, 2.3, 2.5]
     velocity_damping: 0.01
   null_space_regulation: # not needed for UR5e
     null_space_joint_target: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
