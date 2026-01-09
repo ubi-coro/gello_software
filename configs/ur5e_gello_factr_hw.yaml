@@ -35,6 +35,14 @@ controller:
     gain: 3.0
     damping: 0.0
     motor_scalar: 94.5652173913
+  force_position_feedback:
+    # Force-Position feedback: τ = Kp*(q_follower - q_leader) + Kd*(dq_follower - dq_leader)
+    # This is an alternative to scaled torque_feedback (FACTR style)
+    # Only one should be enabled at a time
+    enable: False
+    kp: 2.0           # Position error stiffness (Nm/rad)
+    kd: 0.1           # Velocity error damping (Nm*s/rad)
+    max_torque: 1.5   # Safety limit per joint (Nm)
   gravity_comp:
     enable: True
     gain: 0.6
@@ -43,8 +51,12 @@ controller:
     kp: 0.0
     kd: 0.0
   static_friction_comp:
-    enable_speed:   0.0
-    gain: 0.0
+    enable_speed: 0.15  # rad/s threshold for dither-based compensation
+    gain: 0.6
+    # Per-joint feedforward friction (estimated from physical behavior recording)
+    friction_feedforward: [0.0, 0.058, 0.008, 0.002, 0.002, 0.001]
+    viscous_friction: [0.003, 0.0, 0.001, 0.0, 0.0, 0.0]
+    velocity_deadband: [0.02, 0.05, 0.05, 0.05, 0.05, 0.05]
   joint_limit_barrier:
     kp: 0.0
     kd: 0.0

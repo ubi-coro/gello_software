@@ -205,6 +205,7 @@ def main():
         print("Press Ctrl+C to stop")
 
         running = True
+        debug_counter = 0
         dt = 1.0 / 500.0
 
         # Control parameters
@@ -291,14 +292,10 @@ def main():
                 torque_arm += tau_ss
 
                 # LIVE DEBUG PRINTING - see what's happening
-                print(
-                    f"\r🔍 LIVE: Raw={[f'{x:.2f}' for x in joint_pos_raw[:3]]}... | "
-                    f"Calibrated={[f'{x:.2f}' for x in joint_pos_arm[:3]]}... | "
-                    f"Total_torques={[f'{x:.2f}' for x in torque_arm[:3]]}... | "
-                    f"Applied_torques={[f'{x:.2f}' for x in (torque_arm * joint_signs)[:3]]}...",
-                    end="",
-                    flush=True,
-                )
+                debug_counter += 1
+                if debug_counter % 100 == 0:
+                    torque_str = ", ".join([f"{t:6.3f}" for t in torque_arm])
+                    print(f"[DEBUG] Leader Torques (Nm): [{torque_str}]")
 
                 # Special debugging for joint 3 (the problematic one)
                 if abs(joint_pos_arm[2]) > 0.4:  # If joint 3 is getting extreme

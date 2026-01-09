@@ -1,4 +1,4 @@
-name: ur5e_gello_factr_sim
+name: ur5e_gello_factr_sim_noGripper
 
 dynamixel:
   # USB port name given by the command: ls /dev/serial/by-id/
@@ -11,10 +11,9 @@ dynamixel:
   # Joint 4 (wrist1): XC330-T288-T
   # Joint 5 (wrist2): XC330-T288-T
   # Joint 6 (wrist3): XC330-T288-T
-  # Joint 7 (gripper): XC330-T288-T
   servo_types: [
     "XC330_T288_T", "XM430_W350_T", "XM430_W350_T",
-    "XC330_T288_T", "XC330_T288_T", "XC330_T288_T", "XC330_T288_T"
+    "XC330_T288_T", "XC330_T288_T", "XC330_T288_T"
   ]
   # Servo joint directions: maps motor rotation to URDF joint rotation
   # IMPORTANT: These must match the relationship between:
@@ -23,19 +22,19 @@ dynamixel:
   # Signs for each joint to convert motor_pos -> urdf_joint_pos:
   #   urdf_joint_pos = sign * (motor_pos - offset)
   # Run validate_gello_setup.py to verify these are correct!
-  joint_signs: [1, 1, 1, 1, 1, 1, 1]
+  joint_signs: [1, -1, -1, 1, 1, 1]
   
   # Torque signs: separate from position signs!
   # For some Dynamixel motors (especially XM430), the torque direction
   # is INDEPENDENT of position direction. If gravity compensation pushes
   # the arm in the WRONG direction, invert the torque sign for that joint.
   # Discovered via diagnose_joint_signs.py and test_gravity_torques.py
-  torque_signs: [1, 1, -1, 1, 1, 1, 1]  # Inverted joints 2&3 from [-1,-1] to [+1,+1]
+  torque_signs: [1, 1, -1, 1, 1, 1]  # Inverted joints 2&3 from [-1,-1] to [+1,+1]
 
 arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
   # This URDF defines the kinematics and dynamics (masses, inertias) of the GELLO
-  leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V5/GELLO_Assembly_URDF_V5.urdf"
+  leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V4/GELLO_Assembly_URDF_V4_noGripper.urdf"
   # UR-style leader: 6 arm joints (gripper is handled separately)
   num_arm_joints: 6
   # Joint limits (in radians) - these should match the URDF and physical limits
@@ -45,10 +44,10 @@ arm_teleop:
   initialization:
     # IMPORTANT: Put the leader in EXACTLY this pose BEFORE starting gravity_compensation.py!
     # This pose is used to calculate the Dynamixel multi-turn offsets.
-    # Physical Motor Angle (approx): J1=260, J2=0, J3=260, J4=260, J5=80, J6=180
-    # URDF Target Angle (rad):      J1=260, J2=0, J3=80,  J4=80,  J5=260, J6=0  (offsets applied)
-    calibration_joint_pos: [4.53786, 0.0, 1.39626, 1.39626, 4.53786, 0.0]
-    initial_match_joint_pos: [4.53786, 0.0, 1.39626, 1.39626, 4.53786, 0.0]
+    # We use the "Candle" / Vertical pose as it is easier to align visually than horizontal.
+    # Pose: Base=0, Shoulder=-90 (Up), Elbow=0 (Straight), Wrist1=-90 (Straight), Wrist2=0, Wrist3=0
+    calibration_joint_pos: [0.0, -1.5708, 1.5708, 0.0, 0.0, 0.0]
+    initial_match_joint_pos: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]
     # Set true to block until user manually moves to initial_match_joint_pos
     enforce_initial_match: false
     # Warn if calibrated pose differs from calibration_joint_pos by more than this (in rad)
@@ -81,33 +80,18 @@ controller:
     # is typically 0.1-0.3 Nm per joint. Therefore, we need a higher gain
     # to overcome both gravity AND friction.
     # Try values between 1.0 and 2.0.
-    gain: 0.85  # Reset to 1.0 for testing with correct calibration
-      # Optional joint-space viscous damping (Nm*s/rad). Helps the leader settle and
-      # makes it easier to "let go" without slow drift. Start small.
-      # velocity_damping: 0.05
-      # Optional per-joint scaling of gravity torques (length 6 for the UR-style leader).
-      # Useful if some joints feel "weak" relative to others.
-    #gain_per_joint: [1.0, 1.0, 1.2, 1.2, 1.0, 1.0]
-    velocity_damping: 0.0
+    gain: 1.8  # Reset to 1.0 for testing with correct calibration
   null_space_regulation:
     # Target position when not actively performing tasks (matches your new start position)
     # First 6 values are arm joints; extra values are ignored by the controller.
-    null_space_joint_target: [4.53786, 0.0, 4.53786, 4.53786, 1.39626, 3.14159, 1.0]
+    null_space_joint_target: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0, 1.0]
     kp: 0.0
     kd: 0.0
   static_friction_comp:
     # Enable static friction compensation to help overcome stiction
     # This adds a small dither torque when velocity is near zero
-    enable_speed: 0.0  # rad/s threshold (reduced from 0.9 for tighter control)
+    enable_speed: 0.05  # rad/s threshold (was 0.0 = disabled)
     gain: 0.0  # Fraction of gravity torque to add as friction comp (was 0.0)
-    # Per-joint feedforward friction (estimated from physical behavior recording)
-    # These are Coulomb friction torques (Nm) added in direction of motion
-    # Estimated using: python scripts/estimate_friction_compensation.py
-    friction_feedforward: [0.0, 0.058, 0.008, 0.002, 0.002, 0.001]
-    # Viscous friction coefficient (Nm*s/rad) - proportional to velocity
-    viscous_friction: [0.003, 0.0, 0.001, 0.0, 0.0, 0.0]
-    # Velocity deadband - don't apply feedforward below this velocity (rad/s)
-    velocity_deadband: [0.02, 0.05, 0.05, 0.05, 0.05, 0.05]
   joint_limit_barrier:
     kp: 0.0
     kd: 0.0
@@ -139,7 +123,7 @@ teleop:
     # Auto-alignment will overwrite this at runtime unless auto_align is set false.
     offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     # Enable auto alignment at start to zero follower relative to current leader
-    start_joints: [4.53786, 0.0, 4.53786, 4.53786, 1.39626, 3.14159]
+    start_joints: [0.0, -1.5708, 1.5708, 0.0, 0.0, 0.0]
     auto_align: true
 
   gripper_config: [7, 197, 155]

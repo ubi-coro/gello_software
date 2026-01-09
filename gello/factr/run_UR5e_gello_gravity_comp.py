@@ -32,7 +32,9 @@ def calibrate_joint_offsets(
     def get_error(offset: float, index: int, joint_state: np.ndarray) -> float:
         joint_sign_i = joint_signs[index]
         joint_i = joint_sign_i * (joint_state[index] - offset)
-        start_i = 0.0  # Target is [0,0,0,0,0,0] for UR5e_GELLO URDF
+        # Target is Candle pose: [0, -pi/2, 0, -pi/2, 0, 0]
+        targets = [0.0, -np.pi/2, 0.0, -np.pi/2, 0.0, 0.0]
+        start_i = targets[index]
         return np.abs(joint_i - start_i)
 
     # Get current joint positions
@@ -41,9 +43,9 @@ def calibrate_joint_offsets(
     )  # FIXED: Use same method as main loop
     print(f"Current raw joint positions: {[f'{x:.3f}' for x in curr_joints]}")
 
-    # Target calibration position: UR5e_GELLO URDF home [0,0,0,0,0,0]
-    print("Target calibration position: [0.000, 0.000, 0.000, 0.000, 0.000, 0.000]")
-    print("   This targets the UR5e_GELLO URDF's home position")
+    # Target calibration position: Candle pose
+    print("Target calibration position: [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]")
+    print("   This targets the 'Candle' / Vertical pose")
 
     # Search for best offsets using the proven method
     best_offsets = []
@@ -205,6 +207,7 @@ def main():
         print("Press Ctrl+C to stop")
 
         running = True
+        debug_counter = 0
         dt = 1.0 / 500.0
 
         # Control parameters
@@ -220,8 +223,8 @@ def main():
         joint_limits_min = np.array([-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi])
         joint_limits_max = np.array([np.pi, np.pi, np.pi, np.pi, np.pi, np.pi])
 
-        # Null space target (comfortable middle position)
-        null_space_target = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        # Null space target (comfortable middle position - Candle)
+        null_space_target = np.array([0.0, -np.pi/2, 0.0, -np.pi/2, 0.0, 0.0])
 
         while running:
             start_time = time.time()
@@ -291,14 +294,10 @@ def main():
                 torque_arm += tau_ss
 
                 # LIVE DEBUG PRINTING - see what's happening
-                print(
-                    f"\r🔍 LIVE: Raw={[f'{x:.2f}' for x in joint_pos_raw[:3]]}... | "
-                    f"Calibrated={[f'{x:.2f}' for x in joint_pos_arm[:3]]}... | "
-                    f"Total_torques={[f'{x:.2f}' for x in torque_arm[:3]]}... | "
-                    f"Applied_torques={[f'{x:.2f}' for x in (torque_arm * joint_signs)[:3]]}...",
-                    end="",
-                    flush=True,
-                )
+                debug_counter += 1
+                if debug_counter % 100 == 0:
+                    torque_str = ", ".join([f"{t:6.3f}" for t in torque_arm])
+                    print(f"[DEBUG] Leader Torques (Nm): [{torque_str}]")
 
                 # Special debugging for joint 3 (the problematic one)
                 if abs(joint_pos_arm[2]) > 0.4:  # If joint 3 is getting extreme

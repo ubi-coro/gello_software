@@ -1,0 +1,130 @@
+# ============================================================================
+# GELLO UR5e Kalibrierungsposen - Referenzdokumentation
+# ============================================================================
+#
+# WICHTIG: Diese Werte sind in URDF-Koordinaten (Radiant)!
+# Der physische GELLO-Arm muss EXAKT in dieser Pose sein, bevor
+# gravity_compensation.py gestartet wird.
+#
+# Siehe auch: docs/CALIBRATION_GUIDE.md für detaillierte Anleitung
+#
+# Tools:
+#   python scripts/pose_monitor.py -c <config> --reference candle
+#   python scripts/calibrate_gello.py -c <config>
+#   python scripts/diagnose_alignment.py -c <config>
+#
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Option 1: "CANDLE" (Kerze) - EMPFOHLEN für Kalibrierung
+# ----------------------------------------------------------------------------
+# Beschreibung: Arm vollständig gestreckt, senkrecht nach OBEN zeigend
+# Vorteile:
+#   - Sehr einfach visuell zu verifizieren (alles gerade)
+#   - Minimale Kräfte durch Schwerkraft wenn gehalten
+#   - Eindeutige Position
+#
+#         [EE]
+#          |
+#        [W3]
+#          |
+#        [W2]
+#          |
+#        [W1]
+#          |
+#       [Elbow]
+#          |
+#      [Shoulder]
+#          |
+#        [Base]
+#       ═══════
+#
+calibration_joint_pos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# In Grad: [0°, 0°, 0°, 0°, 0°, 0°]
+
+# ----------------------------------------------------------------------------
+# Option 2: "HOME" (Simulation Default)
+# ----------------------------------------------------------------------------
+# Beschreibung: Arm horizontal, Wrist 90° nach unten
+# Vorteile:
+#   - Typische Startpose der MuJoCo-Simulation
+#   - Gut für direktes Teleop ohne große Anfangsbewegung
+#
+#   [Base]──[Shoulder]──[Elbow]──[W1]
+#      │                          │
+#   ═══════                      [W2]
+#                                 │
+#                               [W3]
+#                                 │
+#                              [EE]
+#
+calibration_joint_pos: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]
+# In Grad: [0°, -90°, 0°, -90°, 0°, 0°]
+
+# ----------------------------------------------------------------------------
+# Option 3: "T-POSE" (Horizontal)
+# ----------------------------------------------------------------------------
+# Beschreibung: Arm horizontal zur Seite gestreckt
+# Verwendung: Gut für Tests der horizontalen Ausrichtung
+#
+#  [Base]──[Sh]──[El]──[W1]──[W2]──[W3]──[EE]
+#     │
+#  ═══════
+#
+calibration_joint_pos: [0.0, -1.5708, 0.0, 0.0, 0.0, 0.0]
+# In Grad: [0°, -90°, 0°, 0°, 0°, 0°]
+
+# ----------------------------------------------------------------------------
+# Option 4: "L-POSE" (Ellbogen gebeugt)
+# ----------------------------------------------------------------------------
+# Beschreibung: Shoulder horizontal, Elbow 90° nach oben
+#
+#       [EE]
+#        │
+#      [W3]
+#        │
+#      [W2]
+#        │
+#      [W1]
+#        │
+#     [Elbow]
+#        │
+# [Base]──[Shoulder]
+#    │
+# ═══════
+#
+calibration_joint_pos: [0.0, -1.5708, 1.5708, 0.0, 0.0, 0.0]
+# In Grad: [0°, -90°, +90°, 0°, 0°, 0°]
+
+# ----------------------------------------------------------------------------
+# Option 5: "HOME BENT" (Kompakte Ruheposition)
+# ----------------------------------------------------------------------------
+# Beschreibung: Kompakte Position mit gebeugtem Ellbogen
+#
+#    [W1]───[W2]───[W3]───[EE]
+#     │
+#  [Elbow]
+#     │
+# [Base]──[Shoulder]
+#    │
+# ═══════
+#
+calibration_joint_pos: [0.0, -1.5708, 1.5708, -1.5708, 0.0, 0.0]
+# In Grad: [0°, -90°, +90°, -90°, 0°, 0°]
+
+# ============================================================================
+# JOINT KONVENTIONEN (UR5e URDF)
+# ============================================================================
+#
+# Joint 1 (Base):     Rotation um Z (vertikal)     | 0° = nach vorne
+# Joint 2 (Shoulder): Rotation um Y (horizontal)   | 0° = nach oben, -90° = horizontal
+# Joint 3 (Elbow):    Rotation um Y (horizontal)   | 0° = gerade, +90° = 90° Beugung
+# Joint 4 (Wrist 1):  Rotation um Y (horizontal)   | 0° = gerade, -90° = nach unten
+# Joint 5 (Wrist 2):  Rotation um Z                | 0° = neutral
+# Joint 6 (Wrist 3):  Rotation um Y                | 0° = neutral
+#
+# Positive Winkel: Gegen den Uhrzeigersinn (von Achse aus gesehen)
+# Negative Winkel: Im Uhrzeigersinn
+#
+# ============================================================================
+

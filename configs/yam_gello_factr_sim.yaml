@@ -39,6 +39,14 @@ controller:
     gain: 3.0
     damping: 0.0
     motor_scalar: 94.5652173913
+  force_position_feedback:
+    # Force-Position feedback: τ = Kp*(q_follower - q_leader) + Kd*(dq_follower - dq_leader)
+    # This is an alternative to scaled torque_feedback (FACTR style)
+    # Only one should be enabled at a time
+    enable: False
+    kp: 2.0           # Position error stiffness (Nm/rad)
+    kd: 0.1           # Velocity error damping (Nm*s/rad)
+    max_torque: 1.5   # Safety limit per joint (Nm)
   gravity_comp:
     enable: True
     gain: 0.8

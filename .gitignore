@@ -38,3 +38,9 @@ third_party/i2rt/
 
 # 3D Model Files
 *.stl
+
+*.svg
+*.npz
+*.png
+*.csv
+*.json

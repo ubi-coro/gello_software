@@ -35,17 +35,21 @@ CURRENT_CONTROL_MODE = 0
 POSITION_CONTROL_MODE = 3
 
 # Servo-specific mappings and limits
+# Mappings from Torque (Nm) to Current (mA or register units)
+# For XC330 (unit 1mA): 1000 / Torque_Constant (Nm/A)
+# For XM430 (unit 2.69mA): 1000 / Torque_Constant (Nm/A) / 2.69
 TORQUE_TO_CURRENT_MAPPING = {
-    "XC330_T288_T": 1158.73,
-    "XM430_W210_T": 1000 / 2.69,
-    "XM430_W350_T": 208.5,
+    "XC330_T288_T": 880.28,  # 1.0 Nm @ 0.88A -> 1.136 Nm/A
+    "XM430_W210_T": 285.0,   # 3.0 Nm @ 2.3A -> 1.304 Nm/A
+    "XM430_W350_T": 208.5,   # 4.1 Nm @ 2.3A -> 1.783 Nm/A
 }
 
-# Servo specifications for current limits (in mA)
+# Servo specifications for current limits (in mA or register units)
+# Set to Stall Current from datasheet to prevent overload
 SERVO_CURRENT_LIMITS = {
-    "XC330_T288_T": 1193,
-    "XM430_W210_T": 1263,
-    "XM430_W350_T": 1193,
+    "XC330_T288_T": 880,   # Stall Current 0.88A (unit 1mA)
+    "XM430_W210_T": 855,   # Stall Current 2.3A (unit 2.69mA -> ~855)
+    "XM430_W350_T": 855,   # Stall Current 2.3A (unit 2.69mA -> ~855)
 }
 
 
