@@ -30,7 +30,7 @@ dynamixel:
   # is INDEPENDENT of position direction. If gravity compensation pushes
   # the arm in the WRONG direction, invert the torque sign for that joint.
   # Discovered via diagnose_joint_signs.py and test_gravity_torques.py
-  torque_signs: [1, 1, -1, 1, 1, 1, 1]  # Inverted joints 2&3 from [-1,-1] to [+1,+1]
+  torque_signs: [1, 1, 1, 1, 1, 1, 1]  # Inverted joints 2&3 from [-1,-1] to [+1,+1]
 
 arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
@@ -60,7 +60,7 @@ gripper_teleop:
   actuation_range: 0.8
 
 controller:
-  frequency: 500
+  frequency: 300
   torque_feedback:
     enable: False
     gain: 3.0
@@ -76,30 +76,16 @@ controller:
     max_torque: 1.5   # Safety limit per joint (Nm)
   gravity_comp:
     enable: True
-    # IMPORTANT: Your GELLO is very lightweight (~0.55 kg total).
-    # Max gravity torque is only ~0.25 Nm, but friction in Dynamixel servos
-    # is typically 0.1-0.3 Nm per joint. Therefore, we need a higher gain
-    # to overcome both gravity AND friction.
-    # Try values between 1.0 and 2.0.
-    gain: 0.85  # Reset to 1.0 for testing with correct calibration
-      # Optional joint-space viscous damping (Nm*s/rad). Helps the leader settle and
-      # makes it easier to "let go" without slow drift. Start small.
-      # velocity_damping: 0.05
-      # Optional per-joint scaling of gravity torques (length 6 for the UR-style leader).
-      # Useful if some joints feel "weak" relative to others.
-    #gain_per_joint: [1.0, 1.0, 1.2, 1.2, 1.0, 1.0]
-    velocity_damping: 0.0
-  null_space_regulation:
-    # Target position when not actively performing tasks (matches your new start position)
-    # First 6 values are arm joints; extra values are ignored by the controller.
-    null_space_joint_target: [4.53786, 0.0, 4.53786, 4.53786, 1.39626, 3.14159, 1.0]
+    gain: 0.9  
+    gain_per_joint: [1.0, 1.0, 1.0, 2.0, 2.0, 2.5]
+    velocity_damping: 0.01
+  null_space_regulation: # not needed for UR5e
+    null_space_joint_target: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     kp: 0.0
     kd: 0.0
   static_friction_comp:
-    # Enable static friction compensation to help overcome stiction
-    # This adds a small dither torque when velocity is near zero
-    enable_speed: 0.0  # rad/s threshold (reduced from 0.9 for tighter control)
-    gain: 0.0  # Fraction of gravity torque to add as friction comp (was 0.0)
+    enable_speed: 0.5  # rad/s threshold 
+    gain: 0.1  # Fraction of gravity torque to add as friction comp (was 0.0)
     # Per-joint feedforward friction (estimated from physical behavior recording)
     # These are Coulomb friction torques (Nm) added in direction of motion
     # Estimated using: python scripts/estimate_friction_compensation.py
