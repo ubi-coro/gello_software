@@ -3,33 +3,38 @@ name: grav_comp_hw
 dynamixel:
   # USB port name given by the command: ls /dev/serial/by-id/
   dynamixel_port: "/dev/ttyDXL_gello"
-  baudrate: 1000000
+  baudrate: 4000000
   # Servo types
   servo_types: [
     "XC330_T288_T", "XM430_W350_T", "XM430_W350_T",
     "XC330_T288_T", "XC330_T288_T", "XC330_T288_T", "XC330_T288_T"
   ]
   # Servo joint directions to match that of the leader arm
-  joint_signs: [1, 1, -1, 1, 1, 1, 1]
+  joint_signs: [1, 1, 1, 1, 1, 1, 1]
 
 arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
-  leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V4/GELLO_Assembly_URDF_V4.urdf"
-  num_arm_joints: 7
-  arm_joint_limits_max: [3.14159, 3.14159, 3.14159, 3.14159, 3.14159, 3.14159, 3.14159]
-  arm_joint_limits_min: [-3.14159, -3.14159, -3.14159, -3.14159, -3.14159, -3.14159, -3.14159]
+  leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V5/GELLO_Assembly_URDF_V5.urdf"
+  num_arm_joints: 6
+  arm_joint_limits_max: [3.14159, 3.14159, 3.14159, 3.14159, 3.14159, 3.14159]
+  arm_joint_limits_min: [-3.14159, -3.14159, -3.14159, -3.14159, -3.14159, -3.14159]
   arm_joint_limits_safety_margin: 0.1
   initialization:
     # These are your start positions (URDF coordinates) - offsets will be auto-calculated
     calibration_joint_pos: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0, 0.0]
     initial_match_joint_pos: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0, 0.0]
+    # Set true to block until user manually moves to initial_match_joint_pos
+    enforce_initial_match: false
+    # Warn if calibrated pose differs from calibration_joint_pos by more than this (in rad)
+    # With the improved calibration resolution, this can be much tighter now
+    calibration_sanity_threshold: 0.3  # ~17° (relaxed slightly for manual alignment)
 
 gripper_teleop:
   # The maximum range (in rad) of the leader gripper trigger
   actuation_range: 0.8
 
 controller:
-  frequency: 500
+  frequency: 350
   torque_feedback:
     enable: False
     gain: 3.0
@@ -45,14 +50,16 @@ controller:
     max_torque: 1.5   # Safety limit per joint (Nm)
   gravity_comp:
     enable: True
-    gain: 0.6
+    gain: 0.9  
+    gain_per_joint: [1.0, 1.0, 1.0, 2.0, 2.3, 2.5]
+    velocity_damping: 0.01
   null_space_regulation:
-    null_space_joint_target: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0, 0.0, 1.0]
+    null_space_joint_target: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     kp: 0.0
     kd: 0.0
   static_friction_comp:
-    enable_speed: 0.15  # rad/s threshold for dither-based compensation
-    gain: 0.6
+    enable_speed: 0.5  # rad/s threshold for dither-based compensation
+    gain: 0.1
     # Per-joint feedforward friction (estimated from physical behavior recording)
     friction_feedforward: [0.0, 0.058, 0.008, 0.002, 0.002, 0.001]
     viscous_friction: [0.003, 0.0, 0.001, 0.0, 0.0, 0.0]

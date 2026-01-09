@@ -108,7 +108,7 @@ controller:
     damping: 0.1
 
 teleop:
-  enable: false
+  enable: true
   hz: 30
   wait_for_server_timeout_s: 5.0
   robot:
@@ -120,12 +120,14 @@ teleop:
     # If your sim model has a different joint order, adjust accordingly.
     index_map: [0, 1, 2, 3, 4, 5]
     # Signs to apply per joint to align sim with leader frames
-    signs: [1, -1, 1, 1, 1, 1]
+    signs: [1, 1, -1, 1, 1, 1]
     # Additional offsets (in radians) to apply to follower per joint after signs
     # Auto-alignment will overwrite this at runtime unless auto_align is set false.
-    offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # Updated: J2 offset by -90° (-1.5708 rad) per user observation.
+    # Added 90° (1.5708 rad) to J1 for "left side" setup.
+    offsets: [1.5708, -1.5708, 0.0, -4.53786, 0.0, 0.0]
     # Enable auto alignment at start to zero follower relative to current leader
-    start_joints: [4.53786, 0.0, 4.53786, 4.53786, 1.39626, 3.14159]
-    auto_align: true
+    start_joints: [4.53786, 0.0, 1.39626, 1.39626, 4.53786, 0.0]
+    auto_align: false
 
   gripper_config: [7, 197, 155]
