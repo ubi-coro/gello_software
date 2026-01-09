@@ -180,6 +180,7 @@ class DynamixelDriver(DynamixelDriverProtocol):
         baudrate: int = 57600,
         max_retries: int = 3,
         use_fake_fallback: bool = True,
+        velocity_filter_alpha: float = 0.5,
     ):
         """Initialize the DynamixelDriver class.
 
@@ -190,6 +191,7 @@ class DynamixelDriver(DynamixelDriverProtocol):
             baudrate: The baudrate for communication.
             max_retries: Maximum number of initialization attempts.
             use_fake_fallback: Whether to fallback to FakeDynamixelDriver on failure.
+            velocity_filter_alpha: EMA filter alpha for velocities (0.0 to 1.0).
         """
         self._ids = list(ids)
         self._num_joints = len(ids)
@@ -201,6 +203,9 @@ class DynamixelDriver(DynamixelDriverProtocol):
         self._is_fake = False
         self._torque_enabled = False
         self._stop_thread = Event()
+
+        self._velocity_filter_alpha = velocity_filter_alpha
+        self._filtered_velocities: Optional[np.ndarray] = None
 
         # Lock-free state: atomic reference swap (Python GIL guarantees atomicity)
         self._latest_state: Optional[JointState] = None
@@ -379,10 +384,19 @@ class DynamixelDriver(DynamixelDriverProtocol):
                 # Velocity unit: 0.229 rev/min -> rad/s
                 velocities_rad_s = raw_velocities.astype(np.float64) * 0.229 * 2.0 * np.pi / 60.0
                 
+                # Apply Exponential Moving Average (EMA) filter to velocities
+                if self._filtered_velocities is None:
+                    self._filtered_velocities = velocities_rad_s.copy()
+                else:
+                    self._filtered_velocities = (
+                        self._velocity_filter_alpha * velocities_rad_s +
+                        (1.0 - self._velocity_filter_alpha) * self._filtered_velocities
+                    )
+
                 # Atomic state update (Python GIL guarantees reference assignment is atomic)
                 self._latest_state = JointState(
                     positions=positions_rad,
-                    velocities=velocities_rad_s,
+                    velocities=self._filtered_velocities.copy(),
                     timestamp=time.time()
                 )
                 
