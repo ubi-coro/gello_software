@@ -1637,18 +1637,19 @@ class FACTRGravityCompensation:
             )
         
         # Debug output (every 100 iterations = ~0.2 second at 500Hz)
-        if not hasattr(self, "_debug_counter"):
-            self._debug_counter = 0
-        self._debug_counter += 1
-        if self._debug_counter % 100 == 0:
-            print(f"\n[DEBUG @ {self._debug_counter / (1/self.dt):.1f}s]")
-            print(f"  Arm pos (deg): {[f'{np.rad2deg(x):+7.1f}' for x in leader_arm_pos]}")
-            print(f"  Gravity τ (Nm): {[f'{x:+.4f}' for x in tau_gravity]}")
-            print(f"  Total τ (Nm):   {[f'{x:+.4f}' for x in torque_arm]}")
-            print(
-                f"  Applied τ*motor_sign: {[f'{x:+.4f}' for x in torque_arm * self.torque_signs[:self.num_arm_joints]]}"
-            )
-            print(f"UR Joint Torques (Nm): {[f'{x:+.4f}' for x in self.get_follower_joint_torques()]}")
+        if debug:=getattr(self, "debug_mode", False):
+            if not hasattr(self, "_debug_counter"):
+                self._debug_counter = 0
+            self._debug_counter += 1
+            if self._debug_counter % 100 == 0:
+                print(f"\n[DEBUG @ {self._debug_counter / (1/self.dt):.1f}s]")
+                print(f"  Arm pos (deg): {[f'{np.rad2deg(x):+7.1f}' for x in leader_arm_pos]}")
+                print(f"  Gravity τ (Nm): {[f'{x:+.4f}' for x in tau_gravity]}")
+                print(f"  Total τ (Nm):   {[f'{x:+.4f}' for x in torque_arm]}")
+                print(
+                    f"  Applied τ*motor_sign: {[f'{x:+.4f}' for x in torque_arm * self.torque_signs[:self.num_arm_joints]]}"
+                )
+                print(f"UR Joint Torques (Nm): {[f'{x:+.4f}' for x in self.get_follower_joint_torques()]}")
         
         # Apply torques only if GC is enabled (torque mode is off otherwise)
         if self.enable_gravity_comp:

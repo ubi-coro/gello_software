@@ -53,7 +53,7 @@ controller:
   gravity_comp:
     enable: True
     gain: 0.9  
-    gain_per_joint: [1.0, 1.1, 1.0, 2.0, 2.3, 2.5]
+    gain_per_joint: [1.0, 1.1, 1.0, 2.0, 2.5, 2.5]
     velocity_damping: 0.01
   null_space_regulation:
     null_space_joint_target: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
