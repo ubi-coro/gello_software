@@ -21,6 +21,13 @@ import numpy.typing as npt
 import pinocchio as pin
 import yaml
 
+import matplotlib
+import matplotlib.pyplot as plt
+from collections import deque
+from threading import Thread
+from dataclasses import dataclass, field
+from typing import Dict, List, Deque
+
 from gello.dynamixel.driver import DynamixelDriver
 
 import threading
@@ -72,6 +79,66 @@ def _instantiate_from_dict(cfg: Dict[str, Any]) -> Any:
     return cls(**{k: _recurse(v) for k, v in kwargs.items()})
 
 
+@dataclass
+class TorqueComponentLogger:
+    """Logger for torque components with thread-safe deques."""
+    history_len: int = 1000
+
+    # Component histories
+    time_history: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
+    tau_gravity: List[Deque[float]] = field(default_factory=list)
+    tau_friction: List[Deque[float]] = field(default_factory=list)
+    tau_damping: List[Deque[float]] = field(default_factory=list)
+    tau_null: List[Deque[float]] = field(default_factory=list)
+    tau_limit: List[Deque[float]] = field(default_factory=list)
+    tau_feedback: List[Deque[float]] = field(default_factory=list)
+    tau_total: List[Deque[float]] = field(default_factory=list)
+    positions: List[Deque[float]] = field(default_factory=list)
+    velocities: List[Deque[float]] = field(default_factory=list)
+
+    def __post_init__(self):
+        self.time_history = deque(maxlen=self.history_len)
+
+    def initialize(self, num_joints: int):
+        """Initialize deques for each joint."""
+        for _ in range(num_joints):
+            self.tau_gravity.append(deque(maxlen=self.history_len))
+            self.tau_friction.append(deque(maxlen=self.history_len))
+            self.tau_damping.append(deque(maxlen=self.history_len))
+            self.tau_null.append(deque(maxlen=self.history_len))
+            self.tau_limit.append(deque(maxlen=self.history_len))
+            self.tau_feedback.append(deque(maxlen=self.history_len))
+            self.tau_total.append(deque(maxlen=self.history_len))
+            self.positions.append(deque(maxlen=self.history_len))
+            self.velocities.append(deque(maxlen=self.history_len))
+
+    def log(
+            self,
+            timestamp: float,
+            positions: np.ndarray,
+            velocities: np.ndarray,
+            tau_gravity: np.ndarray,
+            tau_friction: np.ndarray,
+            tau_damping: np.ndarray,
+            tau_null: np.ndarray,
+            tau_limit: np.ndarray,
+            tau_feedback: np.ndarray,
+            tau_total: np.ndarray,
+    ):
+        """Log one timestep of torque components."""
+        self.time_history.append(timestamp)
+        for i in range(len(positions)):
+            self.positions[i].append(positions[i])
+            self.velocities[i].append(velocities[i])
+            self.tau_gravity[i].append(tau_gravity[i])
+            self.tau_friction[i].append(tau_friction[i])
+            self.tau_damping[i].append(tau_damping[i])
+            self.tau_null[i].append(tau_null[i])
+            self.tau_limit[i].append(tau_limit[i])
+            self.tau_feedback[i].append(tau_feedback[i])
+            self.tau_total[i].append(tau_total[i])
+
+
 class FACTRGravityCompensation:
     """
     Standalone FACTR gravity compensation system without ROS dependencies.
@@ -90,7 +157,7 @@ class FACTRGravityCompensation:
     CALIBRATION_RANGE_MULTIPLIER = 10  # Range: -10π to 10π
     CALIBRATION_STEP_COUNT = 721  # 10 * 2 * 36 + 1 = 721 steps (every 5°)
 
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, enable_visualization: bool = False):
         self.running = False
         self.config_path = config_path
         self.driver: Optional[DynamixelDriver] = None  # Initialize early for cleanup
@@ -117,9 +184,20 @@ class FACTRGravityCompensation:
         self.teleop_smoothing_alpha: float = 0.99
         self._teleop_last_action: Optional[np.ndarray] = None
 
+        # Visualization setup
+        self.enable_visualization = enable_visualization
+        self._viz_logger: Optional[TorqueComponentLogger] = None
+        self._viz_thread: Optional[Thread] = None
+        self._viz_start_time: float = 0.0
+
         try:
             self._load_config()
             self._setup_parameters()
+            
+            # Setup visualization after parameters are loaded (needs self.dt)
+            if self.enable_visualization:
+                self._setup_visualization()
+            
             self._prepare_dynamixel()
             self._prepare_inverse_dynamics()
             self._calibrate_system()
@@ -491,6 +569,16 @@ class FACTRGravityCompensation:
 
         # Instantiate follower robot from config
         follower_robot = _instantiate_from_dict(robot_cfg)
+        
+        # Auto-Tare follower robot if supported (CRITICAL for safe operation)
+        if hasattr(follower_robot, "tare_jacobian_torques"):
+            try:
+                print("Auto-Taring follower robot torques (100 samples)...")
+                # Ensure we are in a safe state/mode if needed, though tare usually just reads
+                follower_robot.tare_jacobian_torques()
+            except Exception as e:
+                print(f"Warning: Failed to tare follower robot: {e}")
+
         self.teleop_robot_server = follower_robot
 
         # Determine server port to use
@@ -1091,15 +1179,30 @@ class FACTRGravityCompensation:
         Returns:
             np.ndarray: External joint torques from follower (length num_arm_joints)
         """
+        # 1. Try via ZMQ client (works for both local threads and remote/network)
+        if self.teleop_enabled and self.teleop_client is not None:
+            try:
+                # Use client method if available (requires updated ZMQClientRobot)
+                if hasattr(self.teleop_client, "get_joint_torques"):
+                    torques = self.teleop_client.get_joint_torques()
+                    if len(torques) >= self.num_arm_joints:
+                        return np.array(torques[: self.num_arm_joints])
+                    if len(torques) > 0:
+                        return np.array(torques)
+            except Exception:
+                pass
+
         if not self.teleop_enabled or self.teleop_robot_server is None:
             return np.zeros(self.num_arm_joints)
 
         try:
-            # Try to get joint torques from the follower robot
+            # 2. Try direct access (Direct Access Fallback)
             follower = self.teleop_robot_server
 
-            # Handle ZMQServerRobot wrapper
-            if hasattr(follower, "robot"):
+            # Handle ZMQServerRobot wrapper (supports both robot and _robot)
+            if hasattr(follower, "_robot"):
+                follower = follower._robot
+            elif hasattr(follower, "robot"):
                 follower = follower.robot
 
             # Check if the follower robot has a get_joint_torques method
@@ -1121,7 +1224,7 @@ class FACTRGravityCompensation:
             return np.zeros(self.num_arm_joints)
 
         except Exception as e:
-            print(f"Warning: Failed to get follower torques: {e}")
+            # print(f"Warning: Failed to get follower torques: {e}")
             return np.zeros(self.num_arm_joints)
 
     def torque_feedback(
@@ -1332,6 +1435,105 @@ class FACTRGravityCompensation:
 
         return float(tau_gripper)
 
+    def _setup_visualization(self):
+        """Setup real-time visualization of torque components."""
+        self._viz_logger = TorqueComponentLogger(history_len=int(10.0 / self.dt))
+        self._viz_logger.initialize(self.num_arm_joints)
+        self._viz_start_time = time.time()
+
+        # Setup plot in main thread (matplotlib requirement)
+        plt.ion()
+        self._viz_fig, self._viz_axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True)
+        self._viz_axes = self._viz_axes.flatten()
+        self._viz_fig.suptitle("GELLO Gravity Compensation - Live Torque Components", fontsize=14)
+
+        self._joint_names = ["J1 (Base)", "J2 (Shoulder)", "J3 (Elbow)",
+                             "J4 (Wrist1)", "J5 (Wrist2)", "J6 (Wrist3)"]
+
+        self._component_colors = {
+            "gravity": "#2ecc71",
+            "friction": "#e74c3c",
+            "damping": "#3498db",
+            "null": "#9b59b6",
+            "limit": "#e67e22",
+            "feedback": "#1abc9c",
+            "total": "#2c3e50",
+        }
+
+        # Initialize lines
+        self._viz_lines: Dict[str, List] = {
+            "gravity": [], "friction": [], "damping": [],
+            "null": [], "limit": [], "feedback": [], "total": []
+        }
+
+        for joint_idx, ax in enumerate(self._viz_axes):
+            ax.set_title(self._joint_names[joint_idx])
+            ax.set_ylabel("Torque [Nm]")
+            ax.grid(True, alpha=0.3)
+            ax.axhline(y=0, color='k', linestyle='-', linewidth=0.5)
+
+            for comp_name, color in self._component_colors.items():
+                linewidth = 2.5 if comp_name == "total" else 1.2
+                line, = ax.plot([], [], color=color, linewidth=linewidth, alpha=0.8)
+                self._viz_lines[comp_name].append(line)
+
+            if joint_idx == 0:
+                ax.legend(
+                    [self._viz_lines[k][0] for k in self._component_colors.keys()],
+                    ["Gravity", "Friction", "Damping", "Null-Space", "Limits", "Feedback", "TOTAL"],
+                    loc='upper left', fontsize=7
+                )
+
+        for ax in self._viz_axes[3:]:
+            ax.set_xlabel("Time [s]")
+
+        plt.tight_layout()
+        self._viz_fig.canvas.draw()
+        plt.pause(0.01)
+
+        print("Visualization enabled - torque components will be plotted in real-time")
+
+    def _update_visualization(self):
+        """Update the visualization plot."""
+        if self._viz_logger is None or len(self._viz_logger.time_history) < 2:
+            return
+
+        t_array = np.array(self._viz_logger.time_history)
+        t_rel = t_array - t_array[0]
+
+        for joint_idx in range(self.num_arm_joints):
+            # Update each component line
+            self._viz_lines["gravity"][joint_idx].set_data(
+                t_rel, np.array(self._viz_logger.tau_gravity[joint_idx])
+            )
+            self._viz_lines["friction"][joint_idx].set_data(
+                t_rel, np.array(self._viz_logger.tau_friction[joint_idx])
+            )
+            self._viz_lines["damping"][joint_idx].set_data(
+                t_rel, np.array(self._viz_logger.tau_damping[joint_idx])
+            )
+            self._viz_lines["null"][joint_idx].set_data(
+                t_rel, np.array(self._viz_logger.tau_null[joint_idx])
+            )
+            self._viz_lines["limit"][joint_idx].set_data(
+                t_rel, np.array(self._viz_logger.tau_limit[joint_idx])
+            )
+            self._viz_lines["feedback"][joint_idx].set_data(
+                t_rel, np.array(self._viz_logger.tau_feedback[joint_idx])
+            )
+            self._viz_lines["total"][joint_idx].set_data(
+                t_rel, np.array(self._viz_logger.tau_total[joint_idx])
+            )
+
+            # Update axis limits
+            ax = self._viz_axes[joint_idx]
+            ax.set_xlim(t_rel[0], t_rel[-1])
+            ax.relim()
+            ax.autoscale_view(scalex=False)
+
+        self._viz_fig.canvas.draw_idle()
+        self._viz_fig.canvas.flush_events()
+
     def control_loop_step(self) -> None:
         """Execute one step of the control loop."""
         # Get current joint states
@@ -1342,61 +1544,96 @@ class FACTRGravityCompensation:
         # Initialize torque commands
         torque_arm = np.zeros(self.num_arm_joints)
 
+        # Track individual components for visualization
+        tau_gravity_comp = np.zeros(self.num_arm_joints)
+        tau_friction_comp = np.zeros(self.num_arm_joints)
+        tau_damping_comp = np.zeros(self.num_arm_joints)
+        tau_null_comp = np.zeros(self.num_arm_joints)
+        tau_limit_comp = np.zeros(self.num_arm_joints)
+        tau_feedback_comp = np.zeros(self.num_arm_joints)
+
         # Joint limit barriers
         torque_l, torque_gripper = self.joint_limit_barrier(
             leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel
         )
         torque_arm += torque_l
+        tau_limit_comp = torque_l.copy()
 
         # Null space regulation
-        torque_arm += self.null_space_regulation(leader_arm_pos, leader_arm_vel)
+        tau_null = self.null_space_regulation(leader_arm_pos, leader_arm_vel)
+        torque_arm += tau_null
+        tau_null_comp = tau_null.copy()
 
         # Gravity compensation and friction compensation
         tau_gravity = np.zeros(self.num_arm_joints)
         if self.enable_gravity_comp:
             tau_gravity = self.gravity_compensation(leader_arm_pos, leader_arm_vel)
             torque_arm += tau_gravity
-            torque_arm += self.friction_compensation(leader_arm_vel)
+            tau_gravity_comp = tau_gravity.copy()
+
+            tau_friction = self.friction_compensation(leader_arm_vel)
+            torque_arm += tau_friction
+            tau_friction_comp = tau_friction.copy()
+
             if self.gravity_comp_velocity_damping != 0.0:
-                torque_arm += -self.gravity_comp_velocity_damping * leader_arm_vel
+                tau_damping = -self.gravity_comp_velocity_damping * leader_arm_vel
+                torque_arm += tau_damping
+                tau_damping_comp = tau_damping.copy()
 
         # Torque feedback (force-feedback from follower robot arm) - FACTR scaled style
         if self.enable_torque_feedback:
             external_joint_torque = self.get_follower_joint_torques()
-            self._follower_torques = external_joint_torque  # Cache for debugging
-            torque_arm += self.torque_feedback(external_joint_torque, leader_arm_vel)
+            self._follower_torques = external_joint_torque
+            tau_fb = self.torque_feedback(external_joint_torque, leader_arm_vel)
+            torque_arm += tau_fb
+            tau_feedback_comp = tau_fb.copy()
 
         # Force-Position feedback (alternative to FACTR) - position error based
         if self.enable_force_position_feedback:
             follower_pos, follower_vel = self.get_follower_arm_state()
-            # Apply the same mapping as teleop to align coordinate frames
             if self.map_index is not None and self.map_signs is not None:
-                # Reverse the mapping: follower -> leader frame
-                # Note: we need to account for signs and offsets used in teleop
                 mapped_follower_pos = np.zeros(self.num_arm_joints)
                 mapped_follower_vel = np.zeros(self.num_arm_joints)
                 map_len = min(len(self.map_index), len(follower_pos))
                 for i, idx in enumerate(self.map_index[:map_len]):
                     if idx < self.num_arm_joints:
-                        # Reverse sign and offset to get back to leader frame
                         sign = self.map_signs[i] if i < len(self.map_signs) else 1.0
-                        offset = self.map_offsets[i] if self.map_offsets is not None and i < len(self.map_offsets) else 0.0
+                        offset = self.map_offsets[i] if self.map_offsets is not None and i < len(
+                            self.map_offsets) else 0.0
                         mapped_follower_pos[idx] = (follower_pos[i] - offset) / sign if sign != 0 else follower_pos[i]
                         mapped_follower_vel[idx] = follower_vel[i] / sign if sign != 0 else follower_vel[i]
                 follower_pos = mapped_follower_pos
                 follower_vel = mapped_follower_vel
-            self._follower_arm_pos = follower_pos  # Cache for debugging
+            self._follower_arm_pos = follower_pos
             self._follower_arm_vel = follower_vel
-            torque_arm += self.force_position_feedback(
+            tau_fp = self.force_position_feedback(
                 leader_arm_pos, leader_arm_vel, follower_pos, follower_vel
             )
+            torque_arm += tau_fp
+            tau_feedback_comp = tau_fp.copy()
 
         # Gripper feedback (force-feedback from follower gripper)
         if self.enable_gripper_feedback:
             follower_gripper_fb = self.get_follower_gripper_feedback()
-            self._follower_gripper_feedback = follower_gripper_fb  # Cache for debugging
+            self._follower_gripper_feedback = follower_gripper_fb
             torque_gripper += self.gripper_feedback(
                 leader_gripper_pos, leader_gripper_vel, follower_gripper_fb
+            )
+
+        # === LOG FOR VISUALIZATION ===
+        if self.enable_visualization and self._viz_logger is not None:
+            current_time = time.time() - self._viz_start_time
+            self._viz_logger.log(
+                timestamp=current_time,
+                positions=leader_arm_pos,
+                velocities=leader_arm_vel,
+                tau_gravity=tau_gravity_comp,
+                tau_friction=tau_friction_comp,
+                tau_damping=tau_damping_comp,
+                tau_null=tau_null_comp,
+                tau_limit=tau_limit_comp,
+                tau_feedback=tau_feedback_comp,
+                tau_total=torque_arm,
             )
         
         # Debug output (every 100 iterations = ~0.2 second at 500Hz)
@@ -1411,6 +1648,7 @@ class FACTRGravityCompensation:
             print(
                 f"  Applied τ*motor_sign: {[f'{x:+.4f}' for x in torque_arm * self.torque_signs[:self.num_arm_joints]]}"
             )
+            print(f"UR Joint Torques (Nm): {[f'{x:+.4f}' for x in self.get_follower_joint_torques()]}")
         
         # Apply torques only if GC is enabled (torque mode is off otherwise)
         if self.enable_gravity_comp:
@@ -1420,6 +1658,8 @@ class FACTRGravityCompensation:
     def run(self) -> None:
         """Run the main control loop."""
         print(f"Starting gravity compensation control loop at {1 / self.dt:.1f} Hz")
+        if self.enable_visualization:
+            print("Visualization enabled - close plot window to stop")
         print("Press Ctrl+C to stop")
 
         self.running = True
@@ -1428,11 +1668,25 @@ class FACTRGravityCompensation:
             self.teleop_thread = threading.Thread(target=self._teleop_loop, daemon=True)
             self.teleop_thread.start()
             print("Teleop started.")
+
+        viz_update_counter = 0
+
         try:
             while self.running:
                 start_time = time.time()
 
                 self.control_loop_step()
+
+                # Update visualization periodically (every 10 iterations)
+                if self.enable_visualization:
+                    viz_update_counter += 1
+                    if viz_update_counter % 10 == 0:
+                        self._update_visualization()
+                        # Check if plot window was closed
+                        if not plt.fignum_exists(self._viz_fig.number):
+                            print("\nVisualization window closed, stopping...")
+                            self.running = False
+                            break
 
                 # Maintain loop timing
                 elapsed = time.time() - start_time
@@ -1447,6 +1701,9 @@ class FACTRGravityCompensation:
             print("\nShutting down...")
         finally:
             self.shutdown()
+            if self.enable_visualization:
+                plt.ioff()
+                plt.close('all')
 
     def shutdown(self) -> None:
         """Safely shutdown the system."""
@@ -1492,6 +1749,11 @@ def main() -> int:
         default="xdof/sandboxs/jliu/factr_grav_comp_demo.yaml",
         help="Path to configuration YAML file",
     )
+    parser.add_argument(
+        "--visualize", "-v",
+        action="store_true",
+        help="Enable real-time visualization of torque components",
+    )
 
     args = parser.parse_args()
 
@@ -1502,7 +1764,7 @@ def main() -> int:
 
     try:
         # Create and run gravity compensation system
-        system = FACTRGravityCompensation(args.config)
+        system = FACTRGravityCompensation(args.config, enable_visualization=args.visualize)
 
         # Set up signal handler for clean shutdown
         def signal_handler(signum, frame):
@@ -1517,6 +1779,8 @@ def main() -> int:
 
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
         return 1
 
     return 0

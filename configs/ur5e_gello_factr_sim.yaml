@@ -47,8 +47,8 @@ arm_teleop:
     # This pose is used to calculate the Dynamixel multi-turn offsets.
     # Physical Motor Angle (approx): J1=260, J2=0, J3=260, J4=260, J5=80, J6=180
     # URDF Target Angle (rad):      J1=260, J2=0, J3=80,  J4=80,  J5=260, J6=0  (offsets applied)
-    calibration_joint_pos: [4.53786, 0.0, 1.39626, 1.39626, 4.53786, 0.0]
-    initial_match_joint_pos: [4.53786, 0.0, 1.39626, 1.39626, 4.53786, 0.0]
+    calibration_joint_pos: [4.53786, 0.0, 4.53786, 3.14159, 4.53786, 0.0]
+    initial_match_joint_pos: [4.53786, 0.0, 4.53786, 3.14159, 4.53786, 0.0]
     # Set true to block until user manually moves to initial_match_joint_pos
     enforce_initial_match: false
     # Warn if calibrated pose differs from calibration_joint_pos by more than this (in rad)
@@ -60,7 +60,7 @@ gripper_teleop:
   actuation_range: 0.8
 
 controller:
-  frequency: 350
+  frequency: 140
   torque_feedback:
     enable: False
     gain: 3.0
@@ -108,7 +108,7 @@ controller:
     damping: 0.1
 
 teleop:
-  enable: true
+  enable: false
   hz: 30
   wait_for_server_timeout_s: 5.0
   robot:

@@ -48,6 +48,19 @@ class ZMQServerRobot:
                     result = self._robot.command_joint_state(**args)
                 elif method == "get_observations":
                     result = self._robot.get_observations()
+                elif method == "get_joint_torques":
+                    # For robots that support torque feedback
+                    if hasattr(self._robot, "get_joint_torques"):
+                        result = self._robot.get_joint_torques()
+                    else:
+                         result = np.zeros(self._robot.num_dofs())
+                elif method == "tare_jacobian_torques":
+                    if hasattr(self._robot, "tare_jacobian_torques"):
+                        self._robot.tare_jacobian_torques(**args)
+                        result = True
+                    else:
+                        print("Warning: robot does not support tare_jacobian_torques")
+                        result = False
                 else:
                     result = {"error": "Invalid method"}
                     print(result)
@@ -72,6 +85,7 @@ class ZMQClientRobot(Robot):
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.REQ)
         self._socket.connect(f"tcp://{host}:{port}")
+        self._lock = threading.Lock()
 
     def num_dofs(self) -> int:
         """Get the number of joints in the robot.
@@ -81,8 +95,9 @@ class ZMQClientRobot(Robot):
         """
         request = {"method": "num_dofs"}
         send_message = pickle.dumps(request)
-        self._socket.send(send_message)
-        result = pickle.loads(self._socket.recv())
+        with self._lock:
+            self._socket.send(send_message)
+            result = pickle.loads(self._socket.recv())
         return result
 
     def get_joint_state(self) -> np.ndarray:
@@ -94,8 +109,9 @@ class ZMQClientRobot(Robot):
         request = {"method": "get_joint_state"}
         send_message = pickle.dumps(request)
         try:
-            self._socket.send(send_message)
-            result = pickle.loads(self._socket.recv())
+            with self._lock:
+                self._socket.send(send_message)
+                result = pickle.loads(self._socket.recv())
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(result["error"])
             return result
@@ -113,8 +129,9 @@ class ZMQClientRobot(Robot):
             "args": {"joint_state": joint_state},
         }
         send_message = pickle.dumps(request)
-        self._socket.send(send_message)
-        result = pickle.loads(self._socket.recv())
+        with self._lock:
+            self._socket.send(send_message)
+            result = pickle.loads(self._socket.recv())
         return result
 
     def get_observations(self) -> Dict[str, np.ndarray]:
@@ -126,15 +143,57 @@ class ZMQClientRobot(Robot):
         request = {"method": "get_observations"}
         send_message = pickle.dumps(request)
         try:
-            self._socket.send(send_message)
-            result = pickle.loads(self._socket.recv())
+            with self._lock:
+                self._socket.send(send_message)
+                result = pickle.loads(self._socket.recv())
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(result["error"])
             return result
         except zmq.Again:
             raise RuntimeError("ZMQ timeout - robot may be disconnected")
 
+    def get_joint_torques(self) -> np.ndarray:
+        """Get the current external joint torques from the remote robot.
+
+        Returns:
+            np.ndarray: The joint torques
+        """
+        request = {"method": "get_joint_torques"}
+        send_message = pickle.dumps(request)
+        try:
+            with self._lock:
+                self._socket.send(send_message)
+                result = pickle.loads(self._socket.recv())
+            if isinstance(result, dict) and "error" in result:
+                raise RuntimeError(result["error"])
+            return result
+        except zmq.Again:
+            # Return zeros if timeout to avoid crashing control loop
+            # BUT: ideally we should raise or log
+            print("ZMQ timeout getting torques")
+            return np.zeros(0)  # Caller will handle shape mismatch or zero
+
+    def tare_jacobian_torques(self, num_samples: int = 100) -> None:
+        """Tare the torque sensors on the remote robot.
+        
+        Args:
+            num_samples: Number of samples to average for the tare.
+        """
+        request = {
+            "method": "tare_jacobian_torques",
+            "args": {"num_samples": num_samples}
+        }
+        send_message = pickle.dumps(request)
+        try:
+            with self._lock:
+                self._socket.send(send_message)
+                # We expect a boolean or None, just consuming the reply
+                pickle.loads(self._socket.recv())
+        except zmq.Again:
+            print("ZMQ timeout taring robot")
+
     def close(self) -> None:
         """Close the ZMQ socket and context."""
-        self._socket.close()
-        self._context.term()
+        with self._lock:
+            self._socket.close()
+            self._context.term()

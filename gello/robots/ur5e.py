@@ -1,14 +1,27 @@
 from typing import Any, Dict, Optional
+import time
 
 import numpy as np
 
 from gello.robots.robot import Robot
+from gello.utils.filters import SignalFilter
 
 
 class URRobot(Robot):
     """A class representing a UR robot."""
 
-    def __init__(self, robot_ip: str = "192.168.1.10", no_gripper: bool = False):
+    def __init__(
+        self, 
+        robot_ip: str = "192.168.1.10", 
+        no_gripper: bool = False,
+        # Filter args
+        filter_type: str = "none",
+        filter_alpha: float = 0.2,
+        filter_window: int = 5,
+        filter_cutoff: float = 10.0,
+        filter_beta: float = 0.007,
+        filter_min_cutoff: float = 1.0,
+    ):
         import rtde_control
         import rtde_receive
 
@@ -33,6 +46,18 @@ class URRobot(Robot):
         self._free_drive = False
         self.robot.endFreedriveMode()
         self._use_gripper = not no_gripper
+
+        # Initialize Torque Filter and Offset
+        self.torque_offsets = np.zeros(6)
+        self.filter = SignalFilter(
+            filter_type=filter_type,
+            sampling_rate=500.0, # UR5e typical control frequency
+            alpha=filter_alpha,
+            window=filter_window,
+            cutoff_hz=filter_cutoff,
+            beta=filter_beta,
+            min_cutoff=filter_min_cutoff
+        )
 
     def num_dofs(self) -> int:
         """Get the number of joints of the robot.
@@ -109,8 +134,8 @@ class URRobot(Robot):
             self._free_drive = False
             self.robot.endFreedriveMode()
 
-    def get_joint_torques(self) -> np.ndarray:
-        """Get the current joint torques of the robot.
+    def get_joint_torques_controller(self) -> np.ndarray:
+        """Get the current joint torques of the robot directly from the controller.
 
         Returns the torques of all joints, corrected by the torque needed to move
         the robot itself (gravity, friction, etc.).
@@ -118,7 +143,23 @@ class URRobot(Robot):
         Returns:
             np.ndarray: The joint torque vector in Nm [Base, Shoulder, Elbow, Wrist1, Wrist2, Wrist3]
         """
-        return np.array(self.r_inter.getActualJointTorques())
+        return np.array(self.robot.getJointTorques())
+
+    def get_joint_torques(self) -> np.ndarray:
+        """Get the current external joint torques estimate.
+
+        Proxy for get_joint_torques_jacobian_calcualted(), which uses:
+        1. J^T * F_ext (Calculated from F/T sensor)
+        2. Tare Compensation
+        3. Signal Filtering (One-Euro/EMA/etc.)
+
+        This is generally less noisy and more reliable for sensitive force-feedback
+        than the raw controller torques on some firmware versions.
+
+        Returns:
+            np.ndarray: The joint torque vector in Nm
+        """
+        return self.get_joint_torques_jacobian_calcualted()
     
     def get_ft_wrench(self) -> np.ndarray:
         """Get the raw force and torque measurement from the UR's built-in F/T sensor.
@@ -129,12 +170,87 @@ class URRobot(Robot):
             np.ndarray: The raw wrench [fx, fy, fz, tx, ty, tz] in N and Nm.
         """
         return np.array(self.r_inter.getFtRawWrench())
+    
+    def get_actual_tcp_force(self) -> np.ndarray:
+        """
+        getActualTCPForce(self: rtde_receive.RTDEReceiveInterface) -> List[float]
+        
+        Returns:
+            Generalized forces in the TCP
+        """
+        return np.array(self.r_inter.getActualTCPForce())
+    
+    def tare_jacobian_torques(self, num_samples: int = 100) -> None:
+        """Tare the torque sensors using the robot's built-in zeroFtSensor().
+
+        This resets the F/T sensor's zero point in the controller. 
+        It is far superior to a software offset because the controller can 
+        continue to correctly compensate for payload gravity as the robot 
+        orientation changes.
+
+        Args:
+            num_samples: Unused, kept for API compatibility.
+        """
+        print("Taring F/T sensor (zeroFtSensor)...")
+        try:
+            # Sends command to controller to zero the sensor
+            success = self.robot.zeroFtSensor()
+            if success:
+                print("F/T sensor tared successfully.")
+            else:
+                print("Warning: zeroFtSensor() returned False (Robot might be moving or not ready).")
+        except Exception as e:
+            print(f"Error calling zeroFtSensor: {e}")
+        
+        # Reset software offsets - we rely on the hardware tare now
+        self.torque_offsets = np.zeros(6)
+        
+        # Allow filter to settle on new zero values
+        time.sleep(0.2)
+
+    def _calculate_raw_jacobian_torque(self, q: np.ndarray, F_ee_compensated: np.ndarray) -> np.ndarray:
+        """Helper to calculate raw J^T * F torque without offsets or filtering."""
+        # UR5e DH parameters
+        d = [0.1625, 0, 0, 0.1333, 0.0997, 0.0996]
+        a = [0, -0.425, -0.3922, 0, 0, 0]
+        alpha = [np.pi / 2, 0, 0, np.pi / 2, -np.pi / 2, 0]
+
+        T = np.eye(4)
+        transforms = [T.copy()]
+
+        for i in range(6):
+            c = np.cos(q[i])
+            s = np.sin(q[i])
+            ca = np.cos(alpha[i])
+            sa = np.sin(alpha[i])
+
+            T_i = np.array([
+                [c, -s * ca, s * sa, a[i] * c],
+                [s, c * ca, -c * sa, a[i] * s],
+                [0, sa, ca, d[i]],
+                [0, 0, 0, 1]
+            ])
+            T = T @ T_i
+            transforms.append(T.copy())
+
+        p_ee = transforms[6][:3, 3]
+
+        J = np.zeros((6, 6))
+        for i in range(6):
+            z_i = transforms[i][:3, 2]
+            p_i = transforms[i][:3, 3]
+            J[:3, i] = np.cross(z_i, p_ee - p_i)
+            J[3:, i] = z_i
+
+        return J.T @ F_ee_compensated
 
     def get_joint_torques_jacobian_calcualted(self) -> np.ndarray:
         """Calculate joint torques from end-effector wrench using Jacobian transpose.
 
         Uses the UR's built-in F/T sensor via getFtRawWrench() and computes:
         τ = J^T * F_ee
+        
+        Applies Tare Offset and Signal Filtering.
 
         Where:
             τ = joint torques (6x1)
@@ -150,57 +266,19 @@ class URRobot(Robot):
         """
         # Get current joint positions for Jacobian calculation
         q = np.array(self.r_inter.getActualQ())
-
-        # UR5e DH parameters (standard/classical DH convention as per UR documentation)
-        # d: link offset along z, a: link length along x, alpha: link twist about x
-        d = [0.1625, 0, 0, 0.1333, 0.0997, 0.0996]  # meters
-        a = [0, -0.425, -0.3922, 0, 0, 0]  # meters
-        alpha = [np.pi / 2, 0, 0, np.pi / 2, -np.pi / 2, 0]  # radians
-
-        # Compute transformation matrices and Jacobian
-        # Standard DH: T_i = Rz(θ) * Tz(d) * Tx(a) * Rx(α)
-        # T_0_i: transformation from base to joint i
-        T = np.eye(4)
-        transforms = [T.copy()]
-
-        for i in range(6):
-            c = np.cos(q[i])
-            s = np.sin(q[i])
-            ca = np.cos(alpha[i])
-            sa = np.sin(alpha[i])
-
-            # Modified DH transformation matrix
-            T_i = np.array([
-                [c, -s * ca, s * sa, a[i] * c],
-                [s, c * ca, -c * sa, a[i] * s],
-                [0, sa, ca, d[i]],
-                [0, 0, 0, 1]
-            ])
-            T = T @ T_i
-            transforms.append(T.copy())
-
-        # End-effector position
-        p_ee = transforms[6][:3, 3]
-
-        # Build geometric Jacobian (in base frame)
-        J = np.zeros((6, 6))
-        for i in range(6):
-            # z-axis of joint i (rotation axis)
-            z_i = transforms[i][:3, 2]
-            # Position of joint i origin
-            p_i = transforms[i][:3, 3]
-
-            # Linear velocity contribution: z_i x (p_ee - p_i)
-            J[:3, i] = np.cross(z_i, p_ee - p_i)
-            # Angular velocity contribution: z_i
-            J[3:, i] = z_i
-
+        
         # Get end-effector wrench from UR's built-in F/T sensor
         # F_ee = [fx, fy, fz, tx, ty, tz] - raw, not payload compensated
-        F_ee = self.get_ft_wrench()
+        F_ee_compensated = self.get_actual_tcp_force()
 
-        # Calculate joint torques: τ = J^T * F_ee
-        joint_torques = J.T @ F_ee
+        # Calculate raw joint torques: τ = J^T * F_ee
+        joint_torques = self._calculate_raw_jacobian_torque(q, F_ee_compensated)
+        
+        # Apply Tare Offset
+        joint_torques = joint_torques - self.torque_offsets
+        
+        # Apply Filter
+        joint_torques = self.filter.update(joint_torques)
 
         return joint_torques
     
@@ -219,7 +297,7 @@ class URRobot(Robot):
         pos = q.tolist() if q is not None else []
         tcp_offset = tcp.tolist() if tcp is not None else []
         # getJacobian returns a flat list of 36 elements (6x6 matrix row-major)
-        jacobian_flat = self.r_inter.getJacobian(pos, tcp_offset)
+        jacobian_flat = self.robot.getJacobian(pos, tcp_offset)
         return np.array(jacobian_flat).reshape(6, 6)
 
     def get_joint_torques_jacobian(self) -> np.ndarray:

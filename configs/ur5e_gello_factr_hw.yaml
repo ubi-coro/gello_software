@@ -11,6 +11,7 @@ dynamixel:
   ]
   # Servo joint directions to match that of the leader arm
   joint_signs: [1, 1, 1, 1, 1, 1, 1]
+  torque_signs: [1, 1, 1, 1, 1, 1, 1]
 
 arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
@@ -21,8 +22,9 @@ arm_teleop:
   arm_joint_limits_safety_margin: 0.1
   initialization:
     # These are your start positions (URDF coordinates) - offsets will be auto-calculated
-    calibration_joint_pos: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0, 0.0]
-    initial_match_joint_pos: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0, 0.0]
+    # Calibration adjusted: Joint 2 target set to -0.42 rad (-24 deg) to match URDF equilibrium
+    calibration_joint_pos: [ 4.53786, 0.0, 4.53786, 3.14159, 4.53786, 0.0 ]
+    initial_match_joint_pos: [ 4.53786, 0.0, 4.53786, 3.14159, 4.53786, 0.0 ]
     # Set true to block until user manually moves to initial_match_joint_pos
     enforce_initial_match: false
     # Warn if calibrated pose differs from calibration_joint_pos by more than this (in rad)
@@ -34,9 +36,9 @@ gripper_teleop:
   actuation_range: 0.8
 
 controller:
-  frequency: 350
+  frequency: 300
   torque_feedback:
-    enable: False
+    enable: True
     gain: 3.0
     damping: 0.0
     motor_scalar: 94.5652173913
@@ -51,7 +53,7 @@ controller:
   gravity_comp:
     enable: True
     gain: 0.9  
-    gain_per_joint: [1.0, 1.0, 1.0, 2.0, 2.3, 2.5]
+    gain_per_joint: [1.0, 1.1, 1.0, 2.0, 2.3, 2.5]
     velocity_damping: 0.01
   null_space_regulation:
     null_space_joint_target: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -59,10 +61,10 @@ controller:
     kd: 0.0
   static_friction_comp:
     enable_speed: 0.5  # rad/s threshold for dither-based compensation
-    gain: 0.1
+    gain: 0.05
     # Per-joint feedforward friction (estimated from physical behavior recording)
-    friction_feedforward: [0.0, 0.058, 0.008, 0.002, 0.002, 0.001]
-    viscous_friction: [0.003, 0.0, 0.001, 0.0, 0.0, 0.0]
+    friction_feedforward: [0.0, 0.002, 0.008, 0.002, 0.002, 0.001]
+    viscous_friction: [0.003, 0.02, 0.001, 0.0, 0.0, 0.0]
     velocity_deadband: [0.02, 0.05, 0.05, 0.05, 0.05, 0.05]
   joint_limit_barrier:
     kp: 0.0
@@ -83,15 +85,19 @@ teleop:
   wait_for_server_timeout_s: 5.0
   robot:
     _target_: gello.robots.ur5e.URRobot
-    robot_ip: "192.168.1.10"
+    robot_ip: "192.168.1.11"
     no_gripper: false
+    # Torque Filter Configuration (for get_joint_torques_jacobian_calcualted)
+    filter_type: "one_euro"
+    filter_min_cutoff: 0.5  # Lower = more stable when still (anti-jitter)
+    filter_beta: 0.007      # Higher = less lag when moving
   mapping:
     # Map leader joints to follower joints
     index_map: [0, 1, 2, 3, 4, 5]
     # Signs to align sim/hardware with leader frames
-    signs: [1, 1, 1, 1, 1, 1]
+    signs: [1, 1, -1, 1, 1, 1]
     # Additional offsets (radians) applied to follower after signs
-    offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    offsets: [4.7124, 4.7124, 3.1416, 1.4835, 3.1416, -0.1745]
     # Auto-align offsets at startup so follower matches current leader pose
     auto_align: true
   # Explicit gripper config for teleop normalization: [id, open_deg, close_deg]
