@@ -17,8 +17,8 @@ arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
   leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V5/GELLO_Assembly_URDF_V5.urdf"
   num_arm_joints: 6
-  arm_joint_limits_max: [3.14159, 3.14159, 3.14159, 3.14159, 3.14159, 3.14159]
-  arm_joint_limits_min: [-3.14159, -3.14159, -3.14159, -3.14159, -3.14159, -3.14159]
+  arm_joint_limits_max: [-3.14159, -3.14159, 3.14159, -3.14159, -3.14159, -3.14159]
+  arm_joint_limits_min: [3.14159, 3.14159, -3.14159, 3.14159, 3.14159, 3.14159]
   arm_joint_limits_safety_margin: 0.1
   initialization:
     # These are your start positions (URDF coordinates) - offsets will be auto-calculated
@@ -36,7 +36,7 @@ gripper_teleop:
   actuation_range: 0.8
 
 controller:
-  frequency: 300
+  frequency: 250
   torque_feedback:
     enable: True
     gain: 3.0
@@ -53,7 +53,7 @@ controller:
   gravity_comp:
     enable: True
     gain: 0.9  
-    gain_per_joint: [1.0, 1.1, 1.0, 2.0, 2.5, 2.5]
+    gain_per_joint: [1.0, 1.1, 1.0, 2.0, 3.0, 2.5]
     velocity_damping: 0.01
   null_space_regulation:
     null_space_joint_target: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -61,9 +61,9 @@ controller:
     kd: 0.0
   static_friction_comp:
     enable_speed: 0.5  # rad/s threshold for dither-based compensation
-    gain: 0.05
+    gain: 0.1
     # Per-joint feedforward friction (estimated from physical behavior recording)
-    friction_feedforward: [0.0, 0.002, 0.008, 0.002, 0.002, 0.001]
+    friction_feedforward: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0] # [0.0, 0.002, 0.008, 0.002, 0.002, 0.001]
     viscous_friction: [0.003, 0.02, 0.001, 0.0, 0.0, 0.0]
     velocity_deadband: [0.02, 0.05, 0.05, 0.05, 0.05, 0.05]
   joint_limit_barrier:
@@ -80,8 +80,9 @@ controller:
     damping: 0.1   # Velocity damping for gripper feedback
 
 teleop:
-  enable: true
-  hz: 30
+  enable: false
+  use_direct_rtde: true
+  hz: 250
   wait_for_server_timeout_s: 5.0
   robot:
     _target_: gello.robots.ur5e.URRobot

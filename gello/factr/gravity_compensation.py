@@ -79,6 +79,45 @@ def _instantiate_from_dict(cfg: Dict[str, Any]) -> Any:
     return cls(**{k: _recurse(v) for k, v in kwargs.items()})
 
 
+class _DirectRobotClient:
+    """Lightweight wrapper that provides ZMQClientRobot-like interface for direct robot access.
+    
+    This bypasses ZeroMQ serialization/deserialization overhead for lower latency
+    when the robot is running in the same process.
+    """
+    
+    def __init__(self, robot: Any):
+        self._robot = robot
+    
+    def num_dofs(self) -> int:
+        return self._robot.num_dofs()
+    
+    def get_joint_state(self) -> np.ndarray:
+        return np.array(self._robot.get_joint_state())
+    
+    def command_joint_state(self, joint_state: np.ndarray) -> None:
+        self._robot.command_joint_state(joint_state)
+    
+    def get_observations(self) -> Dict[str, Any]:
+        if hasattr(self._robot, "get_observations"):
+            return self._robot.get_observations()
+        return {"joint_positions": self.get_joint_state()}
+    
+    def get_joint_torques(self) -> np.ndarray:
+        if hasattr(self._robot, "get_joint_torques"):
+            return np.array(self._robot.get_joint_torques())
+        return np.zeros(self.num_dofs())
+    
+    def freedrive_enabled(self) -> bool:
+        if hasattr(self._robot, "freedrive_enabled"):
+            return self._robot.freedrive_enabled()
+        return False
+    
+    def set_freedrive_mode(self, enable: bool) -> None:
+        if hasattr(self._robot, "set_freedrive_mode"):
+            self._robot.set_freedrive_mode(enable)
+
+
 @dataclass
 class TorqueComponentLogger:
     """Logger for torque components with thread-safe deques."""
@@ -171,6 +210,8 @@ class FACTRGravityCompensation:
         self.teleop_robot_server = None
         self.teleop_threads: list[threading.Thread] = []
         self.teleop_prepared: bool = False
+        self.use_direct_rtde: bool = False  # Bypass ZMQ for lower latency
+        self._direct_follower_robot = None  # Direct reference to follower robot
         # Mapping from leader (arm joints) -> follower (first K joints)
         self.map_index: Optional[np.ndarray] = None
         self.map_signs: Optional[np.ndarray] = None
@@ -540,6 +581,9 @@ class FACTRGravityCompensation:
         if not enabled:
             return
 
+        # Check if we should use direct RTDE access (bypasses ZMQ for lower latency)
+        self.use_direct_rtde = bool(teleop_cfg.get("use_direct_rtde", False))
+
         # Lazily import here to avoid adding dependencies when teleop is disabled
         from gello.zmq_core.robot_node import ZMQClientRobot, ZMQServerRobot
         from gello.env import RobotEnv
@@ -567,6 +611,11 @@ class FACTRGravityCompensation:
             except Exception as e:
                 print(f"Warning: invalid teleop.gripper_config, ignoring: {e}")
 
+        # Inject gripper_feedback_enabled into robot config if gripper feedback is enabled
+        if self.enable_gripper_feedback and "_target_" in robot_cfg:
+            robot_cfg = dict(robot_cfg)  # Copy to avoid modifying original
+            robot_cfg["gripper_feedback_enabled"] = True
+
         # Instantiate follower robot from config
         follower_robot = _instantiate_from_dict(robot_cfg)
         
@@ -580,6 +629,8 @@ class FACTRGravityCompensation:
                 print(f"Warning: Failed to tare follower robot: {e}")
 
         self.teleop_robot_server = follower_robot
+        # Store direct reference to the actual robot (unwrapped) for direct RTDE access
+        self._direct_follower_robot = follower_robot
 
         # Determine server port to use
         server_port = base_port
@@ -590,61 +641,73 @@ class FACTRGravityCompensation:
             except Exception:
                 server_port = base_port
 
-        # Start server in background if needed
-        if hasattr(follower_robot, "serve"):
-            server_thread = threading.Thread(target=follower_robot.serve, daemon=True)
-            server_thread.start()
-            self.teleop_threads.append(server_thread)
+        # Direct RTDE mode: skip ZMQ entirely for hardware robots
+        if self.use_direct_rtde and not hasattr(follower_robot, "serve"):
+            print("Using DIRECT RTDE mode (bypassing ZMQ for lower latency)")
+            # Create a lightweight wrapper that mimics ZMQClientRobot interface
+            self.teleop_client = _DirectRobotClient(follower_robot)
+            # Create env for follower using direct client
+            from gello.env import RobotEnv
+            self.teleop_env = RobotEnv(
+                self.teleop_client, control_rate_hz=self.teleop_rate_hz
+            )
         else:
-            # Hardware robot; wrap with ZMQServerRobot and auto-select port if needed
-            from zmq.error import ZMQError  # type: ignore
+            # Start server in background if needed
+            if hasattr(follower_robot, "serve"):
+                server_thread = threading.Thread(target=follower_robot.serve, daemon=True)
+                server_thread.start()
+                self.teleop_threads.append(server_thread)
+            else:
+                # Hardware robot; wrap with ZMQServerRobot and auto-select port if needed
+                from zmq.error import ZMQError  # type: ignore
 
-            selected_port = None
-            last_error: Optional[Exception] = None
-            for port_delta in range(0, 16):
-                try:
-                    candidate_port = base_port + port_delta
-                    server = ZMQServerRobot(
-                        follower_robot, port=candidate_port, host=server_host
-                    )
-                    server_thread = threading.Thread(target=server.serve, daemon=True)
-                    server_thread.start()
-                    self.teleop_robot_server = server
-                    self.teleop_threads.append(server_thread)
-                    selected_port = candidate_port
-                    break
-                except (ZMQError, Exception) as e:  # bind may fail if address in use
-                    last_error = e
-                    msg = str(e)
-                    if "Address already in use" in msg or "address in use" in msg:
-                        continue
-                    raise
-            if selected_port is None:
-                raise RuntimeError(
-                    f"Failed to create ZMQ server for hardware follower: {last_error}"
-                )
-            server_port = selected_port
-
-        # Wait for server to become ready
-        start = time.time()
-        while True:
-            try:
-                client = ZMQClientRobot(port=server_port, host=server_host)
-                # Probe an RPC to ensure server responsiveness
-                _ = client.num_dofs()
-                self.teleop_client = client
-                break
-            except Exception:
-                if time.time() - start > server_timeout_s:
+                selected_port = None
+                last_error: Optional[Exception] = None
+                for port_delta in range(0, 16):
+                    try:
+                        candidate_port = base_port + port_delta
+                        server = ZMQServerRobot(
+                            follower_robot, port=candidate_port, host=server_host
+                        )
+                        server_thread = threading.Thread(target=server.serve, daemon=True)
+                        server_thread.start()
+                        self.teleop_robot_server = server
+                        self.teleop_threads.append(server_thread)
+                        selected_port = candidate_port
+                        break
+                    except (ZMQError, Exception) as e:  # bind may fail if address in use
+                        last_error = e
+                        msg = str(e)
+                        if "Address already in use" in msg or "address in use" in msg:
+                            continue
+                        raise
+                if selected_port is None:
                     raise RuntimeError(
-                        f"Follower server failed to start on {server_host}:{server_port} within {server_timeout_s} seconds"
+                        f"Failed to create ZMQ server for hardware follower: {last_error}"
                     )
-                time.sleep(0.1)
+                server_port = selected_port
 
-        # Create env for follower
-        self.teleop_env = RobotEnv(
-            self.teleop_client, control_rate_hz=self.teleop_rate_hz
-        )
+            # Wait for server to become ready
+            start = time.time()
+            while True:
+                try:
+                    client = ZMQClientRobot(port=server_port, host=server_host)
+                    # Probe an RPC to ensure server responsiveness
+                    _ = client.num_dofs()
+                    self.teleop_client = client
+                    break
+                except Exception:
+                    if time.time() - start > server_timeout_s:
+                        raise RuntimeError(
+                            f"Follower server failed to start on {server_host}:{server_port} within {server_timeout_s} seconds"
+                        )
+                    time.sleep(0.1)
+
+            # Create env for follower
+            from gello.env import RobotEnv
+            self.teleop_env = RobotEnv(
+                self.teleop_client, control_rate_hz=self.teleop_rate_hz
+            )
 
         # Determine follower DOFs and build mapping defaults
         try:

@@ -14,6 +14,7 @@ class URRobot(Robot):
         self, 
         robot_ip: str = "192.168.1.10", 
         no_gripper: bool = False,
+        gripper_feedback_enabled: bool = False,
         # Filter args
         filter_type: str = "none",
         filter_alpha: float = 0.2,
@@ -46,6 +47,7 @@ class URRobot(Robot):
         self._free_drive = False
         self.robot.endFreedriveMode()
         self._use_gripper = not no_gripper
+        self._gripper_feedback_enabled = gripper_feedback_enabled
 
         # Initialize Torque Filter and Offset
         self.torque_offsets = np.zeros(6)
@@ -401,12 +403,34 @@ class URRobot(Robot):
                 "commanded_force_N": 20.0,
             }
 
+    def set_gripper_feedback_enabled(self, enabled: bool) -> None:
+        """Enable or disable gripper feedback queries.
+        
+        Disabling gripper feedback avoids the ~10ms socket delay per control cycle
+        when gripper force-feedback is not needed.
+        
+        Args:
+            enabled: Whether to query gripper feedback in get_observations()
+        """
+        self._gripper_feedback_enabled = enabled
+
     def get_observations(self) -> Dict[str, Any]:
         joints = self.get_joint_state()
         pos_quat = np.zeros(7)
-        gripper_pos = np.array([joints[-1]])
+        gripper_pos = np.array([joints[-1]]) if self._use_gripper else np.array([0.0])
         joint_torques = self.get_joint_torques()
-        gripper_feedback = self.get_gripper_feedback()
+        # Only query gripper feedback if enabled (avoids ~10ms socket delay per call)
+        if self._gripper_feedback_enabled:
+            gripper_feedback = self.get_gripper_feedback()
+        else:
+            gripper_feedback = {
+                "position": float(gripper_pos[0]),
+                "is_gripping": False,
+                "position_error": 0.0,
+                "force_N": 0.0,
+                "force_normalized": 0.0,
+                "commanded_force_N": 20.0,
+            }
         return {
             "joint_positions": joints,
             "joint_velocities": joints,
