@@ -21,6 +21,13 @@ from typing import Optional, List
 import matplotlib.pyplot as plt
 import numpy as np
 
+try:
+    import rtde_control
+    import rtde_receive
+except ImportError:
+    print("ur_rtde not found. Please install it with: pip install ur_rtde")
+    exit(1)
+
 
 class SignalFilter:
     """
@@ -254,8 +261,7 @@ class UR5eTorqueVisualizer:
 
     def _connect_robot(self) -> None:
         """Connect to UR5e via RTDE."""
-        import rtde_control
-        import rtde_receive
+        # rtde imports are now global
 
         print(f"Connecting to UR5e at {self.robot_ip}...")
         
@@ -304,6 +310,10 @@ class UR5eTorqueVisualizer:
             tau_manual = self._calculate_jacobian_torques_manual(np.array(q), tcp_force)
             print(f"Manual Jacobian (Nm):  {[f'{x:+.2f}' for x in tau_manual]}")
 
+        elif self.mode == "semi-manual":
+            # Just print a placeholder or do a one-off fetch
+            print(f"Semi-manual Jacobian:  (Will be fetched at start of run)")
+
         print("="*70 + "\n")
 
     def _setup_plot(self) -> None:
@@ -327,7 +337,8 @@ class UR5eTorqueVisualizer:
         
         title_map = {
             "direct": "External Joint Torques (Controller Reported)",
-            "manual": "External Joint Torques (Calculated: $J^T F_{tcp}$)"
+            "manual": "External Joint Torques (Calculated: $J^T F_{tcp}$)",
+            "semi-manual": "External Joint Torques (Semi-Manual: $J_{fixed}^T F_{tcp}$)"
         }
         self.fig.suptitle(f"UR5e {title_map.get(self.mode, 'Unknown')}", fontsize=20, weight='bold')
 
@@ -441,6 +452,16 @@ class UR5eTorqueVisualizer:
         print(f"Mode: {self.mode.upper()}")
         print("="*70)
         
+        # Determine Jacobian for semi-manual mode
+        self.J_semi = None
+        if self.mode == "semi-manual":
+            print("Fetching initial Jacobian from controller (semi-manual)...")
+            q_start = self.rtde_r.getActualQ()
+            # RTDE getJacobian() returns a flattened 6x6 matrix (36 floats)
+            J_flat = self.rtde_c.getJacobian(q_start)
+            self.J_semi = np.array(J_flat).reshape(6, 6)
+            print("Jacobian cached.")
+
         if self.enable_freedrive:
             print("FREEDRIVE MODE: Move the robot arm by hand")
         else:
@@ -477,6 +498,9 @@ class UR5eTorqueVisualizer:
                                 q = self.rtde_r.getActualQ()
                                 tcp_force = np.array(self.rtde_r.getActualTCPForce())
                                 t = self._calculate_jacobian_torques_manual(np.array(q), tcp_force)
+                            elif self.mode == "semi-manual":
+                                tcp_force = np.array(self.rtde_r.getActualTCPForce())
+                                t = self.J_semi.T @ tcp_force
                             offsets.append(t)
                             time.sleep(self.dt)
 
@@ -492,19 +516,43 @@ class UR5eTorqueVisualizer:
                 tau_plot = np.zeros(6)
 
                 # --- Fetch Data based on Mode ---
-                if self.mode == "direct":
-                    # Direct mode: Just get the torques from the controller (already compensated)
-                    # We fetch from CONTROL interface
-                    tau_plot = np.array(self.rtde_c.getJointTorques())
-                    
-                elif self.mode == "manual":
-                    # Manual mode: Fetch state and calculate J^T * F
-                    # We fetch from RECEIVE interface
-                    q = self.rtde_r.getActualQ()
-                    tcp_force = np.array(self.rtde_r.getActualTCPForce())
-                    
-                    tau_plot = self._calculate_jacobian_torques_manual(np.array(q), tcp_force)
+                try:
+                    # --- Fetch Data based on Mode ---
+                    if self.mode == "direct":
+                        # Direct mode: Just get the torques from the controller (already compensated)
+                        # We fetch from CONTROL interface
+                        tau_plot = np.array(self.rtde_c.getJointTorques())
+                        
+                    elif self.mode == "manual":
+                        # Manual mode: Fetch state and calculate J^T * F
+                        # We fetch from RECEIVE interface
+                        q = self.rtde_r.getActualQ()
+                        tcp_force = np.array(self.rtde_r.getActualTCPForce())
+                        
+                        tau_plot = self._calculate_jacobian_torques_manual(np.array(q), tcp_force)
 
+                    elif self.mode == "semi-manual":
+                        # Semi-manual: Use cached Jacobian and current tcp force
+                        tcp_force = np.array(self.rtde_r.getActualTCPForce())
+                        tau_plot = self.J_semi.T @ tcp_force
+                
+                except Exception as e:
+                    # Handle potential connection drop (e.g. End of File from RTDE)
+                    err_str = str(e)
+                    if "End of file" in err_str or "Broken pipe" in err_str:
+                        print(f"\nConnection lost ({err_str}). Attempting to reconnect RTDE Receive...")
+                        try:
+                            # Try to reconnect receive interface
+                            self.rtde_r = rtde_receive.RTDEReceiveInterface(self.robot_ip)
+                            print("RTDE Receive reconnected.")
+                            # Retry this loop iteration
+                            continue 
+                        except Exception as rec_e:
+                            print(f"Reconnection failed: {rec_e}")
+                            break
+                    else:
+                        print(f"Error fetching data: {e}")
+                        break
                 # Apply tare offset
                 tau_plot = tau_plot - self.torque_offsets
 
@@ -572,9 +620,9 @@ def main():
     )
     parser.add_argument(
         "--mode", "-m",
-        choices=["direct", "manual"],
+        choices=["direct", "manual", "semi-manual"],
         default="direct",
-        help="Torque visualization mode: 'direct' (Controller) or 'manual' (Jacobian Calculation)"
+        help="Torque visualization mode: 'direct' (Controller), 'manual' (Jacobian Calculation), or 'semi-manual' (Fixed Jacobian)"
     )
     parser.add_argument(
         "--tare",

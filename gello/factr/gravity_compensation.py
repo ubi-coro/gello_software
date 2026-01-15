@@ -225,6 +225,10 @@ class FACTRGravityCompensation:
         self.teleop_smoothing_alpha: float = 0.99
         self._teleop_last_action: Optional[np.ndarray] = None
 
+        # Semi-manual torque calculation (Jacobian based)
+        self.J_semi: Optional[np.ndarray] = None
+        self.J_semi_tare: Optional[np.ndarray] = None
+
         # Visualization setup
         self.enable_visualization = enable_visualization
         self._viz_logger: Optional[TorqueComponentLogger] = None
@@ -651,6 +655,55 @@ class FACTRGravityCompensation:
             self.teleop_env = RobotEnv(
                 self.teleop_client, control_rate_hz=self.teleop_rate_hz
             )
+
+            # --- Semi-Manual Torque Initialization ---
+            # Try to grab Jacobian from UR controller if available
+            try:
+                # Look for standard UR RTDE interfaces in the follower wrapper
+                ur_c = getattr(follower_robot, "c_inter", None) # RTDEControlInterface
+                ur_r = getattr(follower_robot, "r_inter", None) # RTDEReceiveInterface
+                
+                if ur_c is not None and ur_r is not None:
+                    print("Initializing Semi-Manual Torque Calculation (Jacobian method)...")
+                    
+                    # 1. Fetch Jacobian (one-off)
+                    q_start = ur_r.getActualQ()
+                    J_flat = ur_c.getJacobian(q_start)
+                    self.J_semi = np.array(J_flat).reshape(6, 6)
+                    
+                    # 2. Tare (calculate offsets)
+                    tare_success = False
+                    if hasattr(ur_c, "zeroFtSensor"):
+                        print("Attempting hardware tare (zeroFtSensor)...")
+                        try:
+                            if ur_c.zeroFtSensor():
+                                print("Hardware tare successful.")
+                                self.J_semi_tare = np.zeros(6)
+                                tare_success = True
+                                time.sleep(0.2)
+                            else:
+                                print("Hardware tare failed (robot moving?). Falling back to software tare.")
+                        except Exception as e:
+                            print(f"Hardware tare exception: {e}")
+
+                    if not tare_success:
+                        if hasattr(ur_r, "getActualTCPForce"):
+                            print("Taring semi-manual torques (averaging 50 samples)...")
+                            offsets = []
+                            for _ in range(50):
+                                tcp_force = np.array(ur_r.getActualTCPForce())
+                                t = self.J_semi.T @ tcp_force
+                                offsets.append(t)
+                                time.sleep(0.01)
+                            self.J_semi_tare = np.mean(offsets, axis=0)
+                            print(f"Semi-Manual Tare complete. Offsets: {[f'{x:+.2f}' for x in self.J_semi_tare]}")
+                        else:
+                            print("Warning: getActualTCPForce not found on receive interface.")
+                            self.J_semi_tare = np.zeros(6)
+            except Exception as e:
+                print(f"Failed to initialize semi-manual torque: {e}")
+                self.J_semi = None
+
         else:
             # Start server in background if needed
             if hasattr(follower_robot, "serve"):
@@ -1105,18 +1158,7 @@ class FACTRGravityCompensation:
         ) * exceed_min_mask
 
         # Gripper limits
-        if gripper_joint_pos > self.gripper_limit_max:
-            tau_l_gripper = (
-                -self.joint_limit_kp * (gripper_joint_pos - self.gripper_limit_max)
-                - self.joint_limit_kd * gripper_joint_vel
-            )
-        elif gripper_joint_pos < self.gripper_limit_min:
-            tau_l_gripper = (
-                -self.joint_limit_kp * (gripper_joint_pos - self.gripper_limit_min)
-                - self.joint_limit_kd * gripper_joint_vel
-            )
-        else:
-            tau_l_gripper = 0.0
+        tau_l_gripper = 0.0
 
         return tau_l, tau_l_gripper
 
@@ -1235,7 +1277,25 @@ class FACTRGravityCompensation:
     def get_follower_joint_torques(self) -> np.ndarray:
         """Get external joint torques from the follower robot.
 
-        This method retrieves the current joint torques from the follower robot
+        This m--- PREFERRED: Semi-Manual Calculation (Jacobian Transpose) ---
+            # If we successfully initialized the Jacobian from the controller
+            if self.J_semi is not None and self.J_semi_tare is not None:
+                if hasattr(follower, "r_inter"):
+                    try:
+                        tcp_force = np.array(follower.r_inter.getActualTCPForce())
+                        # τ = J^T * F_tcp
+                        t_calc = self.J_semi.T @ tcp_force
+                        # Apply tare
+                        t_ext = t_calc - self.J_semi_tare
+                        
+                        # Return properly sized array
+                        if len(t_ext) >= self.num_arm_joints:
+                            return np.array(t_ext[: self.num_arm_joints])
+                        return np.array(t_ext)
+                    except Exception:
+                        pass # Fall back to other methods
+
+            # ethod retrieves the current joint torques from the follower robot
         for force-feedback. The torques are gravity/friction compensated by the
         follower's controller (e.g., UR5e's getActualJointTorques()).
 

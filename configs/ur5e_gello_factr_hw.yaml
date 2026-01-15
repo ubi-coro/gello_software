@@ -17,8 +17,8 @@ arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
   leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V5/GELLO_Assembly_URDF_V5.urdf"
   num_arm_joints: 6
-  arm_joint_limits_max: [-3.14159, -3.14159, 3.14159, -3.14159, -3.14159, -3.14159]
-  arm_joint_limits_min: [3.14159, 3.14159, -3.14159, 3.14159, 3.14159, 3.14159]
+  arm_joint_limits_max: [6.28318, 3.14159, 7.0, 4.53786, 6.28318, 2.0]
+  arm_joint_limits_min: [3.14159, -1.571, 3.4, 0.0, 3.14159, -1.0]
   arm_joint_limits_safety_margin: 0.1
   initialization:
     # These are your start positions (URDF coordinates) - offsets will be auto-calculated
@@ -67,8 +67,8 @@ controller:
     viscous_friction: [0.003, 0.02, 0.001, 0.0, 0.0, 0.0]
     velocity_deadband: [0.02, 0.05, 0.05, 0.05, 0.05, 0.05]
   joint_limit_barrier:
-    kp: 0.0
-    kd: 0.0
+    kp: 1.0
+    kd: 0.01
   joint_position_control:
     interpolation_step_size: 0.01
     kp: 1.03561658022
@@ -80,7 +80,7 @@ controller:
     damping: 0.1   # Velocity damping for gripper feedback
 
 teleop:
-  enable: false
+  enable: true
   use_direct_rtde: true
   hz: 250
   wait_for_server_timeout_s: 5.0
