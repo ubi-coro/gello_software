@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import time
+import multiprocessing as mp
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -178,6 +179,109 @@ class TorqueComponentLogger:
             self.tau_total[i].append(tau_total[i])
 
 
+def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
+    """Worker process for visualization to avoid blocking control loop."""
+    import matplotlib.pyplot as plt
+    
+    # Re-instantiate logger in this process
+    logger = TorqueComponentLogger(history_len=int(10.0 / dt))
+    logger.initialize(num_joints)
+
+    # Setup plot
+    plt.ion()
+    viz_fig, viz_axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True)
+    viz_axes = viz_axes.flatten()
+    viz_fig.suptitle("GELLO Gravity Compensation - Live Torque Components", fontsize=14)
+
+    joint_names = ["J1 (Base)", "J2 (Shoulder)", "J3 (Elbow)",
+                    "J4 (Wrist1)", "J5 (Wrist2)", "J6 (Wrist3)"]
+
+    component_colors = {
+        "gravity": "#2ecc71",
+        "friction": "#bdc3c7", # Light grey
+        "damping": "#3498db",
+        "null": "#9b59b6",
+        "limit": "#e67e22",
+        "feedback": "#1abc9c",
+        "total": "#2c3e50",
+        "total_smooth": "#c0392b", # Red (Smoothed)
+    }
+
+    viz_lines = {
+        "gravity": [], "friction": [], "damping": [],
+        "null": [], "limit": [], "feedback": [], "total": [],
+        "total_smooth": []
+    }
+
+    # Initialize lines
+    for joint_idx, ax in enumerate(viz_axes):
+        if joint_idx >= num_joints: break
+        ax.set_title(joint_names[joint_idx] if joint_idx < len(joint_names) else f"Joint {joint_idx+1}")
+        ax.grid(True, alpha=0.3)
+        ax.set_ylabel("Torque (Nm)")
+        
+        for name, color in component_colors.items():
+            # Friction gets thinner line and transparency to reduce visual clutter from dithering
+            # Total and Total Smooth get thicker lines
+            lw = 1.5 if "total" in name else (0.5 if name == "friction" else 1.0)
+            alpha = 0.5 if name == "friction" else 1.0
+            
+            line, = ax.plot([], [], label=name, color=color, linewidth=lw, alpha=alpha)
+            viz_lines[name].append(line)
+        
+        if joint_idx == 0:
+            ax.legend(loc="upper left", fontsize="x-small", ncol=2)
+
+    plt.tight_layout()
+
+    while True:
+        # Drain queue to catch up
+        try:
+            while not queue.empty():
+                data = queue.get_nowait()
+                if data is None:  # Poison pill
+                    plt.close(viz_fig)
+                    return
+                logger.log(*data)
+        except Exception:
+            pass
+
+        # Update plot at roughly 10-30Hz
+        if len(logger.time_history) > 2:
+            t_array = np.array(logger.time_history)
+            t_rel = t_array - t_array[0]
+
+            for joint_idx in range(num_joints):
+                if joint_idx >= len(viz_axes): break
+                
+                if len(logger.tau_gravity) > joint_idx:
+                    viz_lines["gravity"][joint_idx].set_data(t_rel, logger.tau_gravity[joint_idx])
+                    viz_lines["friction"][joint_idx].set_data(t_rel, logger.tau_friction[joint_idx])
+                    viz_lines["damping"][joint_idx].set_data(t_rel, logger.tau_damping[joint_idx])
+                    viz_lines["null"][joint_idx].set_data(t_rel, logger.tau_null[joint_idx])
+                    viz_lines["limit"][joint_idx].set_data(t_rel, logger.tau_limit[joint_idx])
+                    viz_lines["feedback"][joint_idx].set_data(t_rel, logger.tau_feedback[joint_idx])
+                    viz_lines["total"][joint_idx].set_data(t_rel, logger.tau_total[joint_idx])
+
+                    # Calculate smoothed total to see underlying moments (removes dither)
+                    raw_total = np.array(logger.tau_total[joint_idx])
+                    win_size = 20 # ~40ms window at 500Hz
+                    if len(raw_total) >= win_size:
+                        kernel = np.ones(win_size) / win_size
+                        # mode='valid' returns len(N) - len(K) + 1. Align with end of window.
+                        smooth = np.convolve(raw_total, kernel, mode='valid')
+                        viz_lines["total_smooth"][joint_idx].set_data(t_rel[win_size-1:], smooth)
+
+                viz_axes[joint_idx].relim()
+                viz_axes[joint_idx].autoscale_view(scalex=True, scaley=True)
+
+            viz_fig.canvas.draw_idle()
+            viz_fig.canvas.flush_events()
+        
+        # Don't hog CPU in this process, allow GUI to update
+        plt.pause(0.05)
+
+
 class FACTRGravityCompensation:
     """
     Standalone FACTR gravity compensation system without ROS dependencies.
@@ -231,8 +335,8 @@ class FACTRGravityCompensation:
 
         # Visualization setup
         self.enable_visualization = enable_visualization
-        self._viz_logger: Optional[TorqueComponentLogger] = None
-        self._viz_thread: Optional[Thread] = None
+        self._viz_queue: Optional[mp.Queue] = None
+        self._viz_process: Optional[mp.Process] = None
         self._viz_start_time: float = 0.0
 
         try:
@@ -876,6 +980,70 @@ class FACTRGravityCompensation:
         except Exception as e:
             print(f"Warning: teleop debug print failed: {e}")
 
+        # Verify coordinate alignment at startup
+
+        if self.enable_force_position_feedback:
+            try:
+                leader_pos, _, _, _ = self.get_leader_joint_states()
+                
+                # Debug: Check what _direct_follower_robot gives us
+                print(f"\n[DEBUG] _direct_follower_robot type: {type(self._direct_follower_robot)}")
+                if self._direct_follower_robot is not None:
+                    fr = self._direct_follower_robot
+                    print(f"  has r_inter: {hasattr(fr, 'r_inter')}")
+                    if hasattr(fr, 'r_inter'):
+                        raw_q = fr.r_inter.getActualQ()
+                        print(f"  r_inter.getActualQ(): {[f'{np.rad2deg(x):+.1f}°' for x in raw_q]}")
+                
+                follower_pos, follower_vel = self.get_follower_arm_state()
+                print(f"  get_follower_arm_state() pos: {[f'{np.rad2deg(x):+.1f}°' for x in follower_pos]}")
+                print(f"    pos: {[f'{np.rad2deg(x):+.1f}°' for x in follower_pos]}")
+                print(f"    vel: {[f'{x:+.3f}' for x in follower_vel]}")
+
+
+                follower_pos, _ = self.get_follower_arm_state()
+                
+                # Transform follower to leader frame (CORRECTED)
+                follower_mapped = np.zeros(self.num_arm_joints)
+                
+                if self.map_index is not None and self.map_signs is not None and self.map_offsets is not None:
+                    for follower_idx in range(min(len(self.map_index), len(follower_pos))):
+                        leader_idx = self.map_index[follower_idx]
+                        
+                        if leader_idx < self.num_arm_joints:
+                            sign = self.map_signs[follower_idx] if follower_idx < len(self.map_signs) else 1.0
+                            offset = self.map_offsets[follower_idx] if follower_idx < len(self.map_offsets) else 0.0
+                            
+                            if abs(sign) > 1e-6:
+                                follower_mapped[leader_idx] = (follower_pos[follower_idx] - offset) / sign
+                            else:
+                                follower_mapped[leader_idx] = follower_pos[follower_idx]
+                else:
+                    follower_mapped = follower_pos[:self.num_arm_joints]
+                
+                init_error = np.abs(follower_mapped - leader_pos)
+                max_error = np.max(init_error)
+                
+                print(f"\n[Force-Position Feedback Startup Check]")
+                print(f"  Leader pos (deg):          {[f'{np.rad2deg(x):+7.1f}' for x in leader_pos]}")
+                print(f"  Follower pos RAW (deg):    {[f'{np.rad2deg(x):+7.1f}' for x in follower_pos]}")
+                print(f"  Follower pos MAPPED (deg): {[f'{np.rad2deg(x):+7.1f}' for x in follower_mapped]}")
+                print(f"  Initial position error:    {[f'{np.rad2deg(x):.1f}°' for x in init_error]}")
+                print(f"  Max error: {np.rad2deg(max_error):.1f}°")
+                
+                if max_error > np.deg2rad(30):
+                    print(f"  WARNING: Large initial error! Force-Position feedback may cause sudden torques.")
+                    print(f"           Consider starting with robots aligned, or use torque_feedback instead.")
+            except Exception as e:
+                print(f"  Startup check failed: {e}")
+
+
+        # Check if impedance mode is enabled
+        impedance_cfg = teleop_cfg.get("impedance", {})
+        self.use_impedance_control = bool(impedance_cfg.get("enable", False))
+        if self.use_impedance_control:
+            print("Impedance control ENABLED for teleop (will use directTorque at 500Hz)")
+
     def _move_follower_to_start(self, target_joints: np.ndarray) -> None:
         assert self.teleop_env is not None
         obs = self.teleop_env.get_obs()
@@ -989,6 +1157,142 @@ class FACTRGravityCompensation:
             sleep_t = rate_dt - elapsed
             if sleep_t > 0:
                 time.sleep(sleep_t)
+
+    def _teleop_loop_impedance(self) -> None:
+        """Teleop loop using impedance control instead of position control.
+        
+        This provides compliant behavior - the robot yields on contact
+        instead of building up force like position control does.
+        """
+        assert self.teleop_env is not None
+        assert self._direct_follower_robot is not None
+        
+        # Load impedance parameters from config
+        impedance_cfg = self.config.get("teleop", {}).get("impedance", {})
+        kp = float(impedance_cfg.get("kp", 50.0))
+        kd = float(impedance_cfg.get("kd", 5.0))
+        use_leader_velocity = bool(impedance_cfg.get("use_leader_velocity", False))
+        
+        # CRITICAL: directTorque requires 500 Hz!
+        rate_hz = 500.0
+        rate_dt = 1.0 / rate_hz
+
+        # Gripper throtteling setting
+        gripper_update_hz = 30.0 # only update gripper at 30Hz
+        gripper_position_threshold = 0.02 # Only update if position changed by >2%
+        last_gripper_cmd = -1.0 # track last comanded gripper position
+        
+        print(f"Starting IMPEDANCE teleop loop (Kp={kp}, Kd={kd}, 500Hz)")
+        print(f"  Leader velocity feedforward: {use_leader_velocity}")
+        print(f"    Gripper update rate: {gripper_update_hz}Hz (threaded)")
+        
+        follower = self._direct_follower_robot
+        
+        # Timing statistics
+        loop_count = 0
+        overrun_count = 0
+        start_time = time.time()
+
+        has_gripper = (
+            hasattr(follower, 'gripper') and
+            hasattr(follower, '_use_gripper') and
+            follower._use_gripper
+        )
+
+        # --- NON-BLOCKING GRIPPER WORKER START ---
+        self._gripper_cmd_lock = threading.Lock()
+        self._latest_gripper_pos = None # None means no new command
+        
+        def gripper_worker():
+            while self.running:
+                pos = None
+                with self._gripper_cmd_lock:
+                    if self._latest_gripper_pos is not None:
+                        pos = self._latest_gripper_pos
+                        self._latest_gripper_pos = None # Mark as consumed
+                
+                if pos is not None:
+                    try:
+                        # This blocking call now happens in a separate thread!
+                        follower.gripper.move(pos, 255, 10) 
+                    except Exception as e:
+                        print(f"Gripper thread error: {e}")
+                
+                time.sleep(1.0 / gripper_update_hz) # Run at 30Hz
+
+        if has_gripper:
+            threading.Thread(target=gripper_worker, daemon=True).start()
+        # --- WORKER END ---
+        
+        while self.running:
+            t0 = time.time()
+            
+            try:
+                # 1. Get leader state (already transformed via offsets/signs)
+                leader_arm_pos, leader_arm_vel, leader_gripper_pos, _ = (
+                    self.get_leader_joint_states()
+                )
+                
+                # 2. Apply teleop mapping (leader → follower coordinates)
+                target_joints = self._build_follower_action(leader_arm_pos, leader_gripper_pos)
+                
+                # 3. Optionally map leader velocity
+                if use_leader_velocity and self.map_signs is not None:
+                    target_vel = self.map_signs * leader_arm_vel[self.map_index]
+                else:
+                    target_vel = None  # Pure damping mode
+                
+                # 4. Send impedance command to follower
+                success = follower.command_joint_state_impedance(
+                    target_joints=target_joints[:6],
+                    target_velocities=target_vel,
+                    kp=kp,
+                    kd=kd,
+                )
+                
+                if not success:
+                    print("Warning: directTorque returned False - robot may have exited torque mode")
+                
+                # 5. Handle gripper separately (stays position-controlled)
+                if has_gripper and len(target_joints) > 6:
+                    gripper_target = target_joints[-1]
+
+                    if abs(gripper_target - last_gripper_cmd) > gripper_position_threshold:
+                        gripper_pos = int(gripper_target * 255)
+                        gripper_pos = max(0, min(255, gripper_pos))
+                        
+                        with self._gripper_cmd_lock:
+                            self._latest_gripper_pos = gripper_pos
+                        
+                        last_gripper_cmd = gripper_target
+                
+                loop_count += 1
+                
+            except Exception as e:
+                print(f"Impedance teleop error: {e}")
+            
+            # Maintain 500 Hz timing (CRITICAL for directTorque!)
+            elapsed = time.time() - t0
+            sleep_t = rate_dt - elapsed
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+            else:
+                overrun_count += 1
+                if overrun_count % 100 == 0:
+                    print(f"Warning: Impedance loop overrun #{overrun_count} ({elapsed*1000:.1f}ms)")
+        
+        # Print statistics
+        total_time = time.time() - start_time
+        actual_hz = loop_count / total_time if total_time > 0 else 0
+        print(f"\nImpedance teleop stopped:")
+        print(f"  Loops: {loop_count}, Time: {total_time:.1f}s, Rate: {actual_hz:.1f}Hz")
+        print(f"  Overruns: {overrun_count} ({100*overrun_count/max(loop_count,1):.1f}%)")
+        
+        # Return to safe state
+        try:
+            follower.robot.stopJ(2.0)  # Decelerate and stop
+        except Exception as e:
+            print(f"Warning: stopJ failed: {e}")
 
     def _get_dynamixel_offsets(self, verbose: bool = True) -> None:
         """Calibrate Dynamixel servos to match expected joint positions.
@@ -1387,34 +1691,53 @@ class FACTRGravityCompensation:
         Returns:
             Tuple of (positions, velocities) arrays, each of length num_arm_joints
         """
-        if not self.teleop_enabled or self.teleop_robot_server is None:
+        if not self.teleop_enabled:
             return np.zeros(self.num_arm_joints), np.zeros(self.num_arm_joints)
 
         try:
-            follower = self.teleop_robot_server
+            # Priority 1: Direct RTDE access (lowest latency)
+            if self._direct_follower_robot is not None:
+                follower = self._direct_follower_robot
+                
+                # UR-RTDE style (direct access to receive interface)
+                if hasattr(follower, "r_inter"):
+                    pos = np.array(follower.r_inter.getActualQ())
+                    vel = np.array(follower.r_inter.getActualQd())
+                    return pos[:self.num_arm_joints], vel[:self.num_arm_joints]
+                
+                # Fallback: get_joint_state (position only)
+                if hasattr(follower, "get_joint_state"):
+                    pos = np.array(follower.get_joint_state())
+                    return pos[:self.num_arm_joints], np.zeros(self.num_arm_joints)
 
-            # Handle ZMQServerRobot wrapper
-            if hasattr(follower, "robot"):
-                follower = follower.robot
+            # Priority 2: Via teleop client (ZMQ or direct wrapper)
+            if self.teleop_client is not None:
+                if hasattr(self.teleop_client, "get_observations"):
+                    obs = self.teleop_client.get_observations()
+                    pos = np.array(obs.get("joint_positions", np.zeros(self.num_arm_joints)))
+                    vel = np.array(obs.get("joint_velocities", np.zeros(self.num_arm_joints)))
+                    return pos[:self.num_arm_joints], vel[:self.num_arm_joints]
 
-            # Try get_observations first (most complete)
-            if hasattr(follower, "get_observations"):
-                obs = follower.get_observations()
-                pos = np.array(obs.get("joint_positions", np.zeros(self.num_arm_joints)))
-                vel = np.array(obs.get("joint_velocities", np.zeros(self.num_arm_joints)))
-                # Ensure we only get arm joints (not gripper)
-                return pos[:self.num_arm_joints], vel[:self.num_arm_joints]
+            # Priority 3: Via teleop_robot_server (legacy path)
+            if self.teleop_robot_server is not None:
+                follower = self.teleop_robot_server
 
-            # Fallback: try get_joint_state
-            if hasattr(follower, "get_joint_state"):
-                pos = np.array(follower.get_joint_state())
-                return pos[:self.num_arm_joints], np.zeros(self.num_arm_joints)
+                # Handle ZMQServerRobot wrapper
+                if hasattr(follower, "_robot"):
+                    follower = follower._robot
+                elif hasattr(follower, "robot"):
+                    follower = follower.robot
 
-            # UR-RTDE style
-            if hasattr(follower, "r_inter"):
-                pos = np.array(follower.r_inter.getActualQ())
-                vel = np.array(follower.r_inter.getActualQd())
-                return pos[:self.num_arm_joints], vel[:self.num_arm_joints]
+                # UR-RTDE style
+                if hasattr(follower, "r_inter"):
+                    pos = np.array(follower.r_inter.getActualQ())
+                    vel = np.array(follower.r_inter.getActualQd())
+                    return pos[:self.num_arm_joints], vel[:self.num_arm_joints]
+
+                # Fallback: get_joint_state
+                if hasattr(follower, "get_joint_state"):
+                    pos = np.array(follower.get_joint_state())
+                    return pos[:self.num_arm_joints], np.zeros(self.num_arm_joints)
 
             return np.zeros(self.num_arm_joints), np.zeros(self.num_arm_joints)
 
@@ -1559,104 +1882,20 @@ class FACTRGravityCompensation:
         return float(tau_gripper)
 
     def _setup_visualization(self):
-        """Setup real-time visualization of torque components."""
-        self._viz_logger = TorqueComponentLogger(history_len=int(10.0 / self.dt))
-        self._viz_logger.initialize(self.num_arm_joints)
+        """Setup real-time visualization of torque components in separate process."""
+        self._viz_queue = mp.Queue()
+        self._viz_process = mp.Process(
+            target=visualization_worker, 
+            args=(self._viz_queue, self.num_arm_joints, self.dt),
+            daemon=True
+        )
+        self._viz_process.start()
         self._viz_start_time = time.time()
-
-        # Setup plot in main thread (matplotlib requirement)
-        plt.ion()
-        self._viz_fig, self._viz_axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True)
-        self._viz_axes = self._viz_axes.flatten()
-        self._viz_fig.suptitle("GELLO Gravity Compensation - Live Torque Components", fontsize=14)
-
-        self._joint_names = ["J1 (Base)", "J2 (Shoulder)", "J3 (Elbow)",
-                             "J4 (Wrist1)", "J5 (Wrist2)", "J6 (Wrist3)"]
-
-        self._component_colors = {
-            "gravity": "#2ecc71",
-            "friction": "#e74c3c",
-            "damping": "#3498db",
-            "null": "#9b59b6",
-            "limit": "#e67e22",
-            "feedback": "#1abc9c",
-            "total": "#2c3e50",
-        }
-
-        # Initialize lines
-        self._viz_lines: Dict[str, List] = {
-            "gravity": [], "friction": [], "damping": [],
-            "null": [], "limit": [], "feedback": [], "total": []
-        }
-
-        for joint_idx, ax in enumerate(self._viz_axes):
-            ax.set_title(self._joint_names[joint_idx])
-            ax.set_ylabel("Torque [Nm]")
-            ax.grid(True, alpha=0.3)
-            ax.axhline(y=0, color='k', linestyle='-', linewidth=0.5)
-
-            for comp_name, color in self._component_colors.items():
-                linewidth = 2.5 if comp_name == "total" else 1.2
-                line, = ax.plot([], [], color=color, linewidth=linewidth, alpha=0.8)
-                self._viz_lines[comp_name].append(line)
-
-            if joint_idx == 0:
-                ax.legend(
-                    [self._viz_lines[k][0] for k in self._component_colors.keys()],
-                    ["Gravity", "Friction", "Damping", "Null-Space", "Limits", "Feedback", "TOTAL"],
-                    loc='upper left', fontsize=7
-                )
-
-        for ax in self._viz_axes[3:]:
-            ax.set_xlabel("Time [s]")
-
-        plt.tight_layout()
-        self._viz_fig.canvas.draw()
-        plt.pause(0.01)
-
-        print("Visualization enabled - torque components will be plotted in real-time")
+        print("Visualization enabled - running in separate process")
 
     def _update_visualization(self):
-        """Update the visualization plot."""
-        if self._viz_logger is None or len(self._viz_logger.time_history) < 2:
-            return
-
-        t_array = np.array(self._viz_logger.time_history)
-        t_rel = t_array - t_array[0]
-
-        for joint_idx in range(self.num_arm_joints):
-            # Update each component line
-            self._viz_lines["gravity"][joint_idx].set_data(
-                t_rel, np.array(self._viz_logger.tau_gravity[joint_idx])
-            )
-            self._viz_lines["friction"][joint_idx].set_data(
-                t_rel, np.array(self._viz_logger.tau_friction[joint_idx])
-            )
-            self._viz_lines["damping"][joint_idx].set_data(
-                t_rel, np.array(self._viz_logger.tau_damping[joint_idx])
-            )
-            self._viz_lines["null"][joint_idx].set_data(
-                t_rel, np.array(self._viz_logger.tau_null[joint_idx])
-            )
-            self._viz_lines["limit"][joint_idx].set_data(
-                t_rel, np.array(self._viz_logger.tau_limit[joint_idx])
-            )
-            self._viz_lines["feedback"][joint_idx].set_data(
-                t_rel, np.array(self._viz_logger.tau_feedback[joint_idx])
-            )
-            self._viz_lines["total"][joint_idx].set_data(
-                t_rel, np.array(self._viz_logger.tau_total[joint_idx])
-            )
-
-            # Update axis limits
-            ax = self._viz_axes[joint_idx]
-            ax.set_xlim(t_rel[0], t_rel[-1])
-            ax.relim()
-            ax.autoscale_view(scalex=False)
-
-        self._viz_fig.canvas.draw_idle()
-        self._viz_fig.canvas.flush_events()
-
+        """Legacy method - functionality moved to worker process."""
+        pass
     def control_loop_step(self) -> None:
         """Execute one step of the control loop."""
         # Get current joint states
@@ -1713,24 +1952,52 @@ class FACTRGravityCompensation:
 
         # Force-Position feedback (alternative to FACTR) - position error based
         if self.enable_force_position_feedback:
-            follower_pos, follower_vel = self.get_follower_arm_state()
-            if self.map_index is not None and self.map_signs is not None:
-                mapped_follower_pos = np.zeros(self.num_arm_joints)
-                mapped_follower_vel = np.zeros(self.num_arm_joints)
-                map_len = min(len(self.map_index), len(follower_pos))
-                for i, idx in enumerate(self.map_index[:map_len]):
-                    if idx < self.num_arm_joints:
-                        sign = self.map_signs[i] if i < len(self.map_signs) else 1.0
-                        offset = self.map_offsets[i] if self.map_offsets is not None and i < len(
-                            self.map_offsets) else 0.0
-                        mapped_follower_pos[idx] = (follower_pos[i] - offset) / sign if sign != 0 else follower_pos[i]
-                        mapped_follower_vel[idx] = follower_vel[i] / sign if sign != 0 else follower_vel[i]
-                follower_pos = mapped_follower_pos
-                follower_vel = mapped_follower_vel
-            self._follower_arm_pos = follower_pos
-            self._follower_arm_vel = follower_vel
+            # Get follower state in UR5e coordinates
+            follower_pos_raw, follower_vel_raw = self.get_follower_arm_state()
+            
+            # Transform follower position from UR5e-Frame to Leader-Frame
+            #
+            # The teleop mapping is defined as:
+            #   follower[i] = signs[i] * leader[index_map[i]] + offsets[i]
+            #
+            # To get the inverse (follower → leader equivalent):
+            #   leader_equiv[index_map[i]] = (follower[i] - offsets[i]) / signs[i]
+            #
+            # Since index_map is typically [0,1,2,3,4,5] (identity), this simplifies to:
+            #   leader_equiv[i] = (follower[i] - offsets[i]) / signs[i]
+            
+            follower_pos_in_leader_frame = np.zeros(self.num_arm_joints)
+            follower_vel_in_leader_frame = np.zeros(self.num_arm_joints)
+            
+            if self.map_index is not None and self.map_signs is not None and self.map_offsets is not None:
+                # Iterate over follower joints
+                for follower_idx in range(min(len(self.map_index), len(follower_pos_raw))):
+                    leader_idx = self.map_index[follower_idx]  # Which leader joint this follower maps FROM
+                    
+                    if leader_idx < self.num_arm_joints:
+                        sign = self.map_signs[follower_idx] if follower_idx < len(self.map_signs) else 1.0
+                        offset = self.map_offsets[follower_idx] if follower_idx < len(self.map_offsets) else 0.0
+                        
+                        # Inverse transformation: leader_equiv = (follower - offset) / sign
+                        if abs(sign) > 1e-6:
+                            follower_pos_in_leader_frame[leader_idx] = (follower_pos_raw[follower_idx] - offset) / sign
+                            follower_vel_in_leader_frame[leader_idx] = follower_vel_raw[follower_idx] / sign
+                        else:
+                            follower_pos_in_leader_frame[leader_idx] = follower_pos_raw[follower_idx]
+                            follower_vel_in_leader_frame[leader_idx] = follower_vel_raw[follower_idx]
+            else:
+                # No mapping - assume same coordinates
+                follower_pos_in_leader_frame = follower_pos_raw[:self.num_arm_joints]
+                follower_vel_in_leader_frame = follower_vel_raw[:self.num_arm_joints]
+            
+            # Cache for debugging
+            self._follower_arm_pos = follower_pos_in_leader_frame
+            self._follower_arm_vel = follower_vel_in_leader_frame
+            
+            # Now both are in Leader-Frame - compute feedback
             tau_fp = self.force_position_feedback(
-                leader_arm_pos, leader_arm_vel, follower_pos, follower_vel
+                leader_arm_pos, leader_arm_vel,
+                follower_pos_in_leader_frame, follower_vel_in_leader_frame
             )
             torque_arm += tau_fp
             tau_feedback_comp = tau_fp.copy()
@@ -1744,20 +2011,20 @@ class FACTRGravityCompensation:
             )
 
         # === LOG FOR VISUALIZATION ===
-        if self.enable_visualization and self._viz_logger is not None:
-            current_time = time.time() - self._viz_start_time
-            self._viz_logger.log(
-                timestamp=current_time,
-                positions=leader_arm_pos,
-                velocities=leader_arm_vel,
-                tau_gravity=tau_gravity_comp,
-                tau_friction=tau_friction_comp,
-                tau_damping=tau_damping_comp,
-                tau_null=tau_null_comp,
-                tau_limit=tau_limit_comp,
-                tau_feedback=tau_feedback_comp,
-                tau_total=torque_arm,
-            )
+        if self.enable_visualization and self._viz_queue is not None:
+            # Send data to visualization process
+            self._viz_queue.put((
+                time.time() - self._viz_start_time,
+                leader_arm_pos.copy(),
+                leader_arm_vel.copy(),
+                tau_gravity_comp.copy(),
+                tau_friction_comp.copy(),
+                tau_damping_comp.copy(),
+                tau_null_comp.copy(),
+                tau_limit_comp.copy(),
+                tau_feedback_comp.copy(),
+                torque_arm.copy()
+            ))
         
         # Debug output (every 100 iterations = ~0.2 second at 500Hz)
         if debug:=getattr(self, "debug_mode", False):
@@ -1789,7 +2056,14 @@ class FACTRGravityCompensation:
         self.running = True
         # Start teleop thread now that running is True
         if self.teleop_enabled and self.teleop_prepared and self.teleop_thread is None:
-            self.teleop_thread = threading.Thread(target=self._teleop_loop, daemon=True)
+
+            if getattr(self, 'use_impedance_control', False):
+                self.teleop_thread = threading.Thread(target=self._teleop_loop_impedance, daemon=True)
+                print("Teleop started (IMPEDANCE MODE - 500Hz)")
+            else:
+                self.teleop_thread = threading.Thread(target=self._teleop_loop, daemon=True)
+                print("Teleop started (Position Control)")
+
             self.teleop_thread.start()
             print("Teleop started.")
 
@@ -1801,16 +2075,12 @@ class FACTRGravityCompensation:
 
                 self.control_loop_step()
 
-                # Update visualization periodically (every 10 iterations)
-                if self.enable_visualization:
-                    viz_update_counter += 1
-                    if viz_update_counter % 10 == 0:
-                        self._update_visualization()
-                        # Check if plot window was closed
-                        if not plt.fignum_exists(self._viz_fig.number):
-                            print("\nVisualization window closed, stopping...")
-                            self.running = False
-                            break
+                # Check visualization process
+                if self.enable_visualization and self._viz_process is not None:
+                     if not self._viz_process.is_alive():
+                        print("\nVisualization process stopped, stopping...")
+                        self.running = False
+                        break
 
                 # Maintain loop timing
                 elapsed = time.time() - start_time
@@ -1832,6 +2102,15 @@ class FACTRGravityCompensation:
     def shutdown(self) -> None:
         """Safely shutdown the system."""
         self.running = False
+        
+        # Stop visualization
+        if getattr(self, "_viz_queue", None) is not None:
+             self._viz_queue.put(None) # Poison pill
+        if getattr(self, "_viz_process", None) is not None:
+            self._viz_process.join(timeout=1.0)
+            if self._viz_process.is_alive():
+                self._viz_process.terminate()
+
         # Stop teleop thread and close ZMQ resources first
         try:
             if self.teleop_thread is not None and self.teleop_thread.is_alive():

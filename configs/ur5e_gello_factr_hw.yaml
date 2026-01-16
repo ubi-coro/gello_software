@@ -39,7 +39,7 @@ controller:
   frequency: 250
   torque_feedback:
     enable: True
-    gain: 3.0
+    gain: -2.0
     damping: 0.0
     motor_scalar: 94.5652173913
   force_position_feedback:
@@ -47,13 +47,13 @@ controller:
     # This is an alternative to scaled torque_feedback (FACTR style)
     # Only one should be enabled at a time
     enable: False
-    kp: 2.0           # Position error stiffness (Nm/rad)
-    kd: 0.1           # Velocity error damping (Nm*s/rad)
+    kp: 2.0          # Position error stiffness (Nm/rad)
+    kd: 0.01           # Velocity error damping (Nm*s/rad)
     max_torque: 1.5   # Safety limit per joint (Nm)
   gravity_comp:
     enable: True
-    gain: 0.9  
-    gain_per_joint: [1.0, 1.1, 1.0, 2.0, 3.0, 2.5]
+    gain: 1.0
+    gain_per_joint: [1.0, 1.3, 1.0, 1.5, 3.0, 2.5]
     velocity_damping: 0.01
   null_space_regulation:
     null_space_joint_target: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -80,10 +80,17 @@ controller:
     damping: 0.1   # Velocity damping for gripper feedback
 
 teleop:
-  enable: true
+  enable: True
   use_direct_rtde: true
   hz: 250
   wait_for_server_timeout_s: 5.0
+
+  impedance:
+    enable: true           # Use impedance instead of position control
+    kp: 100.0               # Position stiffness (Nm/rad)
+    kd: 10.0                # Velocity damping (Nm*s/rad)
+    use_leader_velocity: false  # Use leader velocity in feedforward
+
   robot:
     _target_: gello.robots.ur5e.URRobot
     robot_ip: "192.168.1.11"

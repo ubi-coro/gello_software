@@ -419,6 +419,11 @@ class URRobot(Robot):
         pos_quat = np.zeros(7)
         gripper_pos = np.array([joints[-1]]) if self._use_gripper else np.array([0.0])
         joint_torques = self.get_joint_torques()
+        joint_velocities = np.array(self.r_inter.getActualQd())
+
+        if self._use_gripper:
+            joint_velocities = np.append(joint_velocities, 0.0)
+
         # Only query gripper feedback if enabled (avoids ~10ms socket delay per call)
         if self._gripper_feedback_enabled:
             gripper_feedback = self.get_gripper_feedback()
@@ -433,12 +438,67 @@ class URRobot(Robot):
             }
         return {
             "joint_positions": joints,
-            "joint_velocities": joints,
+            "joint_velocities": joint_velocities,
             "ee_pos_quat": pos_quat,
             "gripper_position": gripper_pos,
             "joint_torques": joint_torques,
             "gripper_feedback": gripper_feedback,
         }
+    
+    def command_joint_state_impedance(
+        self,
+        target_joints: np.ndarray,
+        target_velocities: Optional[np.ndarray] = None,
+        kp: float = 50.0,
+        kd: float = 5.0,
+        tau_ff: Optional[np.ndarray] = None,
+    ) -> bool:
+        """Impedance control using directTorque for compliant trajectory following.
+        
+        Computes: τ = Kp*(q_target - q) + Kd*(q̇_target - q̇) + τ_ff
+        
+        The robot behaves like a spring-damper system to the target position.
+        On contact with obstacles, the robot yields (compliant behavior).
+        
+        MUST be called at 500 Hz! If interrupted, robot returns to position control.
+        
+        Args:
+            target_joints: Desired joint positions (rad) - from leader
+            target_velocities: Desired velocities (rad/s) - None means pure damping
+            kp: Position stiffness (Nm/rad) - higher = stiffer/faster
+            kd: Velocity damping (Nm*s/rad) - higher = more damping
+            tau_ff: Feedforward torques (Nm) - e.g., for known payloads
+            
+        Returns:
+            bool: True if command was successful
+        """
+        # Current state
+        q = np.array(self.r_inter.getActualQ())
+        qd = np.array(self.r_inter.getActualQd())
+        
+        # Target velocity (default: 0 = pure damping, most stable)
+        if target_velocities is None:
+            qd_target = np.zeros(6)
+        else:
+            qd_target = np.asarray(target_velocities[:6])
+        
+        # Impedance control law
+        q_error = np.asarray(target_joints[:6]) - q
+        qd_error = qd_target - qd
+        
+        tau_cmd = kp * q_error + kd * qd_error
+        
+        # Add feedforward if provided
+        if tau_ff is not None:
+            tau_cmd += np.asarray(tau_ff[:6])
+        
+        # Safety: per-joint torque limits (conservative for UR5e)
+        # These are well below the motor limits but safe for testing
+        tau_max = np.array([100.0, 100.0, 50.0, 20.0, 20.0, 20.0])  # Nm
+        tau_cmd = np.clip(tau_cmd, -tau_max, tau_max)
+        
+        # Send to robot (friction_comp=True uses UR's internal friction model)
+        return self.robot.directTorque(tau_cmd.tolist(), True)
 
 
 def main():
