@@ -133,6 +133,7 @@ class TorqueComponentLogger:
     tau_limit: List[Deque[float]] = field(default_factory=list)
     tau_feedback: List[Deque[float]] = field(default_factory=list)
     tau_total: List[Deque[float]] = field(default_factory=list)
+    tau_external: List[Deque[float]] = field(default_factory=list)
     positions: List[Deque[float]] = field(default_factory=list)
     velocities: List[Deque[float]] = field(default_factory=list)
 
@@ -149,6 +150,7 @@ class TorqueComponentLogger:
             self.tau_limit.append(deque(maxlen=self.history_len))
             self.tau_feedback.append(deque(maxlen=self.history_len))
             self.tau_total.append(deque(maxlen=self.history_len))
+            self.tau_external.append(deque(maxlen=self.history_len))
             self.positions.append(deque(maxlen=self.history_len))
             self.velocities.append(deque(maxlen=self.history_len))
 
@@ -164,6 +166,7 @@ class TorqueComponentLogger:
             tau_limit: np.ndarray,
             tau_feedback: np.ndarray,
             tau_total: np.ndarray,
+            tau_external: np.ndarray,
     ):
         """Log one timestep of torque components."""
         self.time_history.append(timestamp)
@@ -177,6 +180,7 @@ class TorqueComponentLogger:
             self.tau_limit[i].append(tau_limit[i])
             self.tau_feedback[i].append(tau_feedback[i])
             self.tau_total[i].append(tau_total[i])
+            self.tau_external[i].append(tau_external[i])
 
 
 def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
@@ -189,7 +193,8 @@ def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
 
     # Setup plot
     plt.ion()
-    viz_fig, viz_axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True)
+    # Change layout to 2x4 to accommodate 7 plots
+    viz_fig, viz_axes = plt.subplots(2, 4, figsize=(24, 10))
     viz_axes = viz_axes.flatten()
     viz_fig.suptitle("GELLO Gravity Compensation - Live Torque Components", fontsize=14)
 
@@ -210,12 +215,21 @@ def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
     viz_lines = {
         "gravity": [], "friction": [], "damping": [],
         "null": [], "limit": [], "feedback": [], "total": [],
-        "total_smooth": []
+        "total_smooth": [],
+        "external_summary": [] # Lines for the summary plot
     }
 
-    # Initialize lines
-    for joint_idx, ax in enumerate(viz_axes):
-        if joint_idx >= num_joints: break
+    # Hide unused plots (anything beyond num_joints and the summary plot)
+    # Slots 0 to num_joints-1 are joints. Slot num_joints is summary.
+    summary_plot_idx = num_joints
+    for i in range(summary_plot_idx + 1, len(viz_axes)):
+        viz_axes[i].axis('off')
+
+    # Initialize Joint Lines (Plots 0 to 5)
+    for joint_idx in range(num_joints):
+        if joint_idx >= len(viz_axes): break
+        ax = viz_axes[joint_idx]
+        
         ax.set_title(joint_names[joint_idx] if joint_idx < len(joint_names) else f"Joint {joint_idx+1}")
         ax.grid(True, alpha=0.3)
         ax.set_ylabel("Torque (Nm)")
@@ -231,6 +245,22 @@ def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
         
         if joint_idx == 0:
             ax.legend(loc="upper left", fontsize="x-small", ncol=2)
+
+    # Initialize Summary Plot (Plot 6)
+    if summary_plot_idx < len(viz_axes):
+        ax = viz_axes[summary_plot_idx]
+        ax.set_title("Follower External Torques (Raw)")
+        ax.grid(True, alpha=0.3)
+        ax.set_ylabel("External Torque (Nm)")
+        
+        # Color cycle for joints in summary plot
+        summary_colors = plt.cm.tab10(np.linspace(0, 1, num_joints))
+        
+        for j in range(num_joints):
+            line, = ax.plot([], [], label=f"J{j+1}", color=summary_colors[j], linewidth=1.5)
+            viz_lines["external_summary"].append(line)
+        
+        ax.legend(ncol=2, fontsize='x-small', loc='upper right')
 
     plt.tight_layout()
 
@@ -251,6 +281,7 @@ def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
             t_array = np.array(logger.time_history)
             t_rel = t_array - t_array[0]
 
+            # Update Joint Plots
             for joint_idx in range(num_joints):
                 if joint_idx >= len(viz_axes): break
                 
@@ -274,6 +305,14 @@ def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
 
                 viz_axes[joint_idx].relim()
                 viz_axes[joint_idx].autoscale_view(scalex=True, scaley=True)
+
+            # Update Summary Plot
+            if summary_plot_idx < len(viz_axes) and len(logger.tau_external) == num_joints:
+                for j in range(num_joints):
+                     viz_lines["external_summary"][j].set_data(t_rel, logger.tau_external[j])
+                
+                viz_axes[summary_plot_idx].relim()
+                viz_axes[summary_plot_idx].autoscale_view(scalex=True, scaley=True)
 
             viz_fig.canvas.draw_idle()
             viz_fig.canvas.flush_events()
@@ -2023,7 +2062,8 @@ class FACTRGravityCompensation:
                 tau_null_comp.copy(),
                 tau_limit_comp.copy(),
                 tau_feedback_comp.copy(),
-                torque_arm.copy()
+                torque_arm.copy(),
+                self._follower_torques.copy()
             ))
         
         # Debug output (every 100 iterations = ~0.2 second at 500Hz)

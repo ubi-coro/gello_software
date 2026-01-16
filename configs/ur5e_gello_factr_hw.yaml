@@ -76,8 +76,8 @@ controller:
 
   gripper_feedback:
     enable: False
-    gain: 1.0      # Force-feedback strength for gripper
-    damping: 0.1   # Velocity damping for gripper feedback
+    gain: 0.5      # Force-feedback strength for gripper
+    damping: 0.01   # Velocity damping for gripper feedback
 
 teleop:
   enable: True
@@ -87,9 +87,9 @@ teleop:
 
   impedance:
     enable: true           # Use impedance instead of position control
-    kp: 100.0               # Position stiffness (Nm/rad)
-    kd: 10.0                # Velocity damping (Nm*s/rad)
-    use_leader_velocity: false  # Use leader velocity in feedforward
+    kp: 120.0               # Position stiffness (Nm/rad)
+    kd: 12.0                # Velocity damping (Nm*s/rad)
+    use_leader_velocity: true  # Use leader velocity in feedforward
 
   robot:
     _target_: gello.robots.ur5e.URRobot
