@@ -1,5 +1,6 @@
-from typing import Any, Dict, Optional
+import threading
 import time
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -27,6 +28,20 @@ class URRobot(Robot):
         import rtde_receive
 
         [print("in ur robot") for _ in range(4)]
+        self._gripper_state_lock = threading.Lock()
+        self._gripper_state_cache = {
+               "position": 0.0,
+               "is_gripping": False,
+               "position_error": 0.0,
+               "force_N": 0.0,
+               "force_estimate": 0.0,
+               "force_normalized": 0.0,
+               "commanded_force_N": 20.0,
+               "motor_current": 0.0,
+        }
+        self._last_gripper_cmd = None  # Track last commanded position for debouncing
+        self._gripper_cmd_threshold = 2  # Only send if changed by >2 units (out of 255)
+        
         try:
             self.robot = rtde_control.RTDEControlInterface(robot_ip)
         except Exception as e:
@@ -41,6 +56,11 @@ class URRobot(Robot):
             self.gripper.connect(hostname=robot_ip, port=63352)
             print("gripper connected")
             # gripper.activate()
+            
+            # Start background poller for gripper feedback
+            self._gripper_running = True
+            self._gripper_thread = threading.Thread(target=self._poll_gripper, daemon=True)
+            self._gripper_thread.start()
 
         [print("connect") for _ in range(4)]
 
@@ -108,8 +128,12 @@ class URRobot(Robot):
             robot_joints, velocity, acceleration, dt, lookahead_time, gain
         )
         if self._use_gripper:
-            gripper_pos = joint_state[-1] * 255
-            self.gripper.move(gripper_pos, 255, 10)
+            gripper_pos = int(joint_state[-1] * 255)
+            # Debounce: Only send gripper command if position changed significantly
+            # This prevents saturating the gripper socket (which blocks current reading)
+            if self._last_gripper_cmd is None or abs(gripper_pos - self._last_gripper_cmd) > self._gripper_cmd_threshold:
+                self.gripper.move(gripper_pos, 255, 255)
+                self._last_gripper_cmd = gripper_pos
         self.robot.waitPeriod(t_start)
 
     def freedrive_enabled(self) -> bool:
@@ -160,6 +184,37 @@ class URRobot(Robot):
         """
         return self.get_joint_torques_jacobian_calcualted()
     
+    def _poll_gripper(self):
+        """Background thread to poll gripper state without blocking main loop."""
+        while self._gripper_running:
+            try:
+                # Read all values (these are blocking TCP calls)
+                # Note: Reading current first for lowest latency
+                current = float(self.gripper.get_current_motor_current())
+                is_gripping = self.gripper.is_gripping()
+                pos = self._get_gripper_pos()
+                position_error = self.gripper.get_position_error()
+                force_est = self.gripper.get_grip_force_estimate()
+                force_norm = self.gripper.get_grip_force_normalized()
+                commanded_force_N = self.gripper.get_commanded_force_N()
+                
+                with self._gripper_state_lock:
+                    self._gripper_state_cache = {
+                        "position": pos,
+                        "is_gripping": is_gripping,
+                        "position_error": position_error,
+                        "force_N": force_est,
+                        "force_estimate": force_est,
+                        "force_normalized": force_norm,
+                        "commanded_force_N": commanded_force_N,
+                        "motor_current": current
+                    }
+                
+                # Poll at ~30Hz (fast enough for feedback, leaves bandwidth for commands)
+                time.sleep(0.033)
+            except Exception as e:
+                time.sleep(0.1) # Backoff on error
+
     def get_ft_wrench(self) -> np.ndarray:
         """Get the raw force and torque measurement from the UR's built-in F/T sensor.
 
@@ -299,6 +354,28 @@ class URRobot(Robot):
         jacobian_flat = self.robot.getJacobian(pos, tcp_offset)
         return np.array(jacobian_flat).reshape(6, 6)
 
+    def get_gripper_feedback(self) -> Dict[str, Any]:
+        """Get gripper feedback including position, object status, and current.
+        
+        Returns:
+            Dict containing gripper feedback.
+        """
+        if not self._use_gripper:
+            return {
+                "position": 0.0,
+                "is_gripping": False,
+                "position_error": 0.0,
+                "force_N": 0.0,
+                "force_estimate": 0.0,
+                "force_normalized": 0.0,
+                "commanded_force_N": 20.0,
+                "motor_current": 0.0,
+            }
+        
+        # Return cached state (non-blocking)
+        with self._gripper_state_lock:
+            return self._gripper_state_cache.copy()
+
     def get_joint_torques_jacobian(self) -> np.ndarray:
         """Calculate joint torques from end-effector wrench using Jacobian transpose.
 
@@ -349,59 +426,6 @@ class URRobot(Robot):
         """
         assert len(torques) == 6, "Torques must be a vector of length 6"
         self.robot.directTorque(torques.tolist(), friction_comp)
-
-    def get_gripper_feedback(self) -> Dict[str, float]:
-        """Get gripper feedback for force-feedback teleoperation.
-
-        The Robotiq 2F-85 uses internal motor current limiting for force control.
-        From manual: FOR setting 0-255 maps linearly to 20-235 N grip force.
-        When object is detected (OBJ status), the gripper reached current limit.
-
-        Returns:
-            Dict with:
-                - 'position': Current normalized position [0=open, 1=closed]
-                - 'is_gripping': Whether an object is detected
-                - 'position_error': Normalized error between commanded and actual position
-                - 'force_N': Estimated grip force in Newtons (0 or 20-235 N)
-                - 'force_normalized': Normalized grip force [0.0, 1.0]
-                - 'commanded_force_N': Currently commanded force limit in Newtons
-        """
-        if not self._use_gripper:
-            return {
-                "position": 0.0,
-                "is_gripping": False,
-                "position_error": 0.0,
-                "force_N": 0.0,
-                "force_normalized": 0.0,
-                "commanded_force_N": 20.0,
-            }
-
-        try:
-            position = self._get_gripper_pos()
-            is_gripping = self.gripper.is_gripping()
-            position_error = self.gripper.get_position_error()
-            force_N = self.gripper.get_grip_force_estimate()  # Returns Newtons
-            force_normalized = self.gripper.get_grip_force_normalized()
-            commanded_force_N = self.gripper.get_commanded_force_N()
-
-            return {
-                "position": position,
-                "is_gripping": is_gripping,
-                "position_error": position_error,
-                "force_N": force_N,
-                "force_normalized": force_normalized,
-                "commanded_force_N": commanded_force_N,
-            }
-        except Exception as e:
-            print(f"Warning: Failed to get gripper feedback: {e}")
-            return {
-                "position": 0.0,
-                "is_gripping": False,
-                "position_error": 0.0,
-                "force_N": 0.0,
-                "force_normalized": 0.0,
-                "commanded_force_N": 20.0,
-            }
 
     def set_gripper_feedback_enabled(self, enabled: bool) -> None:
         """Enable or disable gripper feedback queries.
@@ -494,7 +518,7 @@ class URRobot(Robot):
         
         # Safety: per-joint torque limits (conservative for UR5e)
         # These are well below the motor limits but safe for testing
-        tau_max = np.array([100.0, 100.0, 50.0, 20.0, 20.0, 20.0])  # Nm
+        tau_max = np.array([100.0, 100.0, 60.0, 25.0, 25.0, 25.0])  # Nm
         tau_cmd = np.clip(tau_cmd, -tau_max, tau_max)
         
         # Send to robot (friction_comp=True uses UR's internal friction model)

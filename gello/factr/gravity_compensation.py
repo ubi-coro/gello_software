@@ -134,6 +134,8 @@ class TorqueComponentLogger:
     tau_feedback: List[Deque[float]] = field(default_factory=list)
     tau_total: List[Deque[float]] = field(default_factory=list)
     tau_external: List[Deque[float]] = field(default_factory=list)
+    tau_gripper: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
+    gripper_current: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     positions: List[Deque[float]] = field(default_factory=list)
     velocities: List[Deque[float]] = field(default_factory=list)
 
@@ -142,6 +144,8 @@ class TorqueComponentLogger:
 
     def initialize(self, num_joints: int):
         """Initialize deques for each joint."""
+        self.tau_gripper = deque(maxlen=self.history_len)
+        self.gripper_current = deque(maxlen=self.history_len)
         for _ in range(num_joints):
             self.tau_gravity.append(deque(maxlen=self.history_len))
             self.tau_friction.append(deque(maxlen=self.history_len))
@@ -167,9 +171,13 @@ class TorqueComponentLogger:
             tau_feedback: np.ndarray,
             tau_total: np.ndarray,
             tau_external: np.ndarray,
+            tau_gripper: float = 0.0,
+            gripper_current: float = 0.0,
     ):
         """Log one timestep of torque components."""
         self.time_history.append(timestamp)
+        self.tau_gripper.append(tau_gripper)
+        self.gripper_current.append(gripper_current)
         for i in range(len(positions)):
             self.positions[i].append(positions[i])
             self.velocities[i].append(velocities[i])
@@ -216,14 +224,19 @@ def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
         "gravity": [], "friction": [], "damping": [],
         "null": [], "limit": [], "feedback": [], "total": [],
         "total_smooth": [],
-        "external_summary": [] # Lines for the summary plot
+        "external_summary": [], # Lines for the summary plot
+        "gripper": None,        # Line for the gripper plot
+        "gripper_current": None, # Line for the gripper current
     }
 
-    # Hide unused plots (anything beyond num_joints and the summary plot)
+    # Hide unused plots
     # Slots 0 to num_joints-1 are joints. Slot num_joints is summary.
     summary_plot_idx = num_joints
+    gripper_plot_idx = 7 # 8th slot (bottom right)
+
     for i in range(summary_plot_idx + 1, len(viz_axes)):
-        viz_axes[i].axis('off')
+        if i != gripper_plot_idx:
+            viz_axes[i].axis('off')
 
     # Initialize Joint Lines (Plots 0 to 5)
     for joint_idx in range(num_joints):
@@ -262,6 +275,27 @@ def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
         
         ax.legend(ncol=2, fontsize='x-small', loc='upper right')
 
+    # Initialize Gripper Plot (Plot 7 / 8th slot)
+    if gripper_plot_idx < len(viz_axes):
+        ax = viz_axes[gripper_plot_idx]
+        ax.set_title("Gripper Feedback")
+        ax.grid(True, alpha=0.3)
+        ax.set_ylabel("Torque (Nm)")
+        
+        line, = ax.plot([], [], label="Torque (Red)", color="#e74c3c", linewidth=1.5)
+        viz_lines["gripper"] = line
+        
+        # Add secondary axis for current
+        ax2 = ax.twinx()
+        ax2.set_ylabel("Current 0-255", color="#3498db")
+        line_curr, = ax2.plot([], [], label="Current (Blue)", color="#3498db", linewidth=1.5, linestyle=":")
+        viz_lines["gripper_current"] = line_curr
+
+        # Combine legends
+        lines = [line, line_curr]
+        labels = [l.get_label() for l in lines]
+        ax.legend(lines, labels, fontsize='small', loc='upper right')
+
     plt.tight_layout()
 
     while True:
@@ -272,7 +306,13 @@ def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
                 if data is None:  # Poison pill
                     plt.close(viz_fig)
                     return
-                logger.log(*data)
+                # Handle potentially different tuple sizes during transition
+                if len(data) == 13:
+                    logger.log(*data)
+                elif len(data) == 12:
+                     logger.log(*(data + (0.0,)))
+                else:
+                    logger.log(*data)
         except Exception:
             pass
 
@@ -313,6 +353,23 @@ def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
                 
                 viz_axes[summary_plot_idx].relim()
                 viz_axes[summary_plot_idx].autoscale_view(scalex=True, scaley=True)
+
+            # Update Gripper Plot
+            if gripper_plot_idx < len(viz_axes) and viz_lines["gripper"] is not None:
+                viz_lines["gripper"].set_data(t_rel, logger.tau_gripper)
+                viz_lines["gripper_current"].set_data(t_rel, logger.gripper_current)
+                
+                ax = viz_axes[gripper_plot_idx]
+                # Relim and autoscale primary axis
+                ax.relim()
+                ax.autoscale_view(scalex=True, scaley=True)
+                
+                # Relim and autoscale secondary axis (twinx)
+                # Since we don't have direct ref to ax2 here, we iterate shared axes
+                for peer in ax.get_shared_x_axes().get_siblings(ax):
+                    if peer is not ax:
+                        peer.relim()
+                        peer.autoscale_view(scalex=True, scaley=True)
 
             viz_fig.canvas.draw_idle()
             viz_fig.canvas.flush_events()
@@ -521,6 +578,10 @@ class FACTRGravityCompensation:
         self.gripper_feedback_gain = gripper_feedback_cfg.get("gain", 1.0)
         self.gripper_feedback_damping = gripper_feedback_cfg.get("damping", 0.1)
         self._follower_gripper_feedback: Dict[str, Any] = {}  # Cache for follower gripper state
+        
+        # EMA filter state for gripper feedback
+        self._last_gripper_torque_feedback = 0.0
+        self._gripper_feedback_alpha = 0.1
 
         # Validate: only one feedback mode should be active
         if self.enable_torque_feedback and self.enable_force_position_feedback:
@@ -1837,16 +1898,30 @@ class FACTRGravityCompensation:
             Dict with gripper feedback data
         """
         if not self.teleop_enabled or self.teleop_robot_server is None:
-            return {"position": 0.0, "is_gripping": False, "force_estimate": 0.0}
+            return {
+                "position": 0.0,
+                "is_gripping": False,
+                "force_estimate": 0.0,
+                "force_normalized": 0.0,
+                "motor_current": 0.0,
+            }
 
         try:
             follower = self.teleop_robot_server
 
-            # Handle ZMQServerRobot wrapper
-            if hasattr(follower, "robot"):
+            # IMPORTANT: URRobot has a `.robot` attribute (RTDEControlInterface).
+            # Unwrapping `.robot` blindly would discard gripper methods.
+            # Prefer direct get_gripper_feedback() if present.
+            if hasattr(follower, "get_gripper_feedback"):
+                return follower.get_gripper_feedback()
+
+            # Handle wrapper types (e.g., ZMQServerRobot) only if needed
+            if hasattr(follower, "_robot"):
+                follower = follower._robot
+            elif hasattr(follower, "robot") and not hasattr(follower, "r_inter"):
+                # Heuristic: wrappers expose `.robot` but not RTDE receive interface
                 follower = follower.robot
 
-            # Check for get_gripper_feedback method (UR5e with Robotiq)
             if hasattr(follower, "get_gripper_feedback"):
                 return follower.get_gripper_feedback()
 
@@ -1857,11 +1932,23 @@ class FACTRGravityCompensation:
                     return obs["gripper_feedback"]
 
             # Fallback: return empty feedback
-            return {"position": 0.0, "is_gripping": False, "force_estimate": 0.0}
+            return {
+                "position": 0.0,
+                "is_gripping": False,
+                "force_estimate": 0.0,
+                "force_normalized": 0.0,
+                "motor_current": 0.0,
+            }
 
         except Exception as e:
             print(f"Warning: Failed to get follower gripper feedback: {e}")
-            return {"position": 0.0, "is_gripping": False, "force_N": 0.0, "force_normalized": 0.0}
+            return {
+                "position": 0.0,
+                "is_gripping": False,
+                "force_estimate": 0.0,
+                "force_normalized": 0.0,
+                "motor_current": 0.0,
+            }
 
     def gripper_feedback(
         self,
@@ -1869,54 +1956,52 @@ class FACTRGravityCompensation:
         leader_gripper_vel: float,
         follower_feedback: Dict[str, Any],
     ) -> float:
-        """Compute gripper torque for force-feedback based on follower gripper state.
+        """Compute gripper torque for force-feedback based on follower gripper servo current.
 
-        Implements position-position force feedback for the gripper:
-        - When follower gripper is gripping an object, the motor current limit is reached
-        - The Robotiq FOR setting (0-255) maps to 20-235 N grip force
-        - This force is fed back as resistance torque to the leader gripper
-
-        Args:
-            leader_gripper_pos: Current leader gripper position (rad)
-            leader_gripper_vel: Current leader gripper velocity (rad/s)
-            follower_feedback: Feedback dict from follower gripper containing:
-                - 'is_gripping': Whether object detected
-                - 'force_N': Grip force in Newtons (0 or 20-235 N)
-                - 'force_normalized': Normalized force [0, 1]
-                - 'position': Current gripper position [0, 1]
-
-        Returns:
-            float: Force-feedback torque to apply to leader gripper (Nm)
+        Implements current-based force feedback with EMA filter:
+        τ_h,t = α(-kh * I_g,t) + (1 - α) * τ_h,t-1
         """
-        # Get follower gripper state
-        follower_pos = follower_feedback.get("position", 0.0)
-        is_gripping = follower_feedback.get("is_gripping", False)
-        
-        # Use normalized force for feedback (0-1 range based on 20-235 N)
-        force_normalized = follower_feedback.get("force_normalized", 0.0)
-        # Fallback to old format if new format not available
-        if force_normalized == 0.0 and "force_estimate" in follower_feedback:
-            force_normalized = follower_feedback.get("force_estimate", 0.0)
+        # Get current motor current (Ig,t) - Robotiq COU (0-255)
+        current_raw = float(follower_feedback.get("motor_current", 0.0))
 
-        if not is_gripping:
-            # No object detected - no feedback torque needed
-            return 0.0
+        # Parameters
+        alpha = float(getattr(self, "_gripper_feedback_alpha", 0.1))
+        kh = float(self.gripper_feedback_gain)
+        kd = float(getattr(self, "gripper_feedback_damping", 0.0))
+        tau_prev = float(getattr(self, "_last_gripper_torque_feedback", 0.0))
 
-        # Position-position feedback: resist leader movement when follower is blocked
-        # Normalize leader gripper position to [0, 1] range for comparison
-        leader_pos_normalized = leader_gripper_pos / max(self.gripper_limit_max, 0.01)
-        leader_pos_normalized = np.clip(leader_pos_normalized, 0.0, 1.0)
+        # Simple stability guards
+        # - Ignore small current noise.
+        # - Ignore tiny leader gripper velocity (finite-difference noise).
+        # - Clamp max torque.
+        gripper_cfg = self.config.get("controller", {}).get("gripper_feedback", {})
+        vel_deadband = float(gripper_cfg.get("vel_deadband", 0.02))
+        current_deadband = float(gripper_cfg.get("current_deadband", 2.0))
+        max_torque = float(gripper_cfg.get("max_torque", 1.0))
 
-        # Position error: how much the leader has moved beyond follower
-        position_error = leader_pos_normalized - follower_pos
+        # Current above deadband
+        current = max(0.0, current_raw - current_deadband)
 
-        # Apply feedback torque proportional to position error and force
-        # force_normalized is 0-1 based on motor current limit (20-235 N)
-        # Negative sign: resist the leader from closing further when object is gripped
-        tau_gripper = -self.gripper_feedback_gain * position_error * (1.0 + force_normalized)
+        # Target torque should OPPOSE leader motion (no bias when stationary).
+        # Use a smooth direction term to avoid sign-chatter oscillations near zero velocity.
+        vel = float(leader_gripper_vel)
+        if abs(vel) < vel_deadband or current <= 0.0:
+            target_torque = 0.0
+        else:
+            direction = vel / (abs(vel) + vel_deadband)
+            target_torque = -kh * current * direction
 
-        # Add velocity damping
-        tau_gripper -= self.gripper_feedback_damping * leader_gripper_vel
+        # Add optional damping (also opposes motion)
+        target_torque += -kd * vel
+
+        # Clamp for safety
+        target_torque = float(np.clip(target_torque, -max_torque, max_torque))
+
+        # EMA Filter (Equation 2)
+        tau_gripper = alpha * target_torque + (1.0 - alpha) * tau_prev
+
+        # Update state
+        self._last_gripper_torque_feedback = tau_gripper
 
         return float(tau_gripper)
 
@@ -2052,6 +2137,10 @@ class FACTRGravityCompensation:
         # === LOG FOR VISUALIZATION ===
         if self.enable_visualization and self._viz_queue is not None:
             # Send data to visualization process
+            gripper_current_val = 0.0
+            if isinstance(self._follower_gripper_feedback, dict):
+                gripper_current_val = float(self._follower_gripper_feedback.get("motor_current", 0.0))
+
             self._viz_queue.put((
                 time.time() - self._viz_start_time,
                 leader_arm_pos.copy(),
@@ -2063,7 +2152,9 @@ class FACTRGravityCompensation:
                 tau_limit_comp.copy(),
                 tau_feedback_comp.copy(),
                 torque_arm.copy(),
-                self._follower_torques.copy()
+                self._follower_torques.copy(),
+                float(torque_gripper),
+                gripper_current_val
             ))
         
         # Debug output (every 100 iterations = ~0.2 second at 500Hz)

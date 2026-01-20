@@ -247,6 +247,10 @@ class RobotiqGripper:
         """Returns the current position as returned by the physical hardware."""
         return self._get_var(self.POS)
 
+    def get_current_motor_current(self) -> int:
+        """Returns the current motor current as returned by the physical hardware (COU)."""
+        return self._get_var(self.COU)
+
     def get_object_status(self) -> ObjectStatus:
         """Returns the current object detection status.
 

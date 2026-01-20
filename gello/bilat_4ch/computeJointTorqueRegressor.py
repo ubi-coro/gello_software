@@ -7,7 +7,10 @@ the observer/FACTR loop.
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+import argparse
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pinocchio as pin
@@ -27,15 +30,98 @@ def _compute_ddq(dq: np.ndarray, dt: float, window_length: int = 11, polyorder: 
     return ddq
 
 
-def _build_friction_regressor(v: np.ndarray) -> np.ndarray:
-    """Build per-sample viscous + Coulomb friction regressor."""
+def _resolve_urdf_path(urdf_path: str) -> str:
+    """Resolve URDF path: accept absolute or workspace-relative."""
+    p = Path(urdf_path)
+    if p.is_absolute() and p.exists():
+        return str(p)
 
-    nq = v.shape[0]
-    Y_f = np.zeros((nq, 2 * nq))
+    # Resolve relative to repo root (two parents up from this file: gello/..)
+    repo_root = Path(__file__).resolve().parents[2]
+    cand = (repo_root / p).resolve()
+    if cand.exists():
+        return str(cand)
+    return str(p)
+
+
+def _load_pinocchio_model(urdf_path: str, package_dirs: Optional[str] = None) -> Tuple[Any, Any]:
+    """Load a Pinocchio model with optional package dirs.
+
+    In many URDFs, meshes use package:// paths. Passing package_dirs helps.
+    """
+    urdf_resolved = _resolve_urdf_path(urdf_path)
+    if not os.path.exists(urdf_resolved):
+        raise FileNotFoundError(f"URDF not found: {urdf_path} (resolved: {urdf_resolved})")
+
+    if package_dirs is None:
+        # Default: directory containing URDF, plus repo root.
+        pkg_dirs = [str(Path(urdf_resolved).parent), str(Path(__file__).resolve().parents[2])]
+    else:
+        pkg_dirs = [p for p in package_dirs.split(os.pathsep) if p]
+
+    model, _, _ = pin.buildModelsFromUrdf(filename=urdf_resolved, package_dirs=pkg_dirs)  # type: ignore[attr-defined]
+    data = model.createData()
+    return model, data
+
+
+def _smooth_sign(v: np.ndarray, tanh_eps: float = 0.02) -> np.ndarray:
+    """Smooth approximation to sign(v) to avoid numerical chattering near zero."""
+    eps = float(max(tanh_eps, 1e-6))
+    return np.tanh(v / eps)
+
+
+def _build_friction_regressor(
+    v: np.ndarray,
+    *,
+    coulomb_mode: str = "sign",
+    tanh_eps: float = 0.02,
+    min_abs_vel_for_coulomb: float = 0.0,
+    include_bias: bool = False,
+) -> np.ndarray:
+    """Build per-sample viscous + Coulomb friction regressor.
+
+    This produces a per-joint regressor Y_f so that:
+      tau_friction ≈ Y_f @ theta
+
+    theta layout (per joint):
+      [fv_0, fc_0, fv_1, fc_1, ...] (+ optional biases at end)
+    """
+    nq = int(v.shape[0])
+    n_bias = nq if include_bias else 0
+    Y_f = np.zeros((nq, 2 * nq + n_bias), dtype=float)
+
+    if coulomb_mode not in ("sign", "tanh"):
+        raise ValueError(f"Unsupported coulomb_mode={coulomb_mode!r} (use 'sign' or 'tanh')")
+
     for j in range(nq):
-        Y_f[j, 2 * j] = v[j]  # viscous term
-        Y_f[j, 2 * j + 1] = np.sign(v[j])  # Coulomb term
+        vj = float(v[j])
+        Y_f[j, 2 * j] = vj  # viscous
+
+        if abs(vj) < float(min_abs_vel_for_coulomb):
+            coul = 0.0
+        else:
+            coul = float(np.sign(vj)) if coulomb_mode == "sign" else float(_smooth_sign(np.array([vj]), tanh_eps=tanh_eps)[0])
+
+        Y_f[j, 2 * j + 1] = coul
+
+        if include_bias:
+            Y_f[j, 2 * nq + j] = 1.0
+
     return Y_f
+
+
+def _stack_blocks(blocks: list[np.ndarray]) -> np.ndarray:
+    return np.vstack(blocks) if len(blocks) else np.zeros((0, 0), dtype=float)
+
+
+def _stack_targets(targets: list[np.ndarray]) -> np.ndarray:
+    return np.hstack(targets) if len(targets) else np.zeros((0,), dtype=float)
+
+
+def load_npz_recording(path: str) -> Dict[str, np.ndarray]:
+    """Load a .npz recording (e.g. from scripts/record_physical_behavior.py)."""
+    data = np.load(path, allow_pickle=True)
+    return {k: data[k] for k in data.files}
 
 
 def identify_friction_only(
@@ -43,6 +129,10 @@ def identify_friction_only(
     recorded_data: Dict[str, np.ndarray],
     include_bias: bool = True,
     ridge_lambda: float = 0.0,
+    coulomb_mode: str = "sign",
+    tanh_eps: float = 0.02,
+    min_abs_vel_for_coulomb: float = 0.0,
+    package_dirs: Optional[str] = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
     """Identify viscous/Coulomb friction (and optional torque bias), using URDF gravity.
 
@@ -64,8 +154,7 @@ def identify_friction_only(
         params contains arrays: fv (nq,), fc (nq,), bias (nq,) if include_bias.
     """
 
-    model = pin.buildModelFromUrdf(urdf_path)
-    data = model.createData()
+    model, data = _load_pinocchio_model(urdf_path, package_dirs=package_dirs)
 
     qs = np.asarray(recorded_data["q"], dtype=float)
     dqs = np.asarray(recorded_data["dq"], dtype=float)
@@ -88,13 +177,18 @@ def identify_friction_only(
         tau_m = taus_meas[k]
 
         # Use URDF gravity as known term and identify remaining friction/bias
-        g = pin.computeGeneralizedGravity(model, data, q)
+        g = pin.computeGeneralizedGravity(model, data, q)  # type: ignore[attr-defined]
         tau_res = tau_m - g
 
-        Y_friction = _build_friction_regressor(v)
+        Y_friction = _build_friction_regressor(
+            v,
+            coulomb_mode=coulomb_mode,
+            tanh_eps=tanh_eps,
+            min_abs_vel_for_coulomb=min_abs_vel_for_coulomb,
+            include_bias=include_bias,
+        )
         if include_bias:
-            Y_bias = np.eye(nq)
-            Y = np.hstack([Y_friction, Y_bias])
+            Y = Y_friction
         else:
             Y = Y_friction
 
@@ -129,6 +223,10 @@ def identify_dynamics(
     sg_window: int = 11,
     sg_poly: int = 3,
     ridge_lambda: float = 0.0,
+    coulomb_mode: str = "sign",
+    tanh_eps: float = 0.02,
+    min_abs_vel_for_coulomb: float = 0.0,
+    package_dirs: Optional[str] = None,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """Identify rigid-body and friction parameters via linear regression.
 
@@ -144,8 +242,7 @@ def identify_dynamics(
         and info provides residual norm and rank.
     """
 
-    model = pin.buildModelFromUrdf(urdf_path)
-    data = model.createData()
+    model, data = _load_pinocchio_model(urdf_path, package_dirs=package_dirs)
 
     qs = np.asarray(recorded_data["q"], dtype=float)
     dqs = np.asarray(recorded_data["dq"], dtype=float)
@@ -169,10 +266,16 @@ def identify_dynamics(
         tau_m = taus_meas[k]
 
         # Rigid-body regressor from Pinocchio
-        Y_rigid = pin.computeJointTorqueRegressor(model, data, q, v, a)
+        Y_rigid = pin.computeJointTorqueRegressor(model, data, q, v, a)  # type: ignore[attr-defined]
 
         # Friction regressor (viscous + Coulomb)
-        Y_friction = _build_friction_regressor(v)
+        Y_friction = _build_friction_regressor(
+            v,
+            coulomb_mode=coulomb_mode,
+            tanh_eps=tanh_eps,
+            min_abs_vel_for_coulomb=min_abs_vel_for_coulomb,
+            include_bias=False,
+        )
 
         # Stack
         Y_total = np.hstack([Y_rigid, Y_friction])
@@ -197,6 +300,212 @@ def identify_dynamics(
 
     info = {"residuals": float(residuals if np.ndim(residuals) else residuals), "rank": int(rank)}
     return phi_identified, info
+
+
+def identify_friction_from_free_motion(
+    recorded_data: Dict[str, np.ndarray],
+    *,
+    use_rnea: bool = False,
+    include_coriolis: bool = True,
+    include_bias: bool = True,
+    coulomb_mode: str = "tanh",
+    tanh_eps: float = 0.02,
+    min_abs_vel_for_coulomb: float = 0.02,
+    max_abs_acc: float = 0.8,
+    min_abs_vel: float = 0.05,
+    ridge_lambda: float = 1e-4,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
+    """Estimate friction params from a passive/free-motion recording.
+
+    This is a pragmatic, "make it usable" mode for leader tuning when you do NOT
+    have measured joint torques. It assumes that during gentle motion (low accel)
+    the human-applied torques are small, so:
+
+      tau_friction(q, dq) ≈ -tau_model(q, dq, ddq)
+
+    where tau_model is either:
+      - gravity (+ optional coriolis) from URDF logging, OR
+      - full RNEA from URDF logging (if available)
+
+    The fit is only meaningful if you record slow, smooth movements with pauses.
+    """
+    qs = np.asarray(recorded_data.get("joint_positions"), dtype=float)
+    dqs = np.asarray(recorded_data.get("joint_velocities"), dtype=float)
+    ddqs = np.asarray(recorded_data.get("joint_accelerations"), dtype=float)
+
+    if qs.ndim != 2 or dqs.shape != qs.shape or ddqs.shape != qs.shape:
+        raise ValueError("Expected joint_positions/joint_velocities/joint_accelerations with shape (N, nq)")
+
+    gravity = recorded_data.get("urdf_gravity_torques")
+    coriolis = recorded_data.get("urdf_coriolis_torques")
+    rnea = recorded_data.get("urdf_rnea_torques")
+
+    if use_rnea:
+        if rnea is None:
+            raise ValueError("use_rnea=True requires urdf_rnea_torques in the recording")
+        tau_model = np.asarray(rnea, dtype=float)
+    else:
+        if gravity is None:
+            raise ValueError("Recording missing urdf_gravity_torques; record with scripts/record_physical_behavior.py --urdf ...")
+        tau_model = np.asarray(gravity, dtype=float)
+        if include_coriolis and coriolis is not None:
+            tau_model = tau_model + np.asarray(coriolis, dtype=float)
+
+    nq = qs.shape[1]
+
+    # Pick samples that are informative: low accel, and enough velocity.
+    acc_ok = np.all(np.abs(ddqs) < float(max_abs_acc), axis=1)
+    vel_ok = np.any(np.abs(dqs) > float(min_abs_vel), axis=1)
+    mask = acc_ok & vel_ok
+
+    n_used = int(np.sum(mask))
+    if n_used < max(50, 5 * nq):
+        raise RuntimeError(
+            f"Not enough usable samples for friction fit (used {n_used}). "
+            f"Try recording longer and moving smoothly (max_abs_acc={max_abs_acc}, min_abs_vel={min_abs_vel})."
+        )
+
+    Y_stack: list[np.ndarray] = []
+    tau_stack: list[np.ndarray] = []
+    for k in np.where(mask)[0]:
+        v = dqs[k]
+        # Target: friction should cancel model torque under gentle motion assumption.
+        y = -tau_model[k]
+        Yk = _build_friction_regressor(
+            v,
+            coulomb_mode=coulomb_mode,
+            tanh_eps=tanh_eps,
+            min_abs_vel_for_coulomb=min_abs_vel_for_coulomb,
+            include_bias=include_bias,
+        )
+        Y_stack.append(Yk)
+        tau_stack.append(y)
+
+    Y_matrix = _stack_blocks(Y_stack)  # (N*nq, n_params)
+    tau_vector = _stack_targets(tau_stack)
+
+    n_params = Y_matrix.shape[1]
+    if ridge_lambda > 0.0:
+        A = Y_matrix.T @ Y_matrix + float(ridge_lambda) * np.eye(n_params)
+        b = Y_matrix.T @ tau_vector
+        theta = np.linalg.solve(A, b)
+        residuals = float(np.linalg.norm(Y_matrix @ theta - tau_vector) ** 2)
+        rank = int(np.linalg.matrix_rank(Y_matrix))
+    else:
+        theta, residuals, rank, _ = np.linalg.lstsq(Y_matrix, tau_vector, rcond=None)
+        residuals = float(residuals if np.ndim(residuals) else residuals)
+        rank = int(rank)
+
+    fv = theta[0 : 2 * nq : 2]
+    fc = theta[1 : 2 * nq : 2]
+    params: Dict[str, np.ndarray] = {"fv": fv, "fc": fc}
+    if include_bias:
+        params["bias"] = theta[2 * nq : 2 * nq + nq]
+
+    info = {
+        "residuals": float(residuals),
+        "rank": int(rank),
+        "samples_total": int(qs.shape[0]),
+        "samples_used": int(n_used),
+    }
+    return params, info
+
+
+def _print_yaml_suggestion(params: Dict[str, np.ndarray], *, n_joints: int) -> None:
+    fv = params.get("fv", np.zeros(n_joints))
+    fc = params.get("fc", np.zeros(n_joints))
+    bias = params.get("bias", np.zeros(n_joints))
+
+    def fmt(arr: np.ndarray) -> str:
+        return "[" + ", ".join(f"{float(x):.6f}" for x in arr[:n_joints]) + "]"
+
+    print("\nYAML suggestion (copy into controller.static_friction_comp):")
+    print(f"  friction_feedforward: {fmt(fc)}")
+    print(f"  viscous_friction: {fmt(fv)}")
+    print("  # optional (not currently used in gravity_compensation.py):")
+    print(f"  # torque_bias: {fmt(bias)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Compute friction parameters from a recorded leader motion (.npz)",
+    )
+    parser.add_argument(
+        "--input",
+        "-i",
+        required=True,
+        help="Path to .npz recording (from scripts/record_physical_behavior.py)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["free-motion"],
+        default="free-motion",
+        help="Identification mode (default: free-motion)",
+    )
+    parser.add_argument("--use-rnea", action="store_true", help="Use urdf_rnea_torques if present")
+    parser.add_argument(
+        "--no-coriolis",
+        action="store_true",
+        help="Don’t add urdf_coriolis_torques (if available) in free-motion mode",
+    )
+    parser.add_argument("--no-bias", action="store_true", help="Don’t fit a constant torque bias")
+
+    # Friction model options
+    parser.add_argument("--coulomb-mode", choices=["sign", "tanh"], default="tanh")
+    parser.add_argument("--tanh-eps", type=float, default=0.02)
+    parser.add_argument("--min-abs-vel-for-coulomb", type=float, default=0.02)
+
+    # Sample selection
+    parser.add_argument("--max-abs-acc", type=float, default=0.8)
+    parser.add_argument("--min-abs-vel", type=float, default=0.05)
+
+    # Solver
+    parser.add_argument("--ridge", type=float, default=1e-4)
+
+    args = parser.parse_args()
+
+    rec_path = args.input
+    if not os.path.exists(rec_path):
+        raise FileNotFoundError(f"Recording not found: {rec_path}")
+
+    rec = load_npz_recording(rec_path)
+    qs = np.asarray(rec.get("joint_positions"))
+    if qs.ndim != 2:
+        raise ValueError("Recording missing joint_positions")
+    n_joints = int(qs.shape[1])
+
+    if args.mode == "free-motion":
+        params, info = identify_friction_from_free_motion(
+            rec,
+            use_rnea=bool(args.use_rnea),
+            include_coriolis=not bool(args.no_coriolis),
+            include_bias=not bool(args.no_bias),
+            coulomb_mode=str(args.coulomb_mode),
+            tanh_eps=float(args.tanh_eps),
+            min_abs_vel_for_coulomb=float(args.min_abs_vel_for_coulomb),
+            max_abs_acc=float(args.max_abs_acc),
+            min_abs_vel=float(args.min_abs_vel),
+            ridge_lambda=float(args.ridge),
+        )
+
+        print("\n=== Friction fit (free-motion) ===")
+        print(f"Recording: {rec_path}")
+        print(f"Joints: {n_joints}")
+        print(f"Samples used: {info.get('samples_used')} / {info.get('samples_total')}")
+        print(f"Residuals: {info.get('residuals'):.6e}  rank: {info.get('rank')}")
+        print("\nEstimated parameters:")
+        print("  fv (viscous):", np.array2string(params["fv"], precision=6, floatmode="fixed"))
+        print("  fc (coulomb):", np.array2string(params["fc"], precision=6, floatmode="fixed"))
+        if "bias" in params:
+            print("  bias:", np.array2string(params["bias"], precision=6, floatmode="fixed"))
+
+        _print_yaml_suggestion(params, n_joints=n_joints)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 
 # --- Usage hint ---
