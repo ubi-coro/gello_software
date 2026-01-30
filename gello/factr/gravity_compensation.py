@@ -28,6 +28,8 @@ from collections import deque
 from threading import Thread
 from dataclasses import dataclass, field
 from typing import Dict, List, Deque
+import csv
+from datetime import datetime
 
 from gello.dynamixel.driver import DynamixelDriver
 
@@ -138,6 +140,8 @@ class TorqueComponentLogger:
     gripper_current: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     positions: List[Deque[float]] = field(default_factory=list)
     velocities: List[Deque[float]] = field(default_factory=list)
+    tcp_force: List[Deque[float]] = field(default_factory=list)  # TCP force/torque [Fx, Fy, Fz, Tx, Ty, Tz]
+    tcp_joint_torques: List[Deque[float]] = field(default_factory=list)  # J^T * tcp_force
 
     def __post_init__(self):
         self.time_history = deque(maxlen=self.history_len)
@@ -157,6 +161,12 @@ class TorqueComponentLogger:
             self.tau_external.append(deque(maxlen=self.history_len))
             self.positions.append(deque(maxlen=self.history_len))
             self.velocities.append(deque(maxlen=self.history_len))
+        # Initialize TCP force/torque deques (6 components: Fx, Fy, Fz, Tx, Ty, Tz)
+        for _ in range(6):
+            self.tcp_force.append(deque(maxlen=self.history_len))
+        # Initialize TCP->joint torques (num_joints components)
+        for _ in range(num_joints):
+            self.tcp_joint_torques.append(deque(maxlen=self.history_len))
 
     def log(
             self,
@@ -173,6 +183,8 @@ class TorqueComponentLogger:
             tau_external: np.ndarray,
             tau_gripper: float = 0.0,
             gripper_current: float = 0.0,
+            tcp_force: Optional[np.ndarray] = None,
+            tcp_joint_torques: Optional[np.ndarray] = None,
     ):
         """Log one timestep of torque components."""
         self.time_history.append(timestamp)
@@ -189,6 +201,155 @@ class TorqueComponentLogger:
             self.tau_feedback[i].append(tau_feedback[i])
             self.tau_total[i].append(tau_total[i])
             self.tau_external[i].append(tau_external[i])
+        # Log TCP force/torque
+        if tcp_force is not None and len(tcp_force) >= 6:
+            for i in range(6):
+                self.tcp_force[i].append(tcp_force[i])
+        else:
+            for i in range(6):
+                self.tcp_force[i].append(0.0)
+        # Log TCP->joint torques
+        if tcp_joint_torques is not None:
+            for i in range(min(len(tcp_joint_torques), len(self.tcp_joint_torques))):
+                self.tcp_joint_torques[i].append(tcp_joint_torques[i])
+        else:
+            for i in range(len(self.tcp_joint_torques)):
+                self.tcp_joint_torques[i].append(0.0)
+
+
+class HighFrequencyDataLogger:
+    """High-frequency CSV logger for scientific analysis.
+    
+    Logs comprehensive telemetry data at control loop frequency (500Hz)
+    for post-processing and thesis plots. Data is buffered and written
+    in batches to minimize I/O overhead.
+    """
+    
+    def __init__(self, log_dir: str = "logs", buffer_size: int = 1000):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create timestamped log file
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = self.log_dir / f"gello_data_{timestamp_str}.csv"
+        
+        self.buffer: List[Dict[str, float]] = []
+        self.buffer_size = buffer_size
+        self.file_handle = None
+        self.csv_writer = None
+        self.header_written = False
+        self.start_time: Optional[float] = None
+        
+        print(f"DataLogger initialized: {self.log_file}")
+    
+    def start(self):
+        """Open file for writing."""
+        self.file_handle = open(self.log_file, 'w', newline='', buffering=8192)
+        self.start_time = time.time()
+    
+    def log(
+        self,
+        timestamp: float,
+        q_leader: np.ndarray,
+        q_dot_leader: np.ndarray,
+        tau_gravity: np.ndarray,
+        tau_friction: np.ndarray,
+        tau_damping: np.ndarray,
+        tau_null: np.ndarray,
+        tau_limit: np.ndarray,
+        tau_feedback: np.ndarray,
+        tau_total: np.ndarray,
+        tau_external: np.ndarray,
+        gripper_pos_leader: float = 0.0,
+        gripper_vel_leader: float = 0.0,
+        q_follower: Optional[np.ndarray] = None,
+        q_dot_follower: Optional[np.ndarray] = None,
+        tcp_force: Optional[np.ndarray] = None,
+        gripper_pos_follower: float = 0.0,
+        control_mode: str = "gravity_comp",
+    ):
+        """Log a single timestep of data.
+        
+        All torque arrays should be in Nm, positions in rad, velocities in rad/s.
+        """
+        if self.file_handle is None:
+            return
+        
+        # Build data row
+        num_joints = len(q_leader)
+        row = {
+            'timestamp': timestamp,
+            'control_mode': control_mode,
+        }
+        
+        # Leader data
+        for i in range(num_joints):
+            row[f'q_leader_{i}'] = q_leader[i]
+            row[f'q_dot_leader_{i}'] = q_dot_leader[i]
+            row[f'tau_gravity_{i}'] = tau_gravity[i]
+            row[f'tau_friction_{i}'] = tau_friction[i]
+            row[f'tau_damping_{i}'] = tau_damping[i]
+            row[f'tau_null_{i}'] = tau_null[i]
+            row[f'tau_limit_{i}'] = tau_limit[i]
+            row[f'tau_feedback_{i}'] = tau_feedback[i]
+            row[f'tau_total_{i}'] = tau_total[i]
+            row[f'tau_external_{i}'] = tau_external[i]
+        
+        row['gripper_pos_leader'] = gripper_pos_leader
+        row['gripper_vel_leader'] = gripper_vel_leader
+        
+        # Follower data (if available)
+        if q_follower is not None:
+            for i in range(len(q_follower)):
+                row[f'q_follower_{i}'] = q_follower[i]
+        else:
+            for i in range(num_joints):
+                row[f'q_follower_{i}'] = 0.0
+        
+        if q_dot_follower is not None:
+            for i in range(len(q_dot_follower)):
+                row[f'q_dot_follower_{i}'] = q_dot_follower[i]
+        else:
+            for i in range(num_joints):
+                row[f'q_dot_follower_{i}'] = 0.0
+        
+        row['gripper_pos_follower'] = gripper_pos_follower
+        
+        # TCP force/torque (if available)
+        if tcp_force is not None and len(tcp_force) >= 6:
+            for i in range(6):
+                row[f'tcp_force_{i}'] = tcp_force[i]
+        else:
+            for i in range(6):
+                row[f'tcp_force_{i}'] = 0.0
+        
+        # Write header on first log
+        if not self.header_written:
+            self.csv_writer = csv.DictWriter(self.file_handle, fieldnames=row.keys())
+            self.csv_writer.writeheader()
+            self.header_written = True
+        
+        # Buffer data
+        self.buffer.append(row)
+        
+        # Flush buffer when full
+        if len(self.buffer) >= self.buffer_size:
+            self.flush()
+    
+    def flush(self):
+        """Write buffered data to disk."""
+        if self.csv_writer and self.buffer:
+            self.csv_writer.writerows(self.buffer)
+            self.buffer.clear()
+    
+    def close(self):
+        """Flush remaining data and close file."""
+        if self.file_handle:
+            self.flush()
+            self.file_handle.close()
+            self.file_handle = None
+            duration = time.time() - self.start_time if self.start_time else 0
+            print(f"DataLogger closed. Duration: {duration:.1f}s, File: {self.log_file}")
 
 
 def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
@@ -267,7 +428,7 @@ def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
         ax.set_ylabel("External Torque (Nm)")
         
         # Color cycle for joints in summary plot
-        summary_colors = plt.cm.tab10(np.linspace(0, 1, num_joints))
+        summary_colors = plt.get_cmap('tab10')(np.linspace(0, 1, num_joints))
         
         for j in range(num_joints):
             line, = ax.plot([], [], label=f"J{j+1}", color=summary_colors[j], linewidth=1.5)
@@ -275,26 +436,22 @@ def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
         
         ax.legend(ncol=2, fontsize='x-small', loc='upper right')
 
-    # Initialize Gripper Plot (Plot 7 / 8th slot)
+    # Initialize TCP Force/Torque Plot (Plot 7 / 8th slot)
+    viz_lines["tcp_force"] = []
     if gripper_plot_idx < len(viz_axes):
         ax = viz_axes[gripper_plot_idx]
-        ax.set_title("Gripper Feedback")
+        ax.set_title("TCP Force/Torque")
         ax.grid(True, alpha=0.3)
-        ax.set_ylabel("Torque (Nm)")
+        ax.set_ylabel("Forces (N) / Torques (Nm)")
         
-        line, = ax.plot([], [], label="Torque (Red)", color="#e74c3c", linewidth=1.5)
-        viz_lines["gripper"] = line
+        # Plot TCP force/torque components (6 components)
+        tcp_labels = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
+        tcp_colors = plt.get_cmap('tab10')(np.linspace(0, 0.5, 6))  # First 6 colors from tab10
+        for i in range(6):
+            line, = ax.plot([], [], label=tcp_labels[i], color=tcp_colors[i], linewidth=1.5, alpha=0.8)
+            viz_lines["tcp_force"].append(line)
         
-        # Add secondary axis for current
-        ax2 = ax.twinx()
-        ax2.set_ylabel("Current 0-255", color="#3498db")
-        line_curr, = ax2.plot([], [], label="Current (Blue)", color="#3498db", linewidth=1.5, linestyle=":")
-        viz_lines["gripper_current"] = line_curr
-
-        # Combine legends
-        lines = [line, line_curr]
-        labels = [l.get_label() for l in lines]
-        ax.legend(lines, labels, fontsize='small', loc='upper right')
+        ax.legend(fontsize='x-small', loc='upper left', ncol=2)
 
     plt.tight_layout()
 
@@ -307,10 +464,12 @@ def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
                     plt.close(viz_fig)
                     return
                 # Handle potentially different tuple sizes during transition
-                if len(data) == 13:
+                if len(data) == 15:  # New format with tcp_force and tcp_joint_torques
                     logger.log(*data)
+                elif len(data) == 13:  # Old format without tcp data
+                    logger.log(*(data + (None, None)))
                 elif len(data) == 12:
-                     logger.log(*(data + (0.0,)))
+                     logger.log(*(data + (0.0, None, None)))
                 else:
                     logger.log(*data)
         except Exception:
@@ -354,22 +513,16 @@ def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
                 viz_axes[summary_plot_idx].relim()
                 viz_axes[summary_plot_idx].autoscale_view(scalex=True, scaley=True)
 
-            # Update Gripper Plot
-            if gripper_plot_idx < len(viz_axes) and viz_lines["gripper"] is not None:
-                viz_lines["gripper"].set_data(t_rel, logger.tau_gripper)
-                viz_lines["gripper_current"].set_data(t_rel, logger.gripper_current)
+            # Update TCP Force/Torque Plot
+            if gripper_plot_idx < len(viz_axes) and len(viz_lines["tcp_force"]) == 6:
+                # Update TCP force/torque lines
+                for i in range(6):
+                    if len(logger.tcp_force) > i:
+                        viz_lines["tcp_force"][i].set_data(t_rel, logger.tcp_force[i])
                 
                 ax = viz_axes[gripper_plot_idx]
-                # Relim and autoscale primary axis
                 ax.relim()
                 ax.autoscale_view(scalex=True, scaley=True)
-                
-                # Relim and autoscale secondary axis (twinx)
-                # Since we don't have direct ref to ax2 here, we iterate shared axes
-                for peer in ax.get_shared_x_axes().get_siblings(ax):
-                    if peer is not ax:
-                        peer.relim()
-                        peer.autoscale_view(scalex=True, scaley=True)
 
             viz_fig.canvas.draw_idle()
             viz_fig.canvas.flush_events()
@@ -434,6 +587,10 @@ class FACTRGravityCompensation:
         self._viz_queue: Optional[mp.Queue] = None
         self._viz_process: Optional[mp.Process] = None
         self._viz_start_time: float = 0.0
+
+        # High-frequency data logger for scientific analysis
+        self.enable_data_logging: bool = False  # Enable via config or CLI
+        self.data_logger: Optional[HighFrequencyDataLogger] = None
 
         try:
             self._load_config()
@@ -514,6 +671,14 @@ class FACTRGravityCompensation:
         self.tau_g = np.zeros(self.num_arm_joints)
         # Cache last gripper velocity so we can build URDF-sized vectors for Pinocchio
         self._last_gripper_vel: float = 0.0
+
+        # Data logging configuration
+        logging_cfg = self.config.get("logging", {})
+        self.enable_data_logging = logging_cfg.get("enable", False)
+        log_dir = logging_cfg.get("log_dir", "logs")
+        if self.enable_data_logging:
+            self.data_logger = HighFrequencyDataLogger(log_dir=log_dir)
+            print(f"Data logging enabled: {log_dir}")
 
         # Friction compensation
         self.stiction_comp_enable_speed = self.config["controller"][
@@ -1885,6 +2050,69 @@ class FACTRGravityCompensation:
 
         return tau_ff
 
+    def get_follower_tcp_force(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Get TCP force/torque from follower robot and compute joint torques.
+        
+        Returns:
+            Tuple of (tcp_force, tcp_joint_torques):
+            - tcp_force: 6D wrench [Fx, Fy, Fz, Tx, Ty, Tz] in N and Nm
+            - tcp_joint_torques: Joint torques computed from TCP force via J^T @ F
+        """
+        tcp_force = np.zeros(6)
+        tcp_joint_torques = np.zeros(self.num_arm_joints)
+        
+        if not self.teleop_enabled:
+            return tcp_force, tcp_joint_torques
+        
+        try:
+            # Priority 1: Try direct RTDE access (lowest latency)
+            if self._direct_follower_robot is not None:
+                follower = self._direct_follower_robot
+                
+                # Try URRobot's get_actual_tcp_force() method
+                if hasattr(follower, "get_actual_tcp_force"):
+                    tcp_force = follower.get_actual_tcp_force()
+                # Fallback to direct RTDE access
+                elif hasattr(follower, "r_inter") and hasattr(follower.r_inter, "getActualTCPForce"):
+                    tcp_force = np.array(follower.r_inter.getActualTCPForce())
+            
+            # Priority 2: Try via teleop_robot_server
+            elif self.teleop_robot_server is not None:
+                follower = self.teleop_robot_server
+                
+                # Handle ZMQServerRobot wrapper
+                if hasattr(follower, "_robot"):
+                    follower = follower._robot
+                elif hasattr(follower, "robot"):
+                    follower = follower.robot
+                
+                # Try URRobot's get_actual_tcp_force() method
+                if hasattr(follower, "get_actual_tcp_force"):
+                    tcp_force = follower.get_actual_tcp_force()
+                # Fallback to direct RTDE access
+                elif hasattr(follower, "r_inter") and hasattr(follower.r_inter, "getActualTCPForce"):
+                    tcp_force = np.array(follower.r_inter.getActualTCPForce())
+            
+            # Compute joint torques using Jacobian transpose if we got TCP force
+            if np.any(tcp_force != 0) and self.J_semi is not None:
+                tcp_joint_torques_raw = self.J_semi.T @ tcp_force
+                # Apply tare if available
+                if self.J_semi_tare is not None:
+                    tcp_joint_torques_raw -= self.J_semi_tare
+                # Return only arm joint torques
+                if len(tcp_joint_torques_raw) >= self.num_arm_joints:
+                    tcp_joint_torques = tcp_joint_torques_raw[:self.num_arm_joints]
+                else:
+                    tcp_joint_torques = tcp_joint_torques_raw
+        
+        except Exception as e:
+            # Print error for debugging (only once per run)
+            if not hasattr(self, '_tcp_force_error_logged'):
+                print(f"Warning: Failed to get TCP force: {e}")
+                self._tcp_force_error_logged = True
+        
+        return tcp_force, tcp_joint_torques
+
     def get_follower_gripper_feedback(self) -> Dict[str, Any]:
         """Get gripper feedback from the follower robot.
 
@@ -2020,6 +2248,73 @@ class FACTRGravityCompensation:
     def _update_visualization(self):
         """Legacy method - functionality moved to worker process."""
         pass
+    
+    def _log_data(
+        self,
+        timestamp: float,
+        arm_joint_pos: np.ndarray,
+        arm_joint_vel: np.ndarray,
+        tau_g: np.ndarray,
+        tau_ss: np.ndarray,
+        tau_damp: np.ndarray,
+        tau_n: np.ndarray,
+        tau_l: np.ndarray,
+        tau_ff: np.ndarray,
+        arm_torque: np.ndarray,
+        tau_ext: np.ndarray,
+        gripper_joint_pos: float,
+        gripper_joint_vel: float,
+    ):
+        """Log current control loop data."""
+        if not self.enable_data_logging or self.data_logger is None:
+            return
+        
+        # Get follower state if available
+        q_follower = None
+        q_dot_follower = None
+        tcp_force = None
+        gripper_pos_follower = 0.0
+        
+        try:
+            if self.teleop_enabled:
+                q_follower, q_dot_follower = self.get_follower_arm_state()
+                tcp_force, _ = self.get_follower_tcp_force()
+                gripper_fb = self.get_follower_gripper_feedback()
+                if gripper_fb and 'position' in gripper_fb:
+                    gripper_pos_follower = gripper_fb['position']
+        except Exception:
+            pass  # Continue with None values
+        
+        # Determine control mode
+        control_mode = "gravity_comp"
+        if self.teleop_enabled:
+            impedance_cfg = self.config.get("teleop", {}).get("impedance", {})
+            if impedance_cfg.get("enable", False):
+                control_mode = "impedance_teleop"
+            else:
+                control_mode = "position_teleop"
+        
+        self.data_logger.log(
+            timestamp=timestamp,
+            q_leader=arm_joint_pos,
+            q_dot_leader=arm_joint_vel,
+            tau_gravity=tau_g,
+            tau_friction=tau_ss,
+            tau_damping=tau_damp,
+            tau_null=tau_n,
+            tau_limit=tau_l,
+            tau_feedback=tau_ff,
+            tau_total=arm_torque,
+            tau_external=tau_ext,
+            gripper_pos_leader=gripper_joint_pos,
+            gripper_vel_leader=gripper_joint_vel,
+            q_follower=q_follower,
+            q_dot_follower=q_dot_follower,
+            tcp_force=tcp_force,
+            gripper_pos_follower=gripper_pos_follower,
+            control_mode=control_mode,
+        )
+    
     def control_loop_step(self) -> None:
         """Execute one step of the control loop."""
         # Get current joint states
@@ -2140,6 +2435,9 @@ class FACTRGravityCompensation:
             gripper_current_val = 0.0
             if isinstance(self._follower_gripper_feedback, dict):
                 gripper_current_val = float(self._follower_gripper_feedback.get("motor_current", 0.0))
+            
+            # Get TCP force/torque data
+            tcp_force, tcp_joint_torques = self.get_follower_tcp_force()
 
             self._viz_queue.put((
                 time.time() - self._viz_start_time,
@@ -2154,8 +2452,27 @@ class FACTRGravityCompensation:
                 torque_arm.copy(),
                 self._follower_torques.copy(),
                 float(torque_gripper),
-                gripper_current_val
+                gripper_current_val,
+                tcp_force.copy(),
+                tcp_joint_torques.copy(),
             ))
+        
+        # === LOG FOR SCIENTIFIC ANALYSIS ===
+        self._log_data(
+            timestamp=time.time(),
+            arm_joint_pos=leader_arm_pos,
+            arm_joint_vel=leader_arm_vel,
+            tau_g=tau_gravity_comp,
+            tau_ss=tau_friction_comp,
+            tau_damp=tau_damping_comp,
+            tau_n=tau_null_comp,
+            tau_l=tau_limit_comp,
+            tau_ff=tau_feedback_comp,
+            arm_torque=torque_arm,
+            tau_ext=self._follower_torques,
+            gripper_joint_pos=leader_gripper_pos,
+            gripper_joint_vel=leader_gripper_vel,
+        )
         
         # Debug output (every 100 iterations = ~0.2 second at 500Hz)
         if debug:=getattr(self, "debug_mode", False):
@@ -2182,9 +2499,16 @@ class FACTRGravityCompensation:
         print(f"Starting gravity compensation control loop at {1 / self.dt:.1f} Hz")
         if self.enable_visualization:
             print("Visualization enabled - close plot window to stop")
+        if self.enable_data_logging:
+            print("Data logging enabled")
         print("Press Ctrl+C to stop")
 
         self.running = True
+        
+        # Start data logger if enabled
+        if self.enable_data_logging and self.data_logger:
+            self.data_logger.start()
+        
         # Start teleop thread now that running is True
         if self.teleop_enabled and self.teleop_prepared and self.teleop_thread is None:
 
@@ -2233,6 +2557,10 @@ class FACTRGravityCompensation:
     def shutdown(self) -> None:
         """Safely shutdown the system."""
         self.running = False
+        
+        # Close data logger
+        if self.data_logger:
+            self.data_logger.close()
         
         # Stop visualization
         if getattr(self, "_viz_queue", None) is not None:
@@ -2288,6 +2616,11 @@ def main() -> int:
         action="store_true",
         help="Enable real-time visualization of torque components",
     )
+    parser.add_argument(
+        "--log", "-l",
+        action="store_true",
+        help="Enable high-frequency data logging for post-analysis",
+    )
 
     args = parser.parse_args()
 
@@ -2299,6 +2632,12 @@ def main() -> int:
     try:
         # Create and run gravity compensation system
         system = FACTRGravityCompensation(args.config, enable_visualization=args.visualize)
+        
+        # Override logging setting if CLI flag is provided
+        if args.log:
+            system.enable_data_logging = True
+            if system.data_logger is None:
+                system.data_logger = HighFrequencyDataLogger()
 
         # Set up signal handler for clean shutdown
         def signal_handler(signum, frame):

@@ -353,33 +353,63 @@ def identify_friction_from_free_motion(
 
     nq = qs.shape[1]
 
-    # Pick samples that are informative: low accel, and enough velocity.
-    acc_ok = np.all(np.abs(ddqs) < float(max_abs_acc), axis=1)
-    vel_ok = np.any(np.abs(dqs) > float(min_abs_vel), axis=1)
+    # Acceleration from the recorder is computed by raw differentiation and is often noisy.
+    # If timestamps are available, build a smoothed ddq for gating.
+    ddq_for_mask = ddqs
+    timestamps = recorded_data.get("timestamps")
+    if timestamps is None:
+        timestamps = recorded_data.get("timestamp")
+    if timestamps is not None:
+        ts = np.asarray(timestamps, dtype=float).reshape(-1)
+        if ts.shape[0] == qs.shape[0]:
+            dt_est = float(np.median(np.diff(ts))) if ts.shape[0] >= 3 else 0.0
+            if dt_est > 0:
+                try:
+                    ddq_for_mask = _compute_ddq(dqs, dt_est, window_length=21, polyorder=3)
+                except Exception:
+                    ddq_for_mask = ddqs
+
+    # Pick samples that are informative per joint: low accel AND enough velocity.
+    # IMPORTANT: gate per-joint, not per-timestep across all joints (otherwise you throw away most data).
+    acc_ok = np.abs(ddq_for_mask) < float(max_abs_acc)  # (N, nq)
+    vel_ok = np.abs(dqs) > float(min_abs_vel)  # (N, nq)
     mask = acc_ok & vel_ok
 
-    n_used = int(np.sum(mask))
-    if n_used < max(50, 5 * nq):
+    used_rows_per_joint = mask.sum(axis=0).astype(int)
+    used_rows_total = int(mask.sum())
+    if used_rows_total < max(50, 20 * nq):
         raise RuntimeError(
-            f"Not enough usable samples for friction fit (used {n_used}). "
+            f"Not enough usable joint-samples for friction fit (used_rows_total={used_rows_total}). "
             f"Try recording longer and moving smoothly (max_abs_acc={max_abs_acc}, min_abs_vel={min_abs_vel})."
         )
 
+    # Diagnostics: sign balance (if mostly one direction, Coulomb fit becomes unreliable)
+    pos_counts = np.zeros(nq, dtype=int)
+    neg_counts = np.zeros(nq, dtype=int)
+    for j in range(nq):
+        vj = dqs[:, j]
+        mj = mask[:, j]
+        pos_counts[j] = int(np.sum(vj[mj] > 0))
+        neg_counts[j] = int(np.sum(vj[mj] < 0))
+
     Y_stack: list[np.ndarray] = []
     tau_stack: list[np.ndarray] = []
-    for k in np.where(mask)[0]:
+    for k in range(qs.shape[0]):
+        active = np.where(mask[k])[0]
+        if active.size == 0:
+            continue
         v = dqs[k]
-        # Target: friction should cancel model torque under gentle motion assumption.
-        y = -tau_model[k]
-        Yk = _build_friction_regressor(
+        y_full = -tau_model[k]
+        Yk_full = _build_friction_regressor(
             v,
             coulomb_mode=coulomb_mode,
             tanh_eps=tanh_eps,
             min_abs_vel_for_coulomb=min_abs_vel_for_coulomb,
             include_bias=include_bias,
         )
-        Y_stack.append(Yk)
-        tau_stack.append(y)
+        for j in active:
+            Y_stack.append(Yk_full[j : j + 1, :])
+            tau_stack.append(np.array([float(y_full[j])], dtype=float))
 
     Y_matrix = _stack_blocks(Y_stack)  # (N*nq, n_params)
     tau_vector = _stack_targets(tau_stack)
@@ -406,7 +436,10 @@ def identify_friction_from_free_motion(
         "residuals": float(residuals),
         "rank": int(rank),
         "samples_total": int(qs.shape[0]),
-        "samples_used": int(n_used),
+        "used_rows_total": int(used_rows_total),
+        "used_rows_per_joint": used_rows_per_joint,
+        "pos_counts": pos_counts,
+        "neg_counts": neg_counts,
     }
     return params, info
 
@@ -464,9 +497,10 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    rec_path = args.input
+    # Resolve input path relative to workspace if not found directly
+    rec_path = _resolve_urdf_path(args.input)
     if not os.path.exists(rec_path):
-        raise FileNotFoundError(f"Recording not found: {rec_path}")
+        raise FileNotFoundError(f"Recording not found: {args.input} (resolved to: {rec_path})")
 
     rec = load_npz_recording(rec_path)
     qs = np.asarray(rec.get("joint_positions"))
@@ -491,8 +525,21 @@ def main() -> int:
         print("\n=== Friction fit (free-motion) ===")
         print(f"Recording: {rec_path}")
         print(f"Joints: {n_joints}")
-        print(f"Samples used: {info.get('samples_used')} / {info.get('samples_total')}")
+        if "used_rows_total" in info:
+            print(
+                f"Used rows (joint-samples): {int(info['used_rows_total'])}  "
+                f"(timesteps: {int(info['samples_total'])})"
+            )
+        else:
+            print(f"Samples used: {info.get('samples_used')} / {info.get('samples_total')}")
         print(f"Residuals: {info.get('residuals'):.6e}  rank: {info.get('rank')}")
+
+        if "used_rows_per_joint" in info:
+            per_joint = np.asarray(info["used_rows_per_joint"]).astype(int)
+            pos = np.asarray(info.get("pos_counts", np.zeros_like(per_joint))).astype(int)
+            neg = np.asarray(info.get("neg_counts", np.zeros_like(per_joint))).astype(int)
+            print("Per-joint rows used:", per_joint.tolist())
+            print("Per-joint vel sign counts (+/-):", [(int(p), int(n)) for p, n in zip(pos, neg)])
         print("\nEstimated parameters:")
         print("  fv (viscous):", np.array2string(params["fv"], precision=6, floatmode="fixed"))
         print("  fc (coulomb):", np.array2string(params["fc"], precision=6, floatmode="fixed"))

@@ -83,13 +83,13 @@ controller:
     max_torque: 0.2
 
 teleop:
-  enable: False
+  enable: True
   use_direct_rtde: true
   hz: 250
   wait_for_server_timeout_s: 5.0
 
   impedance:
-    enable: true           # Use impedance instead of position control
+    enable: false           # Use impedance instead of position control
     kp: 150.0               # Position stiffness (Nm/rad)
     kd: 12.0                # Velocity damping (Nm*s/rad)
     use_leader_velocity: true  # Use leader velocity in feedforward
@@ -113,3 +113,8 @@ teleop:
     auto_align: true
   # Explicit gripper config for teleop normalization: [id, open_deg, close_deg]
   gripper_config: [7, 197, 155] 
+
+
+logging:
+  enable: true
+  log_dir: "logs"
