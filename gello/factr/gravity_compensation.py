@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Deque
 import csv
 from datetime import datetime
+import queue
 
 from gello.dynamixel.driver import DynamixelDriver
 
@@ -218,11 +219,12 @@ class TorqueComponentLogger:
 
 
 class HighFrequencyDataLogger:
-    """High-frequency CSV logger for scientific analysis.
+    """High-frequency CSV logger for scientific analysis with asynchronous I/O.
     
     Logs comprehensive telemetry data at control loop frequency (500Hz)
-    for post-processing and thesis plots. Data is buffered and written
-    in batches to minimize I/O overhead.
+    for post-processing and thesis plots. Uses a separate I/O thread to prevent
+    blocking the control loop - control loop only writes to queue (microseconds),
+    while the I/O thread handles slow disk writes asynchronously.
     """
     
     def __init__(self, log_dir: str = "logs", buffer_size: int = 1000):
@@ -233,6 +235,12 @@ class HighFrequencyDataLogger:
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_file = self.log_dir / f"gello_data_{timestamp_str}.csv"
         
+        # Thread-safe queue for async I/O (control loop writes here, I/O thread reads)
+        self.data_queue: queue.Queue = queue.Queue(maxsize=5000)
+        
+        # I/O thread state
+        self.io_thread: Optional[Thread] = None
+        self.running = False
         self.buffer: List[Dict[str, float]] = []
         self.buffer_size = buffer_size
         self.file_handle = None
@@ -240,12 +248,18 @@ class HighFrequencyDataLogger:
         self.header_written = False
         self.start_time: Optional[float] = None
         
-        print(f"DataLogger initialized: {self.log_file}")
+        print(f"DataLogger initialized: {self.log_file} (async I/O)")
     
     def start(self):
-        """Open file for writing."""
+        """Open file for writing and start I/O thread."""
         self.file_handle = open(self.log_file, 'w', newline='', buffering=8192)
         self.start_time = time.time()
+        self.running = True
+        
+        # Start async I/O worker thread
+        self.io_thread = Thread(target=self._io_worker, daemon=True, name="DataLogger-IO")
+        self.io_thread.start()
+        print(f"DataLogger started: async I/O thread running")
     
     def log(
         self,
@@ -267,10 +281,16 @@ class HighFrequencyDataLogger:
         tcp_force: Optional[np.ndarray] = None,
         gripper_pos_follower: float = 0.0,
         control_mode: str = "gravity_comp",
+        tcp_pos_leader: Optional[np.ndarray] = None,
+        tcp_pos_follower: Optional[np.ndarray] = None,
+        tau_external_raw: Optional[np.ndarray] = None,
+        tau_external_ema: Optional[np.ndarray] = None,
+        tau_external_oneeuro: Optional[np.ndarray] = None,
     ):
         """Log a single timestep of data.
         
         All torque arrays should be in Nm, positions in rad, velocities in rad/s.
+        TCP positions in meters, orientation as quaternion [x, y, z, qw, qx, qy, qz].
         """
         if self.file_handle is None:
             return
@@ -323,24 +343,178 @@ class HighFrequencyDataLogger:
             for i in range(6):
                 row[f'tcp_force_{i}'] = 0.0
         
-        # Write header on first log
-        if not self.header_written:
-            self.csv_writer = csv.DictWriter(self.file_handle, fieldnames=row.keys())
-            self.csv_writer.writeheader()
-            self.header_written = True
+        # TCP positions (forward kinematics) - [x, y, z] in meters
+        if tcp_pos_leader is not None and len(tcp_pos_leader) >= 3:
+            row['tcp_x_leader'] = tcp_pos_leader[0]
+            row['tcp_y_leader'] = tcp_pos_leader[1]
+            row['tcp_z_leader'] = tcp_pos_leader[2]
+        else:
+            row['tcp_x_leader'] = 0.0
+            row['tcp_y_leader'] = 0.0
+            row['tcp_z_leader'] = 0.0
         
-        # Buffer data
-        self.buffer.append(row)
+        if tcp_pos_follower is not None and len(tcp_pos_follower) >= 3:
+            row['tcp_x_follower'] = tcp_pos_follower[0]
+            row['tcp_y_follower'] = tcp_pos_follower[1]
+            row['tcp_z_follower'] = tcp_pos_follower[2]
+        else:
+            row['tcp_x_follower'] = 0.0
+            row['tcp_y_follower'] = 0.0
+            row['tcp_z_follower'] = 0.0
         
-        # Flush buffer when full
-        if len(self.buffer) >= self.buffer_size:
-            self.flush()
+        # Filtered external torques for filter comparison plots
+        for i in range(num_joints):
+            if tau_external_raw is not None:
+                row[f'tau_external_raw_{i}'] = tau_external_raw[i]
+            else:
+                row[f'tau_external_raw_{i}'] = tau_external[i]
+            
+            if tau_external_ema is not None:
+                row[f'tau_external_ema_{i}'] = tau_external_ema[i]
+            else:
+                row[f'tau_external_ema_{i}'] = tau_external[i]
+            
+            if tau_external_oneeuro is not None:
+                row[f'tau_external_oneeuro_{i}'] = tau_external_oneeuro[i]
+            else:
+                row[f'tau_external_oneeuro_{i}'] = tau_external[i]
+        
+        # Put data into queue for async I/O (non-blocking, microseconds)
+        try:
+            self.data_queue.put_nowait(row)
+        except queue.Full:
+            # Queue full - drop sample or warn (should rarely happen with 5000 buffer)
+            pass
     
-    def flush(self):
-        """Write buffered data to disk."""
+    def _io_worker(self):
+        """Worker thread that handles all disk I/O asynchronously."""
+        while self.running:
+            try:
+                # Block until data available (timeout for shutdown check)
+                row = self.data_queue.get(timeout=0.1)
+                
+                # Write header on first row
+                if not self.header_written:
+                    self.csv_writer = csv.DictWriter(self.file_handle, fieldnames=row.keys())
+                    self.csv_writer.writeheader()
+                    self.header_written = True
+                
+                # Buffer data
+                self.buffer.append(row)
+                
+                # Flush when buffer full
+                if len(self.buffer) >= self.buffer_size:
+                    self._flush_buffer()
+                    
+            except queue.Empty:
+                # No data available - flush any pending data and continue
+                if self.buffer:
+                    self._flush_buffer()
+                continue
+        
+        # Final flush on shutdown
+        self._drain_queue()
+    
+    def _flush_buffer(self):
+        """Write buffered data to disk (called from I/O thread)."""
         if self.csv_writer and self.buffer:
             self.csv_writer.writerows(self.buffer)
             self.buffer.clear()
+            self.file_handle.flush()  # Ensure data reaches disk
+    
+    def _drain_queue(self):
+        """Drain remaining data from queue and flush (called on shutdown)."""
+        while True:
+            try:
+                row = self.data_queue.get_nowait()
+                if not self.header_written:
+                    self.csv_writer = csv.DictWriter(self.file_handle, fieldnames=row.keys())
+                    self.csv_writer.writeheader()
+                    self.header_written = True
+                self.buffer.append(row)
+            except queue.Empty:
+                break
+        
+        # Final flush
+        if self.buffer:
+            self._flush_buffer()
+    
+    def flush(self):
+        """Deprecated - kept for compatibility. I/O thread handles flushing automatically."""
+        pass
+    
+    def close(self):
+        """Stop I/O thread, flush remaining data, and close file."""
+        if self.running:
+            self.running = False
+            
+            # Wait for I/O thread to finish (max 5 seconds)
+            if self.io_thread and self.io_thread.is_alive():
+                self.io_thread.join(timeout=5.0)
+            
+            # Ensure all data written
+            if self.file_handle:
+                self._drain_queue()
+                self.file_handle.close()
+                self.file_handle = None
+                
+            dropped = self.data_queue.qsize()
+            if dropped > 0:
+                print(f"⚠ DataLogger: {dropped} samples not written (queue overflow)")
+        while self.running:
+            try:
+                # Block until data available (timeout for shutdown check)
+                row = self.data_queue.get(timeout=0.1)
+                
+                # Write header on first row
+                if not self.header_written:
+                    self.csv_writer = csv.DictWriter(self.file_handle, fieldnames=row.keys())
+                    self.csv_writer.writeheader()
+                    self.header_written = True
+                
+                # Buffer data
+                self.buffer.append(row)
+                
+                # Flush when buffer full
+                if len(self.buffer) >= self.buffer_size:
+                    self._flush_buffer()
+                    
+            except queue.Empty:
+                # No data available - flush any pending data and continue
+                if self.buffer:
+                    self._flush_buffer()
+                continue
+        
+        # Final flush on shutdown
+        self._drain_queue()
+    
+    def _flush_buffer(self):
+        """Write buffered data to disk (called from I/O thread)."""
+        if self.csv_writer and self.buffer:
+            self.csv_writer.writerows(self.buffer)
+            self.buffer.clear()
+            self.file_handle.flush()  # Ensure data reaches disk
+    
+    def _drain_queue(self):
+        """Drain remaining data from queue and flush (called on shutdown)."""
+        while True:
+            try:
+                row = self.data_queue.get_nowait()
+                if not self.header_written:
+                    self.csv_writer = csv.DictWriter(self.file_handle, fieldnames=row.keys())
+                    self.csv_writer.writeheader()
+                    self.header_written = True
+                self.buffer.append(row)
+            except queue.Empty:
+                break
+        
+        # Final flush
+        if self.buffer:
+            self._flush_buffer()
+    
+    def flush(self):
+        """Deprecated - kept for compatibility. I/O thread handles flushing automatically."""
+        pass
     
     def close(self):
         """Flush remaining data and close file."""
@@ -2249,6 +2423,75 @@ class FACTRGravityCompensation:
         """Legacy method - functionality moved to worker process."""
         pass
     
+    def compute_forward_kinematics(self, q: np.ndarray) -> np.ndarray:
+        """Compute TCP position using Pinocchio forward kinematics.
+        
+        Args:
+            q: Joint positions in radians (num_arm_joints)
+            
+        Returns:
+            np.ndarray: TCP position [x, y, z] in meters
+        """
+        try:
+            # Pad joint positions to match URDF model size if needed
+            q_full = np.zeros(self._pin_nq)
+            q_full[:min(len(q), self._pin_nq)] = q[:min(len(q), self._pin_nq)]
+            
+            # Compute forward kinematics
+            pin.forwardKinematics(self.pin_model, self.pin_data, q_full)
+            pin.updateFramePlacements(self.pin_model, self.pin_data)
+            
+            # Get end-effector frame (last frame or tool frame)
+            # Use the last frame in the model (typically the tool/flange)
+            ee_frame_id = self.pin_model.nframes - 1
+            tcp_pose = self.pin_data.oMf[ee_frame_id]
+            
+            # Extract position (translation part)
+            return np.array(tcp_pose.translation)
+        except Exception as e:
+            # Return zeros if FK fails
+            return np.zeros(3)
+    
+    def _get_follower_tcp_position(self) -> np.ndarray:
+        """Get TCP position from follower robot (if available).
+        
+        Returns:
+            np.ndarray: TCP position [x, y, z] in meters
+        """
+        if not self.teleop_enabled:
+            return np.zeros(3)
+        
+        try:
+            follower = None
+            
+            # Priority 1: Direct RTDE access
+            if self._direct_follower_robot is not None:
+                follower = self._direct_follower_robot
+            elif self.teleop_robot_server is not None:
+                follower = self.teleop_robot_server
+                if hasattr(follower, "_robot"):
+                    follower = follower._robot
+                elif hasattr(follower, "robot"):
+                    follower = follower.robot
+            
+            if follower is None:
+                return np.zeros(3)
+            
+            # Try to get TCP pose from UR-RTDE
+            if hasattr(follower, "r_inter") and hasattr(follower.r_inter, "getActualTCPPose"):
+                tcp_pose = np.array(follower.r_inter.getActualTCPPose())
+                return tcp_pose[:3]  # [x, y, z, rx, ry, rz]
+            
+            # Fallback: compute FK from joint positions
+            if hasattr(follower, "get_joint_state"):
+                q = np.array(follower.get_joint_state())[:self.num_arm_joints]
+                return self.compute_forward_kinematics(q)
+            
+            return np.zeros(3)
+            
+        except Exception:
+            return np.zeros(3)
+    
     def _log_data(
         self,
         timestamp: float,
@@ -2265,7 +2508,7 @@ class FACTRGravityCompensation:
         gripper_joint_pos: float,
         gripper_joint_vel: float,
     ):
-        """Log current control loop data."""
+        """Log current control loop data including TCP positions."""
         if not self.enable_data_logging or self.data_logger is None:
             return
         
@@ -2274,16 +2517,79 @@ class FACTRGravityCompensation:
         q_dot_follower = None
         tcp_force = None
         gripper_pos_follower = 0.0
+        tcp_pos_leader = None
+        tcp_pos_follower = None
         
         try:
+            # Compute leader TCP position via forward kinematics
+            tcp_pos_leader = self.compute_forward_kinematics(arm_joint_pos)
+            
             if self.teleop_enabled:
                 q_follower, q_dot_follower = self.get_follower_arm_state()
                 tcp_force, _ = self.get_follower_tcp_force()
                 gripper_fb = self.get_follower_gripper_feedback()
                 if gripper_fb and 'position' in gripper_fb:
                     gripper_pos_follower = gripper_fb['position']
+                
+                # Get follower TCP position
+                tcp_pos_follower = self._get_follower_tcp_position()
         except Exception:
             pass  # Continue with None values
+        
+        # Apply different filters to external torques for comparison plots
+        # Initialize filter states if not present
+        if not hasattr(self, '_tau_ext_raw_history'):
+            self._tau_ext_raw_history = tau_ext.copy()
+            self._tau_ext_ema = tau_ext.copy()
+            self._tau_ext_oneeuro_state = {
+                'x_prev': tau_ext.copy(),
+                'dx_prev': np.zeros_like(tau_ext),
+                't_prev': timestamp,
+            }
+        
+        # Raw (unfiltered) external torques
+        tau_ext_raw = tau_ext.copy()
+        
+        # EMA filtered (alpha=0.1)
+        ema_alpha = 0.1
+        self._tau_ext_ema = ema_alpha * tau_ext + (1 - ema_alpha) * self._tau_ext_ema
+        tau_ext_ema = self._tau_ext_ema.copy()
+        
+        # 1€ Filter
+        min_cutoff = 1.0
+        beta = 0.007
+        d_cutoff = 1.0
+        dt = timestamp - self._tau_ext_oneeuro_state['t_prev']
+        if dt <= 0:
+            dt = self.dt
+        
+        tau_ext_oneeuro = np.zeros_like(tau_ext)
+        for i in range(len(tau_ext)):
+            x = tau_ext[i]
+            x_prev = self._tau_ext_oneeuro_state['x_prev'][i]
+            dx_prev = self._tau_ext_oneeuro_state['dx_prev'][i]
+            
+            # Estimate derivative
+            dx = (x - x_prev) / dt
+            
+            # Smooth derivative
+            tau_d = 1.0 / (2 * np.pi * d_cutoff)
+            alpha_d = 1.0 / (1.0 + tau_d / dt)
+            dx_smooth = alpha_d * dx + (1 - alpha_d) * dx_prev
+            
+            # Adaptive cutoff
+            cutoff = min_cutoff + beta * abs(dx_smooth)
+            tau = 1.0 / (2 * np.pi * cutoff)
+            alpha = 1.0 / (1.0 + tau / dt)
+            
+            # Filtered value
+            x_filtered = alpha * x + (1 - alpha) * x_prev
+            tau_ext_oneeuro[i] = x_filtered
+            
+            self._tau_ext_oneeuro_state['x_prev'][i] = x_filtered
+            self._tau_ext_oneeuro_state['dx_prev'][i] = dx_smooth
+        
+        self._tau_ext_oneeuro_state['t_prev'] = timestamp
         
         # Determine control mode
         control_mode = "gravity_comp"
@@ -2313,6 +2619,11 @@ class FACTRGravityCompensation:
             tcp_force=tcp_force,
             gripper_pos_follower=gripper_pos_follower,
             control_mode=control_mode,
+            tcp_pos_leader=tcp_pos_leader,
+            tcp_pos_follower=tcp_pos_follower,
+            tau_external_raw=tau_ext_raw,
+            tau_external_ema=tau_ext_ema,
+            tau_external_oneeuro=tau_ext_oneeuro,
         )
     
     def control_loop_step(self) -> None:
