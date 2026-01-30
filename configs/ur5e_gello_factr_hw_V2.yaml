@@ -116,5 +116,5 @@ teleop:
 
 
 logging:
-  enable: true
+  enable: false
   log_dir: "logs"

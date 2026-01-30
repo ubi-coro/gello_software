@@ -2020,27 +2020,14 @@ class FACTRGravityCompensation:
     def get_follower_joint_torques(self) -> np.ndarray:
         """Get external joint torques from the follower robot.
 
-        This m--- PREFERRED: Semi-Manual Calculation (Jacobian Transpose) ---
-            # If we successfully initialized the Jacobian from the controller
-            if self.J_semi is not None and self.J_semi_tare is not None:
-                if hasattr(follower, "r_inter"):
-                    try:
-                        tcp_force = np.array(follower.r_inter.getActualTCPForce())
-                        # τ = J^T * F_tcp
-                        t_calc = self.J_semi.T @ tcp_force
-                        # Apply tare
-                        t_ext = t_calc - self.J_semi_tare
-                        
-                        # Return properly sized array
-                        if len(t_ext) >= self.num_arm_joints:
-                            return np.array(t_ext[: self.num_arm_joints])
-                        return np.array(t_ext)
-                    except Exception:
-                        pass # Fall back to other methods
-
-            # ethod retrieves the current joint torques from the follower robot
-        for force-feedback. The torques are gravity/friction compensated by the
-        follower's controller (e.g., UR5e's getActualJointTorques()).
+        Uses Jacobian Transpose method: τ = J^T @ F_tcp
+        
+        IMPORTANT: According to UR RTDE documentation, getActualTCPForce() returns
+        "Generalized forces in the TCP" which are expressed in the BASE frame,
+        not the TCP frame. The Jacobian from getJacobian() is also in the base frame.
+        Therefore, NO rotation is needed.
+        
+        The Jacobian is computed fresh each call to handle configuration changes.
 
         Returns:
             np.ndarray: External joint torques from follower (length num_arm_joints)
@@ -2070,6 +2057,43 @@ class FACTRGravityCompensation:
                 follower = follower._robot
             elif hasattr(follower, "robot"):
                 follower = follower.robot
+
+            # --- Priority: Jacobian Transpose Method (τ = J^T @ F) ---
+            # This is the preferred method when RTDE control interface is available
+            if hasattr(follower, "c_inter") and hasattr(follower, "r_inter"):
+                ur_c = follower.c_inter  # RTDEControlInterface
+                ur_r = follower.r_inter  # RTDEReceiveInterface
+                
+                try:
+                    # Get current joint positions for Jacobian calculation
+                    q_current = ur_r.getActualQ()
+                    
+                    # Compute Jacobian at CURRENT configuration (not cached!)
+                    # This is critical for correct force mapping at any pose
+                    J_flat = ur_c.getJacobian(q_current)
+                    J = np.array(J_flat).reshape(6, 6)
+                    
+                    # Get TCP force/torque wrench [Fx, Fy, Fz, Tx, Ty, Tz]
+                    # According to UR docs: already in BASE frame coordinates
+                    tcp_force = np.array(ur_r.getActualTCPForce())
+                    
+                    # Jacobian Transpose Control: τ = J^T @ F
+                    t_calc = J.T @ tcp_force
+                    
+                    # Apply tare offset if available
+                    if self.J_semi_tare is not None:
+                        t_ext = t_calc - self.J_semi_tare
+                    else:
+                        t_ext = t_calc
+                    
+                    # Return properly sized array
+                    if len(t_ext) >= self.num_arm_joints:
+                        return np.array(t_ext[: self.num_arm_joints])
+                    return np.array(t_ext)
+                    
+                except Exception as e:
+                    # print(f"Jacobian calculation failed: {e}")
+                    pass  # Fall back to other methods
 
             # Check if the follower robot has a get_joint_torques method
             if hasattr(follower, "get_joint_torques"):
