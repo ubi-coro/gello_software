@@ -439,10 +439,6 @@ class HighFrequencyDataLogger:
         if self.buffer:
             self._flush_buffer()
     
-    def flush(self):
-        """Deprecated - kept for compatibility. I/O thread handles flushing automatically."""
-        pass
-    
     def close(self):
         """Stop I/O thread, flush remaining data, and close file."""
         if self.running:
@@ -461,70 +457,7 @@ class HighFrequencyDataLogger:
             dropped = self.data_queue.qsize()
             if dropped > 0:
                 print(f"⚠ DataLogger: {dropped} samples not written (queue overflow)")
-        while self.running:
-            try:
-                # Block until data available (timeout for shutdown check)
-                row = self.data_queue.get(timeout=0.1)
-                
-                # Write header on first row
-                if not self.header_written:
-                    self.csv_writer = csv.DictWriter(self.file_handle, fieldnames=row.keys())
-                    self.csv_writer.writeheader()
-                    self.header_written = True
-                
-                # Buffer data
-                self.buffer.append(row)
-                
-                # Flush when buffer full
-                if len(self.buffer) >= self.buffer_size:
-                    self._flush_buffer()
-                    
-            except queue.Empty:
-                # No data available - flush any pending data and continue
-                if self.buffer:
-                    self._flush_buffer()
-                continue
-        
-        # Final flush on shutdown
-        self._drain_queue()
     
-    def _flush_buffer(self):
-        """Write buffered data to disk (called from I/O thread)."""
-        if self.csv_writer and self.buffer:
-            self.csv_writer.writerows(self.buffer)
-            self.buffer.clear()
-            self.file_handle.flush()  # Ensure data reaches disk
-    
-    def _drain_queue(self):
-        """Drain remaining data from queue and flush (called on shutdown)."""
-        while True:
-            try:
-                row = self.data_queue.get_nowait()
-                if not self.header_written:
-                    self.csv_writer = csv.DictWriter(self.file_handle, fieldnames=row.keys())
-                    self.csv_writer.writeheader()
-                    self.header_written = True
-                self.buffer.append(row)
-            except queue.Empty:
-                break
-        
-        # Final flush
-        if self.buffer:
-            self._flush_buffer()
-    
-    def flush(self):
-        """Deprecated - kept for compatibility. I/O thread handles flushing automatically."""
-        pass
-    
-    def close(self):
-        """Flush remaining data and close file."""
-        if self.file_handle:
-            self.flush()
-            self.file_handle.close()
-            self.file_handle = None
-            duration = time.time() - self.start_time if self.start_time else 0
-            print(f"DataLogger closed. Duration: {duration:.1f}s, File: {self.log_file}")
-
 
 def visualization_worker(queue: mp.Queue, num_joints: int, dt: float):
     """Worker process for visualization to avoid blocking control loop."""
@@ -2443,10 +2376,6 @@ class FACTRGravityCompensation:
         self._viz_start_time = time.time()
         print("Visualization enabled - running in separate process")
 
-    def _update_visualization(self):
-        """Legacy method - functionality moved to worker process."""
-        pass
-    
     def compute_forward_kinematics(self, q: np.ndarray) -> np.ndarray:
         """Compute TCP position using Pinocchio forward kinematics.
         

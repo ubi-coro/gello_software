@@ -1,0 +1,493 @@
+<?xml version="1.0" ?>
+<!-- Generated using onshape-to-robot -->
+<!-- Onshape https://cad.onshape.com/documents/14b910631085162a8a56148a/w/d1a31bb2e964e4c8fecaecd4/e/f22348c5eeadedfdb0b5ecc8 -->
+<robot name="gello_urdf">
+  <!-- Link base -->
+  <link name="base">
+    <inertial>
+      <origin xyz="0.0207642 5.25043e-05 0.0195887" rpy="0 0 0"/>
+      <mass value="0.28222"/>
+      <inertia ixx="0.000180151" ixy="4.74748e-07" ixz="-0.0001016" iyy="0.00054845" iyz="-2.47343e-09" izz="0.000574618"/>
+    </inertial>
+    <!-- Part base_new_v2 -->
+    <visual>
+      <origin xyz="0 0 0" rpy="0 -0 0"/>
+      <geometry>
+        <mesh filename="package://assets/base_new_v2.stl"/>
+      </geometry>
+      <material name="base_new_v2_material">
+        <color rgba="0.627451 0.627451 0.627451 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 -0 0"/>
+      <geometry>
+        <mesh filename="package://assets/base_new_v2.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part base_bearing -->
+    <visual>
+      <origin xyz="0.0472894 6.245e-17 0.0388" rpy="0 -0 0"/>
+      <geometry>
+        <mesh filename="package://assets/base_bearing.stl"/>
+      </geometry>
+      <material name="base_bearing_material">
+        <color rgba="0.627451 0.627451 0.627451 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.0472894 6.245e-17 0.0388" rpy="0 -0 0"/>
+      <geometry>
+        <mesh filename="package://assets/base_bearing.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part xc_330_proxy_gehäuse -->
+    <visual>
+      <origin xyz="0.04725 0 0.0295" rpy="0 -0 -1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_gehäuse.stl"/>
+      </geometry>
+      <material name="xc_330_proxy_gehäuse_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.04725 0 0.0295" rpy="0 -0 -1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_gehäuse.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Link link_1 -->
+  <link name="link_1">
+    <inertial>
+      <origin xyz="2.73792e-08 -0.0141047 0.037776" rpy="0 0 0"/>
+      <mass value="0.0452173"/>
+      <inertia ixx="2.0451e-05" ixy="-1.49587e-11" ixz="5.23748e-12" iyy="1.17627e-05" iyz="3.68498e-06" izz="1.40544e-05"/>
+    </inertial>
+    <!-- Part xm430_proxy_welle -->
+    <visual>
+      <origin xyz="2.80151e-15 -0.061765 0.0483" rpy="-1.5708 -4.27436e-15 -9.92539e-14"/>
+      <geometry>
+        <mesh filename="package://assets/xm430_proxy_welle.stl"/>
+      </geometry>
+      <material name="xm430_proxy_welle_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="2.80151e-15 -0.061765 0.0483" rpy="-1.5708 -4.27436e-15 -9.92539e-14"/>
+      <geometry>
+        <mesh filename="package://assets/xm430_proxy_welle.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part xc_330_proxy_wellenplatte -->
+    <visual>
+      <origin xyz="7.88861e-31 0 -0.0035" rpy="1.82887e-68 -0 -1.49017e-30"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_wellenplatte.stl"/>
+      </geometry>
+      <material name="xc_330_proxy_wellenplatte_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="7.88861e-31 0 -0.0035" rpy="1.82887e-68 -0 -1.49017e-30"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_wellenplatte.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part l1_new_v6_bearing -->
+    <visual>
+      <origin xyz="6.93889e-18 2.77556e-17 0.003" rpy="-3.22336e-24 1.8912e-23 -1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/l1_new_v6_bearing.stl"/>
+      </geometry>
+      <material name="l1_new_v6_bearing_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="6.93889e-18 2.77556e-17 0.003" rpy="-3.22336e-24 1.8912e-23 -1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/l1_new_v6_bearing.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Link link_2 -->
+  <link name="link_2">
+    <inertial>
+      <origin xyz="-1.41766e-07 0.106546 0.018566" rpy="0 0 0"/>
+      <mass value="0.2561"/>
+      <inertia ixx="0.00169333" ixy="-5.98873e-06" ixz="7.14223e-11" iyy="5.2204e-05" iyz="-2.56593e-09" izz="0.00168366"/>
+    </inertial>
+    <!-- Part xm430_proxy_gehäuse -->
+    <visual>
+      <origin xyz="-2.24657e-07 0.213087 0.017" rpy="3.14159 -2.28706e-14 -3.14159"/>
+      <geometry>
+        <mesh filename="package://assets/xm430_proxy_gehäuse.stl"/>
+      </geometry>
+      <material name="xm430_proxy_gehäuse_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-2.24657e-07 0.213087 0.017" rpy="3.14159 -2.28706e-14 -3.14159"/>
+      <geometry>
+        <mesh filename="package://assets/xm430_proxy_gehäuse.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part l2_v2 -->
+    <visual>
+      <origin xyz="-1.98617e-07 -0.0132006 0.041097" rpy="-1.5708 -1.5708 0"/>
+      <geometry>
+        <mesh filename="package://assets/l2_v2.stl"/>
+      </geometry>
+      <material name="l2_v2_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-1.98617e-07 -0.0132006 0.041097" rpy="-1.5708 -1.5708 0"/>
+      <geometry>
+        <mesh filename="package://assets/l2_v2.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part xm430_proxy_gehäuse_2 -->
+    <visual>
+      <origin xyz="0 1.38778e-17 0.017" rpy="-3.14159 -4.84763e-31 -1.08468e-30"/>
+      <geometry>
+        <mesh filename="package://assets/xm430_proxy_gehäuse.stl"/>
+      </geometry>
+      <material name="xm430_proxy_gehäuse_2_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 1.38778e-17 0.017" rpy="-3.14159 -4.84763e-31 -1.08468e-30"/>
+      <geometry>
+        <mesh filename="package://assets/xm430_proxy_gehäuse.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Link link_3 -->
+  <link name="link_3">
+    <inertial>
+      <origin xyz="3.91234e-05 0.0961698 0.0344989" rpy="0 0 0"/>
+      <mass value="0.137259"/>
+      <inertia ixx="0.000637531" ixy="-4.95421e-07" ixz="1.96287e-08" iyy="2.42238e-05" iyz="-2.31778e-05" izz="0.00062954"/>
+    </inertial>
+    <!-- Part xm430_proxy_welle_2 -->
+    <visual>
+      <origin xyz="-2.64698e-23 0 -0.017" rpy="-6.61324e-30 -3.77298e-31 1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/xm430_proxy_welle.stl"/>
+      </geometry>
+      <material name="xm430_proxy_welle_2_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-2.64698e-23 0 -0.017" rpy="-6.61324e-30 -3.77298e-31 1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/xm430_proxy_welle.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part xc_330_proxy_gehäuse_2 -->
+    <visual>
+      <origin xyz="7.51459e-10 0.1961 0.029475" rpy="-3.14159 -3.88635e-14 3.14159"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_gehäuse.stl"/>
+      </geometry>
+      <material name="xc_330_proxy_gehäuse_2_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="7.51459e-10 0.1961 0.029475" rpy="-3.14159 -3.88635e-14 3.14159"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_gehäuse.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part l3_new_v1 -->
+    <visual>
+      <origin xyz="2.99663e-17 -0.0155 0.0029875" rpy="-1.5708 1.5708 0"/>
+      <geometry>
+        <mesh filename="package://assets/l3_new_v1.stl"/>
+      </geometry>
+      <material name="l3_new_v1_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="2.99663e-17 -0.0155 0.0029875" rpy="-1.5708 1.5708 0"/>
+      <geometry>
+        <mesh filename="package://assets/l3_new_v1.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Link link_4 -->
+  <link name="link_4">
+    <inertial>
+      <origin xyz="-0.000459747 -0.0004034 0.0260195" rpy="0 0 0"/>
+      <mass value="0.0501361"/>
+      <inertia ixx="1.52358e-05" ixy="-1.02804e-07" ixz="1.97423e-07" iyy="1.34583e-05" iyz="2.91185e-07" izz="6.87223e-06"/>
+    </inertial>
+    <!-- Part l4_new_v2 -->
+    <visual>
+      <origin xyz="4.44506e-16 -1.11022e-16 0.003" rpy="-1.29687e-13 -1.95954e-14 -1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/l4_new_v2.stl"/>
+      </geometry>
+      <material name="l4_new_v2_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="4.44506e-16 -1.11022e-16 0.003" rpy="-1.29687e-13 -1.95954e-14 -1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/l4_new_v2.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part xc_330_proxy_wellenplatte_2 -->
+    <visual>
+      <origin xyz="2.64698e-23 0 -0.0035" rpy="5.7796e-30 1.0526e-30 2.85162e-30"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_wellenplatte.stl"/>
+      </geometry>
+      <material name="xc_330_proxy_wellenplatte_2_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="2.64698e-23 0 -0.0035" rpy="5.7796e-30 1.0526e-30 2.85162e-30"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_wellenplatte.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part xc_330_proxy_gehäuse_3 -->
+    <visual>
+      <origin xyz="-0.000725593 -0.0089 0.0425" rpy="1.5708 9.76996e-15 4.78549e-14"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_gehäuse.stl"/>
+      </geometry>
+      <material name="xc_330_proxy_gehäuse_3_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.000725593 -0.0089 0.0425" rpy="1.5708 9.76996e-15 4.78549e-14"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_gehäuse.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Link link_5 -->
+  <link name="link_5">
+    <inertial>
+      <origin xyz="-0.000141568 -0.000894647 0.023547" rpy="0 0 0"/>
+      <mass value="0.0377581"/>
+      <inertia ixx="8.79592e-06" ixy="-3.37687e-08" ixz="2.30264e-08" iyy="7.63808e-06" iyz="4.28154e-07" izz="4.72744e-06"/>
+    </inertial>
+    <!-- Part xc_330_proxy_wellenplatte_3 -->
+    <visual>
+      <origin xyz="1.0842e-19 0 -0.0035" rpy="0 -0 9.10501e-32"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_wellenplatte.stl"/>
+      </geometry>
+      <material name="xc_330_proxy_wellenplatte_3_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="1.0842e-19 0 -0.0035" rpy="0 -0 9.10501e-32"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_wellenplatte.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part xc_330_proxy_gehäuse_4 -->
+    <visual>
+      <origin xyz="1.38485e-15 -0.0085 0.0355" rpy="1.5708 6.61248e-14 -8.43769e-14"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_gehäuse.stl"/>
+      </geometry>
+      <material name="xc_330_proxy_gehäuse_4_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="1.38485e-15 -0.0085 0.0355" rpy="1.5708 6.61248e-14 -8.43769e-14"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_gehäuse.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part l5_new_v2 -->
+    <visual>
+      <origin xyz="1.51355e-16 -5.74193e-16 0.003" rpy="-3.14159 5.97181e-14 -1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/l5_new_v2.stl"/>
+      </geometry>
+      <material name="l5_new_v2_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="1.51355e-16 -5.74193e-16 0.003" rpy="-3.14159 5.97181e-14 -1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/l5_new_v2.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Link link_6_handle -->
+  <link name="link_6_handle">
+    <inertial>
+      <origin xyz="0.00157715 -0.0159597 0.025293" rpy="0 0 0"/>
+      <mass value="0.0499581"/>
+      <inertia ixx="3.9104e-05" ixy="3.9112e-06" ixz="7.32699e-07" iyy="9.0581e-06" iyz="-4.1607e-06" izz="4.02535e-05"/>
+    </inertial>
+    <!-- Part factr_teleop_gripper_leader_handle -->
+    <visual>
+      <origin xyz="-0.002 -0.00993762 0.0275" rpy="0 1.6118e-30 2.52435e-29"/>
+      <geometry>
+        <mesh filename="package://assets/factr_teleop_gripper_leader_handle.stl"/>
+      </geometry>
+      <material name="factr_teleop_gripper_leader_handle_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.002 -0.00993762 0.0275" rpy="0 1.6118e-30 2.52435e-29"/>
+      <geometry>
+        <mesh filename="package://assets/factr_teleop_gripper_leader_handle.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part xc_330_proxy_wellenplatte_4 -->
+    <visual>
+      <origin xyz="1.0842e-19 6.23793e-05 -0.0035" rpy="0 1.6118e-30 2.52435e-29"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_wellenplatte.stl"/>
+      </geometry>
+      <material name="xc_330_proxy_wellenplatte_4_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="1.0842e-19 6.23793e-05 -0.0035" rpy="0 1.6118e-30 2.52435e-29"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_wellenplatte.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part xc_330_proxy_gehäuse_5 -->
+    <visual>
+      <origin xyz="-0.0095 6.23791e-05 0.0355" rpy="4.88498e-15 3.91215e-14 1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_gehäuse.stl"/>
+      </geometry>
+      <material name="xc_330_proxy_gehäuse_5_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.0095 6.23791e-05 0.0355" rpy="4.88498e-15 3.91215e-14 1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_gehäuse.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Link link_7_trigger -->
+  <link name="link_7_trigger">
+    <inertial>
+      <origin xyz="-0.01833 0.00711587 0.00491827" rpy="0 0 0"/>
+      <mass value="0.00861509"/>
+      <inertia ixx="8.18602e-07" ixy="1.12324e-06" ixz="9.97258e-08" iyy="3.84638e-06" iyz="-3.87271e-08" izz="4.566e-06"/>
+    </inertial>
+    <!-- Part factr_teleop_gripper_trigger -->
+    <visual>
+      <origin xyz="8.94073e-11 -2.65413e-16 0.005" rpy="1.5708 9.14546e-15 -3.80131e-14"/>
+      <geometry>
+        <mesh filename="package://assets/factr_teleop_gripper_trigger.stl"/>
+      </geometry>
+      <material name="factr_teleop_gripper_trigger_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="8.94073e-11 -2.65413e-16 0.005" rpy="1.5708 9.14546e-15 -3.80131e-14"/>
+      <geometry>
+        <mesh filename="package://assets/factr_teleop_gripper_trigger.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part xc_330_proxy_wellenplatte_5 -->
+    <visual>
+      <origin xyz="1.38778e-17 1.73472e-18 0.0065" rpy="-3.14159 -1.7697e-30 1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_wellenplatte.stl"/>
+      </geometry>
+      <material name="xc_330_proxy_wellenplatte_5_material">
+        <color rgba="0.964706 0.964706 0.952941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="1.38778e-17 1.73472e-18 0.0065" rpy="-3.14159 -1.7697e-30 1.5708"/>
+      <geometry>
+        <mesh filename="package://assets/xc_330_proxy_wellenplatte.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Joint from link_6_handle to link_7_trigger -->
+  <joint name="joint_gripper" type="revolute">
+    <origin xyz="-0.0095 6.23791e-05 0.039" rpy="4.31843e-15 3.91215e-14 1.5708"/>
+    <parent link="link_6_handle"/>
+    <child link="link_7_trigger"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10" lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+  <!-- Joint from link_5 to link_6_handle -->
+  <joint name="joint_6" type="revolute">
+    <origin xyz="1.08951e-15 -0.012 0.0355" rpy="1.5708 6.61248e-14 -8.43769e-14"/>
+    <parent link="link_5"/>
+    <child link="link_6_handle"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10" lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+  <!-- Joint from link_4 to link_5 -->
+  <joint name="joint_5" type="revolute">
+    <origin xyz="-0.000725593 -0.0124 0.0425" rpy="1.5708 -1.99979e-14 5.59318e-14"/>
+    <parent link="link_4"/>
+    <child link="link_5"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10" lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+  <!-- Joint from link_3 to link_4 -->
+  <joint name="joint_4" type="revolute">
+    <origin xyz="7.51459e-10 0.1961 0.025975" rpy="3.14159 4.23052e-14 -2.58419e-14"/>
+    <parent link="link_3"/>
+    <child link="link_4"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10" lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+  <!-- Joint from link_2 to link_3 -->
+  <joint name="joint_3" type="revolute">
+    <origin xyz="-2.24657e-07 0.213087 9.35016e-15" rpy="-3.14159 3.02593e-14 4.47975e-14"/>
+    <parent link="link_2"/>
+    <child link="link_3"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10" lower="0" upper="6.28"/>
+  </joint>
+  <!-- Joint from link_1 to link_2 -->
+  <joint name="joint_2" type="revolute">
+    <origin xyz="4.48882e-15 -0.044765 0.0483" rpy="-1.5708 4.66294e-15 3.14159"/>
+    <parent link="link_1"/>
+    <child link="link_2"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10" lower="0" upper="6.28"/>
+  </joint>
+  <!-- Joint from base to link_1 -->
+  <joint name="joint_1" type="revolute">
+    <origin xyz="0.04725 0 0.033" rpy="0 3.30608e-39 -1.5708"/>
+    <parent link="base"/>
+    <child link="link_1"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10" lower="0" upper="6.28"/>
+  </joint>
+</robot>

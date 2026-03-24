@@ -44,6 +44,7 @@ class URRobot(Robot):
         
         try:
             self.robot = rtde_control.RTDEControlInterface(robot_ip)
+            self.c_inter = self.robot
         except Exception as e:
             print(e)
             print(robot_ip)

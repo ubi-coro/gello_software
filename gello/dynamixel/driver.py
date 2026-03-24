@@ -49,6 +49,8 @@ LEN_PRESENT_VELOCITY = 4
 ADDR_OPERATING_MODE = 11
 CURRENT_CONTROL_MODE = 0
 POSITION_CONTROL_MODE = 3
+ADDR_PRESENT_CURRENT = 126
+LEN_PRESENT_CURRENT = 2
 
 # Servo-specific mappings and limits
 
@@ -64,12 +66,19 @@ SERVO_CURRENT_LIMITS = {
     "XM430_W350_T": 855,   # Stall Current 2.3A (unit 2.69mA -> ~855)
 }
 
+CURRENT_UNIT_MA = {
+    "XC330_T288_T": 1.0,
+    "XM430_W210_T": 2.69,
+    "XM430_W350_T": 2.69,
+}
+
 
 @dataclass
 class JointState:
     """Immutable joint state snapshot for lock-free reading."""
     positions: np.ndarray  # radians
     velocities: np.ndarray  # rad/s
+    currents: np.ndarray    # mA (physical units)
     timestamp: float  # time.time() when captured
     
     def age_ms(self) -> float:
@@ -112,6 +121,10 @@ class DynamixelDriverProtocol(Protocol):
 
     def get_positions_and_velocities(self) -> Tuple[np.ndarray, np.ndarray]:
         """Get joint positions (rad) and velocities (rad/s)."""
+        ...
+
+    def get_currents(self) -> np.ndarray:
+        """Get motor currents in mA (physical units)."""
         ...
 
     def close(self):
@@ -160,6 +173,9 @@ class FakeDynamixelDriver(DynamixelDriverProtocol):
 
     def get_positions_and_velocities(self) -> Tuple[np.ndarray, np.ndarray]:
         return self._joint_angles.copy(), self._velocities.copy()
+
+    def get_currents(self) -> np.ndarray:
+        return self._currents.copy()
 
     def get_positions(self) -> np.ndarray:
         return self.get_joints()
@@ -224,9 +240,13 @@ class DynamixelDriver(DynamixelDriverProtocol):
             self.current_limits = np.array(
                 [SERVO_CURRENT_LIMITS[s] for s in self._servo_types]
             )
+            self.current_conversions = np.array(
+                [CURRENT_UNIT_MA.get(s, 1.0) for s in self._servo_types], dtype=np.float64
+            )
         else:
             self.torque_to_current_map = None
             self.current_limits = None
+            self.current_conversions = np.full(self._num_joints, 1.0, dtype=np.float64)
 
         # Fake driver fallback storage
         self._fake_joint_angles: Optional[np.ndarray] = None
@@ -280,11 +300,18 @@ class DynamixelDriver(DynamixelDriverProtocol):
         self._packetHandler = PacketHandler(2.0)
         
         # Read both velocity and position in one transaction (8 bytes total)
+        # self._groupSyncRead = GroupSyncRead(
+        #     self._portHandler,
+        #     self._packetHandler,
+        #     ADDR_PRESENT_VELOCITY,
+        #     LEN_PRESENT_VELOCITY + LEN_PRESENT_POSITION,
+        # )
+
         self._groupSyncRead = GroupSyncRead(
             self._portHandler,
             self._packetHandler,
-            ADDR_PRESENT_VELOCITY,
-            LEN_PRESENT_VELOCITY + LEN_PRESENT_POSITION,
+            ADDR_PRESENT_CURRENT,  # 126 statt 128
+            LEN_PRESENT_CURRENT + LEN_PRESENT_VELOCITY + LEN_PRESENT_POSITION,  # 2+4+4=10
         )
         
         # Separate writers for position and current
@@ -345,6 +372,7 @@ class DynamixelDriver(DynamixelDriverProtocol):
         # Pre-allocate arrays outside loop
         raw_positions = np.zeros(self._num_joints, dtype=np.int32)
         raw_velocities = np.zeros(self._num_joints, dtype=np.int32)
+        raw_currents = np.zeros(self._num_joints, dtype=np.int32)
         
         while not self._stop_thread.is_set():
             read_start = time.time()
@@ -362,6 +390,13 @@ class DynamixelDriver(DynamixelDriverProtocol):
             # === Parse results OUTSIDE lock (getData is thread-safe for reading) ===
             try:
                 for i, dxl_id in enumerate(self._ids):
+                    # Current (2 Bytes bei Adresse 126, signed 16-bit)
+                    current_raw = self._groupSyncRead.getData(
+                        dxl_id, ADDR_PRESENT_CURRENT, LEN_PRESENT_CURRENT
+                    )
+                    if current_raw > 0x7FFF:
+                        current_raw -= 0x10000
+                    raw_currents[i] = current_raw
                     # Velocity (4 bytes)
                     velocity = self._groupSyncRead.getData(
                         dxl_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY
@@ -383,6 +418,8 @@ class DynamixelDriver(DynamixelDriverProtocol):
                 positions_rad = raw_positions.astype(np.float64) / 2048.0 * np.pi
                 # Velocity unit: 0.229 rev/min -> rad/s
                 velocities_rad_s = raw_velocities.astype(np.float64) * 0.229 * 2.0 * np.pi / 60.0
+                # convert current
+                current_mA = raw_currents.astype(np.float64) * self.current_conversions
                 
                 # Apply Exponential Moving Average (EMA) filter to velocities
                 if self._filtered_velocities is None:
@@ -397,6 +434,7 @@ class DynamixelDriver(DynamixelDriverProtocol):
                 self._latest_state = JointState(
                     positions=positions_rad,
                     velocities=self._filtered_velocities.copy(),
+                    currents=current_mA,
                     timestamp=time.time()
                 )
                 
@@ -432,6 +470,21 @@ class DynamixelDriver(DynamixelDriverProtocol):
         """Get the current joint angles in radians."""
         positions, _ = self.get_positions_and_velocities()
         return positions
+
+    def get_currents(self) -> np.ndarray:
+        """Get motor currents in mA (physical units) - lock-free read."""
+        if self._is_fake:
+            return self._fake_currents.copy()
+
+        timeout = 5.0
+        start = time.time()
+        while self._latest_state is None:
+            if time.time() - start > timeout:
+                raise RuntimeError("Timeout waiting for first joint state")
+            time.sleep(0.01)
+
+        state = self._latest_state
+        return state.currents.copy()
 
     def get_positions(self) -> np.ndarray:
         """Alias for get_joints()."""

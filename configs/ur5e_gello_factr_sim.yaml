@@ -97,10 +97,6 @@ controller:
   joint_limit_barrier:
     kp: 0.0
     kd: 0.0
-  joint_position_control:
-    interpolation_step_size: 0.5
-    kp: 1.03561658022
-    kd: 0.04315069084
 
   gripper_feedback:
     enable: False
