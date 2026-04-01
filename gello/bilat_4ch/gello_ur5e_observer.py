@@ -1,159 +1,254 @@
 """Leader-side disturbance observer for torque estimation without an F/T sensor.
-This module is self-contained so you can prototype external torque estimation on
-the GELLO leader without modifying the rest of the stack yet. It follows a
-discrete DOB scheme (velocity observer + force observer) using the Pinocchio
-model of the leader to supply mass/inertia terms.
+
+Reworked to follow Yamane et al. Algorithm 1 internally while preserving
+the original LeaderObserver API.  The previous transfer-function-form
+implementation had several filter-coefficient bugs (incorrect ζ scaling,
+previous-output/input confusion in bilinear LPFs).  This version
+eliminates them by using the pseudocode from Algorithm 1 directly.
+
+References
+----------
+Yamane et al., "Design and Experimental Validation of Sensorless
+4-Channel Bilateral Teleoperation for Low-Cost Manipulators", 2026.
+  - Algorithm 1, Eq. 2, 15, 16, 17, 20.
+
 """
 from __future__ import annotations
+
+import warnings
 from typing import Tuple
+
 import numpy as np
 import pinocchio as pin
+
 
 class LeaderObserver:
     """Estimate joint velocities and external joint torques on the leader.
 
-    The observer implements a two-stage filter (velocity and force observers)
-    using Tustin-discretized LPF/HPF blocks. It expects the commanded torques
-    to be provided with model-based terms included; it subtracts non-linear
-    dynamics internally to form the input term tau_u.
+    Internally follows Yamane et al. Algorithm 1:
+        1. Velocity Observer (VOB) — complementary filter (Eq. 16)
+        2. Force Observer (FOB) — disturbance estimate (Eq. 20)
+
+    All filters use bilinear (Tustin) discretisation with a single
+    tuning parameter ωc (cutoff frequency) and ζ (damping ratio, default 1).
+
+    API note
+    --------
+    The ``update()`` signature accepts ``dq_measured`` and ``dq_ref`` for
+    backward compatibility, but **neither is used**.  Velocity is estimated
+    internally, and the acceleration reference is derived from ``tau_cmd``
+    via Eq. 17.
     """
-    def __init__(self, urdf_path: str, omega_c: float, dt: float, q0: np.ndarray, zeta: float = 1.0):
-        # Load Pinocchio model for leader dynamics
+
+    def __init__(
+        self,
+        urdf_path: str,
+        omega_c: float,
+        dt: float,
+        q0: np.ndarray,
+        zeta: float = 1.0,
+    ):
+        # --- Pinocchio model ---
         self.model = pin.buildModelFromUrdf(urdf_path)
         self.data = self.model.createData()
-        self.nq = self.model.nq
-        self.nv = self.model.nv
+        self.nq: int = self.model.nq
+        self.nv: int = self.model.nv
 
-        # Observer parameters
+        # --- Observer parameters ---
         self.omega_c = float(omega_c)
         self.dt = float(dt)
-        self.zeta = zeta
+        self.zeta = float(zeta)
 
-        # Persistent filter states
-        self.q_prev = np.zeros(self.nq)
-        self.q_prev[:len(q0)] = q0
-        self.dtheta_ref_prev = np.zeros(self.nv)
-        # Velocity observer states
-        self.dtheta_int_hpf_prev = np.zeros(self.nv)
-        self.theta_lpf_vob_prev = np.zeros(self.nq)
-        self.theta_lpf_vob_prev[:len(q0)] = q0
-        # Force observer states
-        self.tau_u_lpf_prev = np.zeros(self.nv)
-        self.theta_lpf_fob_prev = np.zeros(self.nq)
-        self.theta_lpf_fob_prev[:len(q0)] = q0
-        self.temp_lpf_prev = np.zeros(self.nv)
-        # Outputs
-        self.dtheta_hat = np.zeros(self.nv)
-        self.tau_ext_hat = np.zeros(self.nv)
+        # --- State allocation ---
+        self._n_active = min(len(q0), self.nv)
+        self._init_states(q0)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _pad_q(self, q: np.ndarray) -> np.ndarray:
+        out = np.zeros(self.nq)
+        n = min(len(q), self.nq)
+        out[:n] = q[:n]
+        return out
+
+    def _pad_v(self, v: np.ndarray) -> np.ndarray:
+        out = np.zeros(self.nv)
+        n = min(len(v), self.nv)
+        out[:n] = v[:n]
+        return out
+
+    def _init_states(self, q0: np.ndarray) -> None:
+        n = self.nv
+
+        # Previous joint position measurement
+        self.q_prev = self._pad_q(q0)
+
+        # --- VOB states (Algorithm 1, velocity-estimation block) ---
+        self.ddq_ref_prev = np.zeros(n)       # previous raw ¨q_ref
+        self.ddq_ref_lpf_prev = np.zeros(n)   # previous LPF-filtered ¨q_ref
+        self.q_lpf_prev = self._pad_q(q0)     # previous LPF-filtered position
+
+        # --- FOB states (Algorithm 1, force-estimation block) ---
+        self.dq_pred_prev = np.zeros(n)        # previous velocity prediction
+
+        # --- Outputs ---
+        self.dtheta_hat = np.zeros(n)          # estimated joint velocity
+        self.tau_ext_hat = np.zeros(n)         # estimated external torque
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
     def reset(self, q0: np.ndarray) -> None:
-        """Reset filter states to a new starting configuration."""
-        self.q_prev = np.zeros(self.nq)
-        self.q_prev[:len(q0)] = q0
-        self.dtheta_ref_prev.fill(0.0)
-        self.dtheta_int_hpf_prev.fill(0.0)
-        self.theta_lpf_vob_prev = np.zeros(self.nq)
-        self.theta_lpf_vob_prev[:len(q0)] = q0
-        self.tau_u_lpf_prev.fill(0.0)
-        self.theta_lpf_fob_prev = np.zeros(self.nq)
-        self.theta_lpf_fob_prev[:len(q0)] = q0
-        self.temp_lpf_prev.fill(0.0)
-        self.dtheta_hat.fill(0.0)
-        self.tau_ext_hat.fill(0.0)
+        """Reset all filter states to a new starting configuration."""
+        self._n_active = min(len(q0), self.nv)
+        self._init_states(q0)
 
-    def update(self, q_measured: np.ndarray, dq_measured: np.ndarray, tau_cmd: np.ndarray, dq_ref: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Run one observer step.
+    def update(
+        self,
+        q_measured: np.ndarray,
+        dq_measured: np.ndarray,
+        tau_cmd: np.ndarray,
+        dq_ref: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Run one observer step (Algorithm 1, Yamane et al.).
 
-        Args:
-            q_measured: Current joint positions (rad).
-            dq_measured: Current joint velocities (rad/s).
-            tau_cmd: Commanded joint torques that were sent to the servos
-                (these typically already include gravity/Coriolis/feedforward).
-            dq_ref: Reference joint velocities used by your controller.
+        Parameters
+        ----------
+        q_measured : array
+            Current joint positions [rad] from encoders.
+        dq_measured : array
+            **Unused** — kept for API compatibility.  Velocity is
+            estimated internally by the observer.
+        tau_cmd : array
+            Total torque command sent to the servos [Nm], including
+            gravity / Coriolis / feedforward terms (Yamane Eq. 2).
+        dq_ref : array
+            **Unused** — kept for API compatibility.  The acceleration
+            reference is computed internally from *tau_cmd* (Eq. 17).
 
-        Returns:
-            (dtheta_hat, tau_ext_hat): estimated joint velocities and external torques.
+        Returns
+        -------
+        dtheta_hat : array
+            Estimated joint velocities [rad/s].
+        tau_ext_hat : array
+            Estimated external joint torques [Nm].
         """
-        # Handle size mismatches (e.g. if the URDF includes a gripper but the driver doesn't)
-        input_size_q = len(q_measured)
-        input_size_v = len(dq_measured)
+        # Remember original size so we can slice the output
+        input_size_v = min(len(q_measured), self.nv)
 
-        if input_size_q < self.nq:
-            q_measured = np.concatenate([q_measured, np.zeros(self.nq - input_size_q)])
-        if input_size_v < self.nv:
-            dq_measured = np.concatenate([dq_measured, np.zeros(self.nv - input_size_v)])
-            tau_cmd = np.concatenate([tau_cmd, np.zeros(self.nv - len(tau_cmd))])
-            dq_ref = np.concatenate([dq_ref, np.zeros(self.nv - len(dq_ref))])
+        # --- Pad inputs to model size ---
+        q = self._pad_q(q_measured)
+        tau = self._pad_v(tau_cmd)
 
-        # Discrete filter coefficients (Tustin)
+        Ts = self.dt
         wc = self.omega_c
-        T = self.dt
-        alpha_num = 2.0 - 2.0 * self.zeta * wc * T
-        alpha_den = 2.0 +  2.0 * self.zeta * wc * T
-        beta = (wc * T) / alpha_den
+        zeta = self.zeta
 
-        # Model terms
-        pin.computeCoriolisMatrix(self.model, self.data, q_measured, self.dtheta_hat)
-        coriolis = self.data.C @ self.dtheta_hat
-        g = pin.computeGeneralizedGravity(self.model, self.data, q_measured)
+        # =============================================================
+        # Bilinear LPF coefficient  (1st-order, cutoff = 2ζωc)
+        #   α = (2 − 2ζωc·Ts) / (2 + 2ζωc·Ts)
+        #   gain = (1−α)/2 = 2ζωc·Ts / (2 + 2ζωc·Ts)
+        # =============================================================
+        two_zeta_wc = 2.0 * zeta * wc
+        alpha = (2.0 - two_zeta_wc * Ts) / (2.0 + two_zeta_wc * Ts)
+        half_1ma = (1.0 - alpha) / 2.0          # correct for all ζ
 
-        # Form input torque without non-linear terms: tau_u = tau_cmd - (C*dq + g)
-        tau_u = tau_cmd - coriolis - g
+        # =============================================================
+        # 1. Model terms
+        # =============================================================
+        pin.crba(self.model, self.data, q)
+        M = self.data.M.copy()
+        M = np.triu(M) + np.triu(M, 1).T        # symmetrise
 
-        # Mass matrix and its inverse applied to tau_u
-        pin.crba(self.model, self.data, q_measured)
-        M = self.data.M
-        M_inv_tau_u = np.linalg.solve(M, tau_u)
-
-        # --- Velocity Observer (VOB) ---
-        term1_vel = (alpha_num / alpha_den) * self.dtheta_int_hpf_prev
-        term2_vel = (T / alpha_den) * (dq_ref + self.dtheta_ref_prev)
-        dtheta_int_hpf = term1_vel + term2_vel
-        theta_lpf_vob = (alpha_num / alpha_den) * self.theta_lpf_vob_prev + (
-                2.0 * beta
-        ) * (q_measured + self.q_prev)
-        dtheta_pdiff_vob = 2.0 * wc * (q_measured - theta_lpf_vob)
-        self.dtheta_hat = dtheta_int_hpf + dtheta_pdiff_vob
-
-        # --- Force/Disturbance Observer (FOB) ---
-        tau_u_lpf = (alpha_num / alpha_den) * self.tau_u_lpf_prev + beta * (
-                M_inv_tau_u + self.tau_u_lpf_prev
+        # h(q, ˆ˙q) = C(q, ˆ˙q)·ˆ˙q + g(q)
+        h = pin.rnea(
+            self.model, self.data, q, self.dtheta_hat, np.zeros(self.nv)
         )
-        theta_lpf_fob = (alpha_num / alpha_den) * self.theta_lpf_fob_prev + beta * (
-                q_measured + self.q_prev
+
+        # =============================================================
+        # 2. τ_u  and  acceleration reference  ¨q_ref   (Eq. 2 & 17)
+        # =============================================================
+        tau_u = tau - h                                     # Eq. 2, D=0
+        ddq_ref = np.linalg.solve(M, tau_u + self.tau_ext_hat)  # Eq. 17
+
+        # =============================================================
+        # 3. VELOCITY ESTIMATION  (Eq. 16 / Algorithm 1)
+        #    ˆ˙q = ¨q^lpf_ref/(2ζωc) + ˙q_lpf
+        # =============================================================
+        # LPF on acceleration reference
+        ddq_ref_lpf = (
+            alpha * self.ddq_ref_lpf_prev
+            + half_1ma * (ddq_ref + self.ddq_ref_prev)
+
         )
-        dtheta_pdiff_fob = wc * (q_measured - theta_lpf_fob)
-        temp = tau_u_lpf + wc * dtheta_pdiff_fob
-        temp_lpf = (alpha_num / alpha_den) * self.temp_lpf_prev + beta * (
-                temp + self.temp_lpf_prev
+
+        # LPF on position
+        q_lpf = (
+            alpha * self.q_lpf_prev
+            + half_1ma * (q + self.q_prev)
+
         )
-        term_bracket = -temp_lpf + wc * dtheta_pdiff_fob
-        self.tau_ext_hat = M @ term_bracket
 
-        # --- Update stored states ---
-        self.q_prev = np.array(q_measured, dtype=float)
-        self.dtheta_ref_prev = np.array(dq_ref, dtype=float)
-        self.dtheta_int_hpf_prev = dtheta_int_hpf
-        self.theta_lpf_vob_prev = theta_lpf_vob
-        self.tau_u_lpf_prev = tau_u_lpf
-        self.theta_lpf_fob_prev = theta_lpf_fob
-        self.temp_lpf_prev = temp_lpf
-        
-        # Returned values sliced to input size
-        return self.dtheta_hat[:input_size_v].copy(), self.tau_ext_hat[:input_size_v].copy()
+        # Filtered numerical differentiation:  2ζωc·(q − q^lpf)
+        dq_lpf = two_zeta_wc * (q[: self.nv] - q_lpf[: self.nv])
+
+        # Complementary filter  (Eq. 16)
+        self.dtheta_hat = ddq_ref_lpf / two_zeta_wc + dq_lpf
+
+        # =============================================================
+        # 4. EXTERNAL FORCE ESTIMATION  (Eq. 20 / Algorithm 1)
+        #    ˆd = (ωc/2ζ)·(˙q_lpf − ˙q_pred)
+        #    ˆτ_ext = M(q)·ˆd
+        # =============================================================
+        # Velocity prediction  (trapezoidal integration of ¨q^lpf_ref)
+        dq_pred = (
+            self.dq_pred_prev
+            + (ddq_ref_lpf + self.ddq_ref_lpf_prev) / 2.0 * Ts
+
+        )
+
+        # Disturbance in acceleration domain
+        d_hat = (wc / (2.0 * zeta)) * (dq_lpf - dq_pred)
+
+        # External torque  (Eq. 15)
+        self.tau_ext_hat = M @ d_hat
+
+        # =============================================================
+        # 5. Store states for next step
+        # =============================================================
+        self.q_prev = q.copy()
+        self.ddq_ref_prev = ddq_ref.copy()
+        self.ddq_ref_lpf_prev = ddq_ref_lpf.copy()
+        self.q_lpf_prev = q_lpf.copy()
+        self.dq_pred_prev = dq_pred.copy()
+
+        return (
+            self.dtheta_hat[:input_size_v].copy(),
+            self.tau_ext_hat[:input_size_v].copy(),
+        )
 
 
+# =====================================================================
+
+# Smoke test
+
+# =====================================================================
 
 if __name__ == "__main__":
-    # Smoke test: run one observer step
-    urdf_file = "gello/factr/urdf/GELLO_Assembly_URDF_V5/GELLO_Assembly_URDF_V5.urdf"
+    urdf_file = (
+        "gello/factr/urdf/GELLO_Assembly_URDF_V5/GELLO_Assembly_URDF_V5.urdf"
+    )
     q0 = np.array([0.0, -1.57, 0.0, -1.57, 0.0, 0.0])
     obs = LeaderObserver(urdf_path=urdf_file, omega_c=50.0, dt=0.001, q0=q0)
+
     q_meas = q0.copy()
     dq_meas = np.zeros_like(q0)
     tau_cmd = np.zeros_like(q0)
     dq_ref = np.zeros_like(q0)
+
     dq_hat, tau_ext_hat = obs.update(q_meas, dq_meas, tau_cmd, dq_ref)
     print("dtheta_hat:", dq_hat)
     print("tau_ext_hat:", tau_ext_hat)
-

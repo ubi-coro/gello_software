@@ -1,0 +1,68 @@
+# CR-DAgger default parameters
+
+# These are overridden by CLI arguments where applicable
+
+admittance:
+  # Joint-space admittance dynamics: M·q̈_c = τ_ext - D·dq_c - K·(q_c - q_ref)
+  mass: 1.0           # Virtual inertia [kg·m²] (scalar, applied per joint)
+  damping: 5.0        # Virtual damping [Nm·s/rad]
+  stiffness: 20.0     # Virtual stiffness [Nm/rad]
+
+wrench_feedback:
+  enable: false
+  gain: 0.5           # Scaling factor for UR5e wrench → GELLO admittance
+
+intervention:
+  # Torque threshold detector (Schmitt trigger)
+  torque_threshold_high: 0.3    # Nm — activation
+  torque_threshold_low: 0.15    # Nm — deactivation
+  torque_onset_steps: 3
+  torque_offset_steps: 10
+
+  # Delta position detector
+  delta_q_threshold: 0.02       # rad
+  delta_dq_threshold: 0.05      # rad/s
+  delta_onset_s: 0.03
+  delta_offset_s: 0.2
+
+  # Energy injection detector
+  energy_threshold: 0.005       # Joules
+  energy_decay_rate: 10.0       # 1/s
+
+  # Fusion
+  min_votes: 2                  # Minimum detector agreements
+
+shi_observer:
+  alpha_ema: 0.5
+  vel_threshold: 0.05
+  eta: 0.65
+
+recording:
+  latency_compensation_s: 0.008   # Dynamixel position mode latency
+  log_dir: "cr_dagger_data"
+
+policy:
+  action_dt: 0.1                  # Seconds between waypoints
+  horizon: 32                     # Number of waypoints per prediction
+
+ipc:
+  trajectory_shm_name: "cr_dagger_traj"
+  observation_shm_name: "cr_dagger_obs"
+  obs_write_decimation: 33        # Write obs every N control steps (~10 Hz)
+
+lerobot:
+  default_fps: 330                        # Control loop frequency
+  camera_fps: 30                          # Camera frame rate
+  video_codec: "av1"                      # MP4 codec
+  default_camera_shape: [480, 640, 3]     # H, W, C
+  enable_push_to_hub: false
+  private: true
+
+  # Feature names (for documentation — actual schema is in lerobot_recorder.py)
+  # observation.state:      [q(6), dq(6), gripper(1)]      = 13 dims
+  # observation.effort:     tau_ext(6)                      = 6 dims
+  # observation.wrench:     wrench(6)                       = 6 dims
+  # observation.delta_q:    q_c - q_ref (latency-comp.)    = 6 dims
+  # action:                 q_ref(6) + gripper_ref(1)       = 7 dims
+  # action.compliant:       q_c(6) + gripper_c(1)           = 7 dims
+

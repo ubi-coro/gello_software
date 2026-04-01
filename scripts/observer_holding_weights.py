@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Stage-1 observer comparison on real GELLO hardware.
+"""Stage-1 observer comparison on real GELLO hardware WITH POSITION HOLD.
 
-Runs GELLO in gravity-comp hold mode, reads both observers in parallel:
+Runs GELLO in gravity-comp + PD position hold mode, reads both observers in parallel:
 - Shi minimalist estimator (needs Present Current)
 - Yamane observer (needs tau_cmd + q)
 
 Use case:
 1) Start script
-2) Let arm settle in gravity compensation
+2) The arm records its initial joint positions and holds them actively.
 3) Hang known weight (e.g. 0.5 kg) at EE
 4) Compare tau_ext traces / norms live
 """
@@ -62,8 +62,6 @@ def _resolve_leader_urdf(config_path: Path, leader_urdf: str) -> Path:
 
 
 def _infer_motor_params(servo_types: list[str], n: int) -> tuple[np.ndarray, np.ndarray]:
-    # Values mapping: (gear_ratio, Kt_motor)
-    # kt_motor ≈ Kt_effective / gear_ratio, where Kt_effective = stall_torque / stall_current
     params_by_servo = {
         "XC330_T288_T": (288.35, 1.136 / 288.35),
         "XM430_W210_T": (212.6, 1.304 / 212.6),
@@ -108,7 +106,7 @@ def _init_plot(n_joints: int, window_s: float):
     axes[0].set_title("Yamane Observer")
     axes[1].set_title("Minimalist Observer (Shi)")
 
-    axes[0].set_ylabel(r"External Torque $\tau_{ext}$ (Nm)")
+    axes[0].set_ylabel(r"External Torque $\tau_{\text{ext}}$ (Nm)")
     axes[0].set_xlabel(f"Time window [{window_s:.0f}s]")
     axes[1].set_xlabel(f"Time window [{window_s:.0f}s]")
 
@@ -152,7 +150,7 @@ def _update_plot(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Observer comparison with known payload")
+    parser = argparse.ArgumentParser(description="Observer comparison while holding position with PD control")
     parser.add_argument(
         "--config",
         type=str,
@@ -173,6 +171,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot-window", type=float, default=15.0, help="Live-plot window size [s]")
     parser.add_argument("--plot-rate", type=float, default=10.0, help="Live-plot refresh rate [Hz]")
     parser.add_argument("--no-plot", action="store_true", help="Disable live plotting")
+    
+    parser.add_argument("--kp", type=float, default=20.0, help="Proportional gain for position holding")
+    parser.add_argument("--kd", type=float, default=1.0, help="Derivative gain for position holding")
+    
     return parser.parse_args()
 
 
@@ -187,10 +189,11 @@ def main() -> int:
         return 1
 
     print("=" * 70)
-    print("Stage-1 observer comparison")
+    print("Stage-1 observer comparison WITH POSITION HOLD")
     print(f"Config: {config_path}")
     print(f"Known payload note: {args.weight_kg:.3f} kg")
-    print("Running in gravity-comp hold with both observers in parallel")
+    print(f"PD Control Gains -> Kp: {args.kp:.2f}, Kd: {args.kd:.2f}")
+    print("Running in gravity-comp + PD hold with both observers in parallel")
     print("=" * 70)
 
     system: Optional[FACTRGravityCompensation] = None
@@ -255,12 +258,22 @@ def main() -> int:
         plot_state = None if args.no_plot else _init_plot(n, args.plot_window)
         plot_period = 1.0 / max(args.plot_rate, 1e-3)
 
+        # Let it settle for a fraction of a second before recording the 0-position.
+        time.sleep(0.5)
+
+        # Get initial position to hold
+        q0_target, _, _, _ = system.get_leader_joint_states()
+        print(f"Target positions recorded. Actively holding position now.")
+
         t_start = time.time()
         last_step_t = time.perf_counter()
         last_plot_t = t_start
         loop_counter = 0
 
         print("Observer loop started. Press Ctrl+C to stop.")
+
+        kp = float(args.kp)
+        kd = float(args.kd)
 
         while running:
             now_perf = time.perf_counter()
@@ -269,10 +282,16 @@ def main() -> int:
 
             q, dq, _, _ = system.get_leader_joint_states()
 
+            # Command torques
             tau_grav = system.gravity_compensation(q, dq)
             tau_fric = system.friction_compensation(dq)
-            tau_damp = -float(system.gravity_comp_velocity_damping) * dq
-            tau_cmd = tau_grav + tau_fric + tau_damp
+            
+            # PD position control torque
+            tau_pd = kp * (q0_target - q) - kd * dq
+            
+            # We add PD on top of gravity and friction
+            tau_cmd = tau_grav + tau_fric + tau_pd
+            
             system.set_leader_joint_torque(tau_cmd, 0.0)
 
             currents_all = system.driver.get_currents() if system.driver is not None else np.zeros(n)
@@ -304,9 +323,6 @@ def main() -> int:
                 t_hist = np.asarray(t_buf, dtype=float)
                 shi_hist = np.asarray(shi_buf, dtype=float)
                 yam_hist = np.asarray(yam_buf, dtype=float)
-                norm_shi_hist = np.asarray(norm_shi_buf, dtype=float)
-                norm_yam_hist = np.asarray(norm_yam_buf, dtype=float)
-                detector_hist = np.asarray(det_buf, dtype=float)
                 _update_plot(
                     plot_state,
                     n,
@@ -334,16 +350,21 @@ def main() -> int:
     finally:
         if system is not None:
             try:
+                system.set_leader_joint_torque(np.zeros(n), 0.0)
+                time.sleep(0.05)
+                system.driver.set_operating_mode(3)
+                time.sleep(0.05)
                 system.shutdown()
             except Exception as exc:
-                print(f"Shutdown warning: {exc}")
-        if plt is not None:
-            try:
-                plt.ioff()
-                plt.close("all")
-            except Exception:
                 pass
-
+        if plt is not None:
+            if plot_state is not None:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                save_path = f"observer_comparison_{timestamp}.svg"
+                plot_state["fig"].savefig(save_path, format="svg", bbox_inches="tight")
+                print(f"\nSaved final plot to {save_path}")
+            plt.ioff()
+            plt.close('all')
 
 if __name__ == "__main__":
     raise SystemExit(main())
