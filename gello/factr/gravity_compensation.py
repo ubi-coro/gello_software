@@ -1006,9 +1006,15 @@ class FACTRGravityCompensation:
 
         print(f"Loading URDF: {urdf_path}")
         urdf_model_dir = str(urdf_path.parent)
-        self.pin_model, _, _ = pin.buildModelsFromUrdf(
-            filename=str(urdf_path), package_dirs=urdf_model_dir
-        )
+        if self.enable_visualization:
+            # Visualization needs visual/collision meshes.
+            self.pin_model, _, _ = pin.buildModelsFromUrdf(
+                filename=str(urdf_path), package_dirs=urdf_model_dir
+            )
+        else:
+            # Headless operation (e.g., observer tests) only needs dynamics.
+            # This avoids failures when visual mesh package paths are unavailable.
+            self.pin_model = pin.buildModelFromUrdf(str(urdf_path))
         self.pin_data = self.pin_model.createData()
         # Cache sizes for quick sanity checks and vector padding
         self._pin_nq = int(getattr(self.pin_model, "nq", 0))
