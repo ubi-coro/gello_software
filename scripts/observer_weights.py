@@ -61,52 +61,60 @@ def _resolve_leader_urdf(config_path: Path, leader_urdf: str) -> Path:
     raise FileNotFoundError(f"URDF not found for leader_urdf='{leader_urdf}'")
 
 
-def _infer_default_gear_ratios(servo_types: list[str], n: int) -> np.ndarray:
-    gear_by_servo = {
-        "XC330_T288_T": 1.0,
-        "XM430_W210_T": 353.5,
-        "XM430_W350_T": 353.5,
+def _infer_motor_params(servo_types: list[str], n: int) -> tuple[np.ndarray, np.ndarray]:
+    # Values mapping: (gear_ratio, Kt_motor)
+    # kt_motor ≈ Kt_effective / gear_ratio, where Kt_effective = stall_torque / stall_current
+    params_by_servo = {
+        "XC330_T288_T": (288.35, 1.136 / 288.35),
+        "XM430_W210_T": (212.6, 1.304 / 212.6),
+        "XM430_W350_T": (353.5, 1.783 / 353.5),
     }
-    out = []
+    gear_ratios = []
+    kts = []
     for s in servo_types[:n]:
-        out.append(float(gear_by_servo.get(s, 1.0)))
-    if len(out) < n:
-        out.extend([1.0] * (n - len(out)))
-    return np.asarray(out, dtype=float)
+        gr, kt = params_by_servo.get(s, (1.0, 0.00504))
+        gear_ratios.append(float(gr))
+        kts.append(float(kt))
+    if len(gear_ratios) < n:
+        gear_ratios.extend([1.0] * (n - len(gear_ratios)))
+        kts.extend([0.00504] * (n - len(kts)))
+    return np.asarray(gear_ratios, dtype=float), np.asarray(kts, dtype=float)
 
 
 def _init_plot(n_joints: int, window_s: float):
     if plt is None:
         return None
 
+    # Set acadamic typesetting (Arial/sans-serif)
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = ["Arial", "Helvetica", "DejaVu Sans"]
+    plt.rcParams["font.size"] = 12
+    plt.rcParams["axes.linewidth"] = 1.2
+
     plt.ion()
-    fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
-    fig.suptitle("Observer comparison: Shi vs Yamane")
+    # 1x2 Matrix: Yamane on the left, Shi on the right
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
+    fig.suptitle("Observer Comparison: Yamane vs Minimalist (Shi)", fontweight="bold")
 
     lines_shi = []
     lines_yam = []
     for j in range(n_joints):
-        (line_shi,) = axes[0].plot([], [], label=f"J{j+1}")
-        (line_yam,) = axes[1].plot([], [], label=f"J{j+1}")
-        lines_shi.append(line_shi)
+        # axes[0] is Yamane, axes[1] is Shi
+        (line_yam,) = axes[0].plot([], [], linewidth=1.5, label=f"Joint {j+1}")
+        (line_shi,) = axes[1].plot([], [], linewidth=1.5, label=f"Joint {j+1}")
         lines_yam.append(line_yam)
+        lines_shi.append(line_shi)
 
-    (line_norm_shi,) = axes[2].plot([], [], label="||tau_ext_shi||")
-    (line_norm_yam,) = axes[2].plot([], [], label="||tau_ext_yam||")
-    (line_detector,) = axes[2].plot([], [], label="intervention (0/1)")
+    axes[0].set_title("Yamane Observer")
+    axes[1].set_title("Minimalist Observer (Shi)")
 
-    axes[0].set_ylabel("Shi tau_ext [Nm]")
-    axes[1].set_ylabel("Yamane tau_ext [Nm]")
-    axes[2].set_ylabel("Norm / state")
-    axes[2].set_xlabel(f"Time window [{window_s:.0f}s]")
+    axes[0].set_ylabel(r"External Torque $\tau_{ext}$ (Nm)")
+    axes[0].set_xlabel(f"Time window [{window_s:.0f}s]")
+    axes[1].set_xlabel(f"Time window [{window_s:.0f}s]")
 
-    axes[0].grid(True, alpha=0.3)
-    axes[1].grid(True, alpha=0.3)
-    axes[2].grid(True, alpha=0.3)
-
-    axes[0].legend(loc="upper right", ncol=3, fontsize=8)
-    axes[1].legend(loc="upper right", ncol=3, fontsize=8)
-    axes[2].legend(loc="upper right", fontsize=8)
+    for ax in axes:
+        ax.grid(True, linestyle="--", alpha=0.5)
+        ax.legend(loc="upper left", fontsize=10)
 
     fig.tight_layout()
     return {
@@ -114,9 +122,6 @@ def _init_plot(n_joints: int, window_s: float):
         "axes": axes,
         "lines_shi": lines_shi,
         "lines_yam": lines_yam,
-        "line_norm_shi": line_norm_shi,
-        "line_norm_yam": line_norm_yam,
-        "line_detector": line_detector,
     }
 
 
@@ -126,9 +131,6 @@ def _update_plot(
     t_hist: np.ndarray,
     shi_hist: np.ndarray,
     yam_hist: np.ndarray,
-    norm_shi_hist: np.ndarray,
-    norm_yam_hist: np.ndarray,
-    detector_hist: np.ndarray,
 ):
     if plot_state is None or t_hist.size == 0:
         return
@@ -139,10 +141,6 @@ def _update_plot(
     for j in range(n_joints):
         plot_state["lines_shi"][j].set_data(tx, shi_hist[:, j])
         plot_state["lines_yam"][j].set_data(tx, yam_hist[:, j])
-
-    plot_state["line_norm_shi"].set_data(tx, norm_shi_hist)
-    plot_state["line_norm_yam"].set_data(tx, norm_yam_hist)
-    plot_state["line_detector"].set_data(tx, detector_hist)
 
     for ax in plot_state["axes"]:
         ax.set_xlim(tx[0], tx[-1] if tx[-1] > 1e-3 else 1.0)
@@ -211,13 +209,13 @@ def main() -> int:
 
         n = int(system.num_arm_joints)
         servo_types = list(system.config["dynamixel"]["servo_types"])
-        gear_ratio = _infer_default_gear_ratios(servo_types, n)
+        gear_ratio, kt = _infer_motor_params(servo_types, n)
 
         leader_urdf = str(system.config["arm_teleop"]["leader_urdf"])
         urdf_path = _resolve_leader_urdf(config_path, leader_urdf)
 
         motor_params = MotorParams(
-            kt=np.full(n, float(args.shi_kt), dtype=float),
+            kt=kt,
             gear_ratio=gear_ratio,
             eta=np.full(n, float(args.shi_eta), dtype=float),
             motor_type=MotorType.CURRENT,
@@ -315,9 +313,6 @@ def main() -> int:
                     t_hist,
                     shi_hist,
                     yam_hist,
-                    norm_shi_hist,
-                    norm_yam_hist,
-                    detector_hist,
                 )
                 last_plot_t = wall_now
 

@@ -132,11 +132,19 @@ class GelloMinimalistCompliance:
         # Raw mapped torque applied at the joint output
         tau_raw_joint = self.mp.gear_ratio * tau_load
         
-        # 3. Obtain Bias Torques (Gravity + Coriolis)
-        tau_bias = self.data.qfrc_bias[:self.nv]
+        # 3. Obtain Bias Torques (Gravity only for minimalist quasi-static assumption)
+        # MuJoCo's qfrc_bias includes Coriolis, so we temporarily zero velocities to get pure gravity
+        orig_qvel = self.data.qvel.copy()
+        self.data.qvel[:] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+        tau_grav = self.data.qfrc_bias[:self.nv].copy()
+        
+        # Restore state
+        self.data.qvel[:] = orig_qvel
+        mujoco.mj_forward(self.model, self.data)
         
         # 4. Joint External Torque Residual
-        tau_ext = -(tau_raw_joint - tau_bias)
+        tau_ext = -(tau_raw_joint - tau_grav)
         
         # 5. Extract Jacobians
         jacp = np.zeros((3, self.nv), dtype=np.float64)

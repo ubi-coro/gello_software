@@ -426,7 +426,7 @@ if __name__ == "__main__":
     # Example: GELLO with Dynamixel XM430-W350 servos
     # -------------------------------------------------------------------------
     urdf_file = (
-        "gello/factr/urdf/GELLO_Assembly_URDF_V5/GELLO_Assembly_URDF_V5.urdf"
+        "gello/factr/urdf/GELLO_Assembly_URDF_V6/robot.urdf"
     )
     n_joints = 6
 
