@@ -267,6 +267,17 @@ def main() -> int:
         tare_samples: List[np.ndarray] = []
         observer_tare = np.zeros(n)
         observer_deadband = np.zeros(n)
+        tau_ext_prev = np.zeros(n)
+        tau_ext_rate_limit = 0.05
+        tau_ext_max = np.array([0.15, 0.15, 0.15, 0.10, 0.10, 0.05],
+                               dtype=float)
+        if n < len(tau_ext_max):
+            tau_ext_max = tau_ext_max[:n]
+        elif n > len(tau_ext_max):
+            tau_ext_max = np.pad(tau_ext_max, (0, n - len(tau_ext_max)),
+                                 mode="edge")
+        leak = 0.995
+        debug_counter = 0
 
         # Admittance state (initialised properly when entering REPLAY)
         q_c  = np.zeros(n)
@@ -374,7 +385,7 @@ def main() -> int:
                     tare_array = np.asarray(tare_samples, dtype=float)
                     observer_tare = np.mean(tare_array, axis=0)
                     tare_std = np.std(tare_array, axis=0)
-                    min_deadband = np.array([0.05, 0.10, 0.15, 0.03, 0.03, 0.02],
+                    min_deadband = np.array([0.05, 0.30, 0.30, 0.03, 0.03, 0.02],
                                             dtype=float)
                     if n < len(min_deadband):
                         min_deadband = min_deadband[:n]
@@ -401,6 +412,8 @@ def main() -> int:
                 if t_rel >= 0.5:
                     phase = "REPLAY"
                     replay_start_t = time.time() - t_start
+                    tau_ext_prev = np.zeros(n)
+                    debug_counter = 0
 
                     q_c = trajectory_q[0][1].copy()
                     dq_c = np.zeros(n)
@@ -427,25 +440,33 @@ def main() -> int:
                 idx = min(idx, len(trajectory_q) - 1)
                 _, q_ref, dq_ref = trajectory_q[idx]
 
-                tau_ext_compensated = tau_ext - observer_tare
+                tau_ext_comp = tau_ext - observer_tare
 
-                tau_ext_compensated = np.where(
-                    np.abs(tau_ext_compensated) < observer_deadband,
+                tau_ext_comp = np.where(
+                    np.abs(tau_ext_comp) < observer_deadband,
                     0.0,
-                    tau_ext_compensated
+                    tau_ext_comp
                 )
+
+                delta_tau = np.clip(
+                    tau_ext_comp - tau_ext_prev,
+                    -tau_ext_rate_limit,
+                    tau_ext_rate_limit,
+                )
+                tau_ext_comp = tau_ext_prev + delta_tau
+                tau_ext_prev = tau_ext_comp.copy()
+
+                tau_ext_comp = np.clip(tau_ext_comp, -tau_ext_max, tau_ext_max)
 
                 # --- Joint-Space Admittance ---
                 if args.mode == "joint":
                     ddq_c = (
-                        #tau_ext
-                        tau_ext_compensated
+                        tau_ext_comp
                         - args.damp_j  * dq_c
                         - args.stiff_j * (q_c - q_ref)
 
                     ) / args.mass_j
 
-                    leak = 0.995
                     dq_c = leak * dq_c + ddq_c * measured_dt
                     q_c  = q_c  + dq_c  * measured_dt
 
@@ -466,7 +487,7 @@ def main() -> int:
                     x_act, J_act = compute_task_kinematics(system, q)
 
                     # τ_ext → F_ext  via  (J^T)^+
-                    F_ext = np.linalg.pinv(J_act.T) @ tau_ext_compensated
+                    F_ext = np.linalg.pinv(J_act.T) @ tau_ext_comp
 
                     ddx_c = (
                         F_ext
@@ -506,6 +527,16 @@ def main() -> int:
                 if n_motors > n:
                     target_hw[-1] = system.leader_gripper_raw_rad
                 system.driver.set_joints(target_hw.tolist())
+
+                debug_counter += 1
+                if debug_counter % 30 == 1:
+                    print(
+                        f"  [t={t_rel:5.2f}] "
+                        f"d={[f'{int(x):+d}' for x in shi.d_prev]}  "
+                        f"tau_raw=[{' '.join(f'{x:+.3f}' for x in tau_ext)}]  "
+                        f"tau_comp=[{' '.join(f'{x:+.3f}' for x in tau_ext_comp)}]  "
+                        f"dq_deg=[{' '.join(f'{(q_c[i]-q_ref[i])*57.3:+5.1f}' for i in range(n))}]"
+                    )
 
                 # --- Live plot ---
                 wall_now = time.time()
