@@ -14,7 +14,8 @@ Phases:
   2. RECORD — User moves arm, trajectory is recorded
     3. HOME   — Position interpolation moves arm to trajectory start
     4. TARE   — Observer bias/deadband calibration at rest
-    5. REPLAY — Admittance control tracks the recorded trajectory
+    5. WARMUP — Observer settles while holding start position
+    6. REPLAY — Admittance control tracks the recorded trajectory
 
 """
 
@@ -257,6 +258,7 @@ def main() -> int:
         record_start_t = 0.0
         home_start_t   = 0.0
         tare_start_t   = 0.0
+        warmup_start_t = 0.0
         home_start_q   = np.zeros(n)
         target_q       = np.zeros(n)
         replay_start_t = 0.0
@@ -372,13 +374,31 @@ def main() -> int:
                     tare_array = np.asarray(tare_samples, dtype=float)
                     observer_tare = np.mean(tare_array, axis=0)
                     tare_std = np.std(tare_array, axis=0)
-                    observer_deadband = 2.0 * tare_std
+                    min_deadband = np.array([0.05, 0.10, 0.15, 0.03, 0.03, 0.02],
+                                            dtype=float)
+                    if n < len(min_deadband):
+                        min_deadband = min_deadband[:n]
+                    elif n > len(min_deadband):
+                        min_deadband = np.pad(
+                            min_deadband,
+                            (0, n - len(min_deadband)),
+                            mode="edge",
+                        )
+                    observer_deadband = np.maximum(3.0 * tare_std, min_deadband)
 
                     print(f"  Tare offset: {[f'{x:+.3f}' for x in observer_tare]} Nm")
-                    print(f"  Deadband 2σ: {[f'{x:.3f}' for x in observer_deadband]} Nm")
+                    print(f"  Deadband 3σ+min: {[f'{x:.3f}' for x in observer_deadband]} Nm")
 
-                    shi.reset()
+                    phase = "WARMUP"
+                    warmup_start_t = t_now
+                    print("[WARMUP] Observer stabilisiert (0.5s)...")
 
+            # ── PHASE: WARMUP ────────────────────────────────────────
+            elif phase == "WARMUP":
+                t_rel = t_now - warmup_start_t
+                system.driver.set_joints(target_raw.tolist())
+
+                if t_rel >= 0.5:
                     phase = "REPLAY"
                     replay_start_t = time.time() - t_start
 
@@ -425,7 +445,8 @@ def main() -> int:
 
                     ) / args.mass_j
 
-                    dq_c = dq_c + ddq_c * measured_dt
+                    leak = 0.995
+                    dq_c = leak * dq_c + ddq_c * measured_dt
                     q_c  = q_c  + dq_c  * measured_dt
 
                     # Safety clamp — stay within joint limits
@@ -445,7 +466,7 @@ def main() -> int:
                     x_act, J_act = compute_task_kinematics(system, q)
 
                     # τ_ext → F_ext  via  (J^T)^+
-                    F_ext = np.linalg.pinv(J_act.T) @ tau_ext
+                    F_ext = np.linalg.pinv(J_act.T) @ tau_ext_compensated
 
                     ddx_c = (
                         F_ext
