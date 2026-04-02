@@ -158,8 +158,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--home-time",   type=float, default=4.0)
 
     # Low-level position PD (used during HOME phase only)
-    p.add_argument("--kp-low", type=float, default=30.0)
-    p.add_argument("--kd-low", type=float, default=2.0)
+    p.add_argument("--kp-low", type=float, default=10.0)
+    p.add_argument("--kd-low", type=float, default=0.5)
 
     # Admittance parameters — joint space
     p.add_argument("--mass-j",  type=float, default=1.0)
@@ -319,7 +319,7 @@ def main() -> int:
 
                 tau_grav = system.gravity_compensation(q, dq)
                 tau_fric = system.friction_compensation(dq)
-                tau_pd   = 20.0 * (des_q - q) - 2.0 * dq
+                tau_pd   = args.kp_low * (des_q - q) - args.kd_low * dq
                 tau_cmd  = tau_grav + tau_fric + tau_pd
                 system.set_leader_joint_torque(tau_cmd, 0.0)
 

@@ -36,7 +36,7 @@ gripper_teleop:
   actuation_range: 0.8
 
 controller:
-  frequency: 350
+  frequency: 300
   torque_feedback:
     enable: True
     gain: -3.0

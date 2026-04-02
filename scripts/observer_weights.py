@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import multiprocessing as mp
+import queue
 
 try:
     import matplotlib.pyplot as plt
@@ -81,40 +83,51 @@ def _infer_motor_params(servo_types: list[str], n: int) -> tuple[np.ndarray, np.
     return np.asarray(gear_ratios, dtype=float), np.asarray(kts, dtype=float)
 
 
-def _init_plot(n_joints: int, window_s: float):
+def _init_plot(n_joints: int, window_s: float, observer_mode: str, plt):
+
     if plt is None:
         return None
 
-    # Set acadamic typesetting (Arial/sans-serif)
     plt.rcParams["font.family"] = "sans-serif"
     plt.rcParams["font.sans-serif"] = ["Arial", "Helvetica", "DejaVu Sans"]
     plt.rcParams["font.size"] = 12
     plt.rcParams["axes.linewidth"] = 1.2
 
     plt.ion()
-    # 1x2 Matrix: Yamane on the left, Shi on the right
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
-    fig.suptitle("Observer Comparison: Yamane vs Minimalist (Shi)", fontweight="bold")
+    n_subplots = 2 if observer_mode == "both" else 1
+    fig, axes = plt.subplots(1, n_subplots, figsize=(7 * n_subplots, 6), sharey=True)
+    if n_subplots == 1:
+        axes = [axes]
+        
+    fig.suptitle(f"Observer Comparison ({observer_mode})", fontweight="bold")
 
-    lines_shi = []
-    lines_yam = []
-    for j in range(n_joints):
-        # axes[0] is Yamane, axes[1] is Shi
-        (line_yam,) = axes[0].plot([], [], linewidth=1.5, label=f"Joint {j+1}")
-        (line_shi,) = axes[1].plot([], [], linewidth=1.5, label=f"Joint {j+1}")
-        lines_yam.append(line_yam)
-        lines_shi.append(line_shi)
+    lines_shi = [] if observer_mode in ["both", "shi"] else None
+    lines_yam = [] if observer_mode in ["both", "yamane"] else None
+    
+    ax_idx = 0
+    if observer_mode in ["both", "yamane"]:
+        ax_yam = axes[ax_idx]
+        for j in range(n_joints):
+            (line_yam,) = ax_yam.plot([], [], linewidth=1.5, label=f"Joint {j+1}")
+            lines_yam.append(line_yam)
+        ax_yam.set_title("Yamane Observer")
+        ax_yam.set_ylabel(r"External Torque $	tau_{\text{ext}}$ (Nm)")
+        ax_yam.set_xlabel(f"Time window [{window_s:.0f}s]")
+        ax_yam.grid(True, linestyle="--", alpha=0.5)
+        ax_yam.legend(loc="upper left", fontsize=10)
+        ax_idx += 1
 
-    axes[0].set_title("Yamane Observer")
-    axes[1].set_title("Minimalist Observer (Shi)")
-
-    axes[0].set_ylabel(r"External Torque $\tau_{ext}$ (Nm)")
-    axes[0].set_xlabel(f"Time window [{window_s:.0f}s]")
-    axes[1].set_xlabel(f"Time window [{window_s:.0f}s]")
-
-    for ax in axes:
-        ax.grid(True, linestyle="--", alpha=0.5)
-        ax.legend(loc="upper left", fontsize=10)
+    if observer_mode in ["both", "shi"]:
+        ax_shi = axes[ax_idx]
+        for j in range(n_joints):
+            (line_shi,) = ax_shi.plot([], [], linewidth=1.5, label=f"Joint {j+1}")
+            lines_shi.append(line_shi)
+        ax_shi.set_title("Minimalist Observer (Shi)")
+        if ax_idx == 0:
+            ax_shi.set_ylabel(r"External Torque $	tau_{\text{ext}}$ (Nm)")
+        ax_shi.set_xlabel(f"Time window [{window_s:.0f}s]")
+        ax_shi.grid(True, linestyle="--", alpha=0.5)
+        ax_shi.legend(loc="upper left", fontsize=10)
 
     fig.tight_layout()
     return {
@@ -129,8 +142,8 @@ def _update_plot(
     plot_state,
     n_joints: int,
     t_hist: np.ndarray,
-    shi_hist: np.ndarray,
-    yam_hist: np.ndarray,
+    shi_hist,
+    yam_hist,
 ):
     if plot_state is None or t_hist.size == 0:
         return
@@ -139,8 +152,10 @@ def _update_plot(
     tx = t_hist - t0
 
     for j in range(n_joints):
-        plot_state["lines_shi"][j].set_data(tx, shi_hist[:, j])
-        plot_state["lines_yam"][j].set_data(tx, yam_hist[:, j])
+        if plot_state["lines_shi"] is not None and shi_hist is not None:
+            plot_state["lines_shi"][j].set_data(tx, shi_hist[:, j])
+        if plot_state["lines_yam"] is not None and yam_hist is not None:
+            plot_state["lines_yam"][j].set_data(tx, yam_hist[:, j])
 
     for ax in plot_state["axes"]:
         ax.set_xlim(tx[0], tx[-1] if tx[-1] > 1e-3 else 1.0)
@@ -149,6 +164,33 @@ def _update_plot(
 
     plot_state["fig"].canvas.draw_idle()
     plot_state["fig"].canvas.flush_events()
+
+
+def _visualization_worker(queue, n_joints, window_s, observer_mode):
+    import matplotlib.pyplot as plt
+    try:
+        plot_state = _init_plot(n_joints, window_s, observer_mode, plt)
+        while True:
+            data = None
+            try:
+                while True:
+                    data = queue.get_nowait()
+            except Exception: # queue.Empty
+                pass
+            
+            if data == "QUIT":
+                break
+                
+            if data is not None:
+                t_hist, shi_hist, yam_hist = data
+                _update_plot(plot_state, n_joints, t_hist, shi_hist, yam_hist)
+                
+            plt.pause(0.05)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"Visualization error: {e}")
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -161,6 +203,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--weight-kg", type=float, default=0.5, help="Known payload for experiment notes")
     parser.add_argument("--duration", type=float, default=0.0, help="Run duration in seconds (0 = until Ctrl+C)")
+    parser.add_argument("--observer", choices=["both", "shi", "yamane"], default="both", help="Which observer(s) to run and plot")
 
     parser.add_argument("--shi-kt", type=float, default=0.00504, help="Shi kt default for all joints [Nm/A motor-side]")
     parser.add_argument("--shi-eta", type=float, default=0.65, help="Shi eta default for all joints")
@@ -221,28 +264,33 @@ def main() -> int:
             motor_type=MotorType.CURRENT,
         )
 
-        shi = MinimalistTorqueEstimator(
-            MinimalistEstimatorConfig(
-                urdf_path=str(urdf_path),
-                motor_params=motor_params,
-                alpha_ema=float(args.shi_alpha),
-                vel_threshold=float(args.shi_vel_threshold),
+        shi = None
+        detector = None
+        if args.observer in ["both", "shi"]:
+            shi = MinimalistTorqueEstimator(
+                MinimalistEstimatorConfig(
+                    urdf_path=str(urdf_path),
+                    motor_params=motor_params,
+                    alpha_ema=float(args.shi_alpha),
+                    vel_threshold=float(args.shi_vel_threshold),
+                )
             )
-        )
-        detector = InterventionDetector(
-            n_joints=n,
-            torque_threshold=0.3,
-            activation_count=3,
-            deactivation_count=5,
-        )
+            detector = InterventionDetector(
+                n_joints=n,
+                torque_threshold=0.3,
+                activation_count=3,
+                deactivation_count=5,
+            )
 
-        yamane = LeaderObserver(
-            urdf_path=str(urdf_path),
-            omega_c=float(args.yamane_omega_c),
-            dt=float(system.dt),
-            q0=system.calibration_joint_pos[:n],
-            zeta=float(args.yamane_zeta),
-        )
+        yamane = None
+        if args.observer in ["both", "yamane"]:
+            yamane = LeaderObserver(
+                urdf_path=str(urdf_path),
+                omega_c=float(args.yamane_omega_c),
+                dt=float(system.dt),
+                q0=system.calibration_joint_pos[:n],
+                zeta=float(args.yamane_zeta),
+            )
 
         maxlen = max(100, int(args.plot_window / max(system.dt, 1e-4)))
         t_buf = deque(maxlen=maxlen)
@@ -252,7 +300,12 @@ def main() -> int:
         norm_yam_buf = deque(maxlen=maxlen)
         det_buf = deque(maxlen=maxlen)
 
-        plot_state = None if args.no_plot else _init_plot(n, args.plot_window)
+        viz_queue = None
+        viz_process = None
+        if not args.no_plot:
+            viz_queue = mp.Queue()
+            viz_process = mp.Process(target=_visualization_worker, args=(viz_queue, n, args.plot_window, args.observer), daemon=True)
+            viz_process.start()
         plot_period = 1.0 / max(args.plot_rate, 1e-3)
 
         t_start = time.time()
@@ -278,42 +331,45 @@ def main() -> int:
             currents_all = system.driver.get_currents() if system.driver is not None else np.zeros(n)
             currents_arm = currents_all[:n] * system.joint_signs[:n]
 
-            tau_ext_shi = shi.update(q, dq, currents_arm)
-            intervention_active = detector.update(tau_ext_shi)
-            _, tau_ext_yam = yamane.update(q_measured=q, tau_cmd=tau_cmd, dt=measured_dt)
+            tau_ext_shi = np.zeros(n)
+            tau_ext_yam = np.zeros(n)
+            intervention_active = False
+
+            if shi is not None:
+                tau_ext_shi = shi.update(q, dq, currents_arm)
+                intervention_active = detector.update(tau_ext_shi)
+            
+            if yamane is not None:
+                _, tau_ext_yam = yamane.update(q_measured=q, tau_cmd=tau_cmd, dt=measured_dt)
 
             t_now = time.time() - t_start
             t_buf.append(t_now)
-            shi_buf.append(tau_ext_shi.copy())
-            yam_buf.append(tau_ext_yam.copy())
-            norm_shi_buf.append(float(np.linalg.norm(tau_ext_shi)))
-            norm_yam_buf.append(float(np.linalg.norm(tau_ext_yam)))
-            det_buf.append(1.0 if intervention_active else 0.0)
+            if shi is not None:
+                shi_buf.append(tau_ext_shi.copy())
+                norm_shi_buf.append(float(np.linalg.norm(tau_ext_shi)))
+                det_buf.append(1.0 if intervention_active else 0.0)
+            if yamane is not None:
+                yam_buf.append(tau_ext_yam.copy())
+                norm_yam_buf.append(float(np.linalg.norm(tau_ext_yam)))
 
             loop_counter += 1
             if loop_counter % 100 == 0:
-                print(
-                    f"t={t_now:7.2f}s | "
-                    f"||shi||={norm_shi_buf[-1]:6.3f} Nm | "
-                    f"||yam||={norm_yam_buf[-1]:6.3f} Nm | "
-                    f"intervention={int(intervention_active)}"
-                )
+                msg = f"t={t_now:7.2f}s | "
+                if shi is not None:
+                    msg += f"||shi||={norm_shi_buf[-1]:6.3f} Nm | intervention={int(intervention_active)} | "
+                if yamane is not None:
+                    msg += f"||yam||={norm_yam_buf[-1]:6.3f} Nm"
+                print(msg.strip(" | "))
 
             wall_now = time.time()
-            if (not args.no_plot) and (plot_state is not None) and (wall_now - last_plot_t >= plot_period):
+            if (not args.no_plot) and (viz_queue is not None) and (wall_now - last_plot_t >= plot_period):
                 t_hist = np.asarray(t_buf, dtype=float)
-                shi_hist = np.asarray(shi_buf, dtype=float)
-                yam_hist = np.asarray(yam_buf, dtype=float)
-                norm_shi_hist = np.asarray(norm_shi_buf, dtype=float)
-                norm_yam_hist = np.asarray(norm_yam_buf, dtype=float)
-                detector_hist = np.asarray(det_buf, dtype=float)
-                _update_plot(
-                    plot_state,
-                    n,
-                    t_hist,
-                    shi_hist,
-                    yam_hist,
-                )
+                shi_hist = np.asarray(shi_buf, dtype=float) if shi else None
+                yam_hist = np.asarray(yam_buf, dtype=float) if yamane else None
+                try:
+                    viz_queue.put_nowait((t_hist, shi_hist, yam_hist))
+                except Exception:
+                    pass
                 last_plot_t = wall_now
 
             if args.duration > 0.0 and t_now >= args.duration:
@@ -337,13 +393,21 @@ def main() -> int:
                 system.shutdown()
             except Exception as exc:
                 print(f"Shutdown warning: {exc}")
-        if plt is not None:
+        if not args.no_plot and 'viz_queue' in locals() and viz_queue is not None:
             try:
-                plt.ioff()
-                plt.close("all")
+                viz_queue.put_nowait("QUIT")
+            except Exception:
+                pass
+        if not args.no_plot and 'viz_process' in locals() and viz_process is not None:
+            try:
+                viz_process.join(timeout=1.0)
+                if viz_process.is_alive():
+                    viz_process.terminate()
             except Exception:
                 pass
 
 
 if __name__ == "__main__":
+    import multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
     raise SystemExit(main())

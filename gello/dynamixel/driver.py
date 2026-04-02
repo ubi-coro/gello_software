@@ -593,10 +593,15 @@ class DynamixelDriver(DynamixelDriverProtocol):
         torque_value = TORQUE_ENABLE if enable else TORQUE_DISABLE
         with self._lock:
             for dxl_id in self._ids:
-                dxl_comm_result, dxl_error = self._packetHandler.write1ByteTxRx(
-                    self._portHandler, dxl_id, ADDR_TORQUE_ENABLE, torque_value
-                )
-                if dxl_comm_result != COMM_SUCCESS or dxl_error != 0:
+                retries = 3
+                for attempt in range(retries):
+                    dxl_comm_result, dxl_error = self._packetHandler.write1ByteTxRx(
+                        self._portHandler, dxl_id, ADDR_TORQUE_ENABLE, torque_value
+                    )
+                    if dxl_comm_result == COMM_SUCCESS and dxl_error == 0:
+                        break
+                    time.sleep(0.01)
+                else:
                     raise RuntimeError(
                         f"Failed to set torque mode for Dynamixel with ID {dxl_id}"
                     )
