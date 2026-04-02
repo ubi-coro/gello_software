@@ -317,15 +317,40 @@ def main() -> int:
                 s = 10*alpha_t**3 - 15*alpha_t**4 + 6*alpha_t**5
                 des_q = home_start_q + s * (target_q - home_start_q)
 
-                tau_grav = system.gravity_compensation(q, dq)
-                tau_fric = system.friction_compensation(dq)
-                tau_pd   = args.kp_low * (des_q - q) - args.kd_low * dq
-                tau_cmd  = tau_grav + tau_fric + tau_pd
+                # tau_grav = system.gravity_compensation(q, dq)
+                tau_grav = system.gravity_compensation(q, np.zeros(n))
+                # tau_fric = system.friction_compensation(dq)
+
+                kp_vec = np.array([3.0, 3.0, 3.0, 1.5, 1.5, 1.0])
+                kd_vec = np.array([1.5, 1.5, 1.5, 0.8, 0.8, 0.5])
+                #tau_pd   = args.kp_low * (des_q - q) - args.kd_low * dq
+                tau_pd   = kp_vec * (des_q - q) - kd_vec * dq
+                tau_pd = np.clip(tau_pd, -0.8, 0.8)
+                tau_cmd  = tau_grav + tau_pd # + tau_fric
                 system.set_leader_joint_torque(tau_cmd, 0.0)
 
                 if t_rel >= args.home_time + 1.0:
                     # -- transition to REPLAY --
                     phase = "REPLAY"
+
+                    print("[REPLAY] Taring Shi observer (100 samples)...")
+                    tare_samples = []
+                    for _ in range(100):
+                        q_t, dq_t, _, _ = system.get_leader_joint_states()
+                        c_all = system.driver.get_currents()
+                        c_arm = c_all[:n] * system.joint_signs[:n]
+                        tau_sample = shi.update(q_t, dq_t, c_arm)
+                        tare_samples.append(tau_sample.copy())
+                        time.sleep(1.0 / 300)
+
+                    observer_tare = np.mean(tare_samples, axis=0)
+                    print(f" Tare offsets: {[f'{x:+.3f}' for x in observer_tare]} Nm")
+
+                    tare_std = np.std(tare_samples, axis=0)
+                    observer_deadband = 2.0 * tare_std
+                    print(f" Deadband (2σ): {[f'{x:.3f}' for x in observer_deadband]} Nm")
+
+
                     print(f"[{phase}] Switching to POSITION MODE "
                           "for admittance tracking.")
 
@@ -366,10 +391,21 @@ def main() -> int:
                 idx = min(idx, len(trajectory_q) - 1)
                 _, q_ref, dq_ref = trajectory_q[idx]
 
+                tau_ext = shi.update(q. dq. currents_arm)
+
+                tau_ext_compensated = tau_ext - observer_tare
+
+                tau_ext_compensated = np.where(
+                    np.abs(tau_ext_compensated) < observer_deadband,
+                    0.0,
+                    tau_ext_compensated
+                )
+
                 # --- Joint-Space Admittance ---
                 if args.mode == "joint":
                     ddq_c = (
-                        tau_ext
+                        #tau_ext
+                        tau_ext_compensated
                         - args.damp_j  * dq_c
                         - args.stiff_j * (q_c - q_ref)
 
