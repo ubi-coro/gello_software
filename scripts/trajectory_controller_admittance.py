@@ -12,8 +12,9 @@ The admittance loop runs on top of Dynamixel position-mode tracking:
 Phases:
   1. PREP   — Settle in gravity comp
   2. RECORD — User moves arm, trajectory is recorded
-  3. HOME   — PD control moves arm back to trajectory start
-  4. REPLAY — Admittance control tracks the recorded trajectory
+    3. HOME   — Position interpolation moves arm to trajectory start
+    4. TARE   — Observer bias/deadband calibration at rest
+    5. REPLAY — Admittance control tracks the recorded trajectory
 
 """
 
@@ -96,7 +97,9 @@ def _init_plot(mode: str, window_s: float):
     fig.suptitle(f"Admittance Replay ({mode.capitalize()} Space)", fontweight="bold")
 
     n_dims = 6 if mode == "joint" else 3
-    colors = plt.cm.tab10(np.linspace(0, 1, n_dims))
+    colors = np.array([
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b",
+    ])[:n_dims]
     lines_ref, lines_act = [], []
     for i in range(n_dims):
         lbl = f"Joint {i+1}" if mode == "joint" else ["X", "Y", "Z"][i]
@@ -157,7 +160,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--record-time", type=float, default=5.0)
     p.add_argument("--home-time",   type=float, default=4.0)
 
-    # Low-level position PD (used during HOME phase only)
+    # Kept for compatibility with existing launch scripts.
     p.add_argument("--kp-low", type=float, default=10.0)
     p.add_argument("--kd-low", type=float, default=0.5)
 
@@ -203,9 +206,13 @@ def main() -> int:
     signal.signal(signal.SIGINT,  _sig)
     signal.signal(signal.SIGTERM, _sig)
 
+    plot_state = None
+
     try:
         system = FACTRGravityCompensation(str(config_path),
                                           enable_visualization=False)
+        if system.driver is None:
+            raise RuntimeError("FACTR driver is not initialized")
         n = int(system.num_arm_joints)
 
         # ── Shi observer (current-based, works in position mode) ─────
@@ -238,7 +245,7 @@ def main() -> int:
         print(f"[{phase}] Settle in gravity comp for {args.prep_time}s …")
 
         plot_state = None if args.no_plot else _init_plot(args.mode,
-                                                          args.record_time)
+                                  args.record_time)
         plot_period = 1.0 / max(args.plot_rate, 1e-3)
         last_plot_t = time.time()
 
@@ -249,9 +256,15 @@ def main() -> int:
         # Variables set during phase transitions
         record_start_t = 0.0
         home_start_t   = 0.0
+        tare_start_t   = 0.0
         home_start_q   = np.zeros(n)
         target_q       = np.zeros(n)
         replay_start_t = 0.0
+        home_start_raw = np.zeros(system.num_motors)
+        target_raw = np.zeros(system.num_motors)
+        tare_samples: List[np.ndarray] = []
+        observer_tare = np.zeros(n)
+        observer_deadband = np.zeros(n)
 
         # Admittance state (initialised properly when entering REPLAY)
         q_c  = np.zeros(n)
@@ -303,11 +316,35 @@ def main() -> int:
 
                 if t_rel >= args.record_time:
                     phase = "HOME"
+                    print(f"[{phase}] Switching to position mode & returning "
+                          f"to start ({args.home_time}s) …")
+
+                    # Read raw positions before mode switch to avoid a jump.
+                    raw_pos_now = np.asarray(system.driver.get_joints(),
+                                             dtype=float)
+
+                    system.driver.set_torque_mode(False)
+                    time.sleep(0.02)
+                    system.driver.set_operating_mode(3)
+                    time.sleep(0.02)
+                    system.driver.set_torque_mode(True)
+
+                    # Immediately hold current raw position after switching.
+                    system.driver.set_joints(raw_pos_now.tolist())
+                    time.sleep(0.02)
+
                     home_start_t = t_now
                     home_start_q = q.copy()
+                    home_start_raw = raw_pos_now.copy()
                     target_q = trajectory_q[0][1]
-                    print(f"[{phase}] Returning to start for "
-                          f"{args.home_time}s …")
+
+                    target_raw = np.zeros(system.num_motors)
+                    target_raw[:n] = (
+                        target_q * system.joint_signs[:n]
+                        + system.joint_offsets[:n]
+                    )
+                    if system.num_motors > n:
+                        target_raw[-1] = raw_pos_now[-1]
 
             # ── PHASE: HOME ──────────────────────────────────────────
             elif phase == "HOME":
@@ -315,64 +352,43 @@ def main() -> int:
                 alpha_t = np.clip(t_rel / args.home_time, 0.0, 1.0)
                 # Minimum-jerk profile
                 s = 10*alpha_t**3 - 15*alpha_t**4 + 6*alpha_t**5
-                des_q = home_start_q + s * (target_q - home_start_q)
+                des_raw = home_start_raw + s * (target_raw - home_start_raw)
+                system.driver.set_joints(des_raw.tolist())
 
-                # tau_grav = system.gravity_compensation(q, dq)
-                tau_grav = system.gravity_compensation(q, np.zeros(n))
-                # tau_fric = system.friction_compensation(dq)
-
-                kp_vec = np.array([3.0, 3.0, 3.0, 1.5, 1.5, 1.0])
-                kd_vec = np.array([1.5, 1.5, 1.5, 0.8, 0.8, 0.5])
-                #tau_pd   = args.kp_low * (des_q - q) - args.kd_low * dq
-                tau_pd   = kp_vec * (des_q - q) - kd_vec * dq
-                tau_pd = np.clip(tau_pd, -0.8, 0.8)
-                tau_cmd  = tau_grav + tau_pd # + tau_fric
-                system.set_leader_joint_torque(tau_cmd, 0.0)
-
-                if t_rel >= args.home_time + 1.0:
-                    # -- transition to REPLAY --
-                    phase = "REPLAY"
-
-                    print("[REPLAY] Taring Shi observer (100 samples)...")
+                if t_rel >= args.home_time:
+                    phase = "TARE"
+                    tare_start_t = t_now
                     tare_samples = []
-                    for _ in range(100):
-                        q_t, dq_t, _, _ = system.get_leader_joint_states()
-                        c_all = system.driver.get_currents()
-                        c_arm = c_all[:n] * system.joint_signs[:n]
-                        tau_sample = shi.update(q_t, dq_t, c_arm)
-                        tare_samples.append(tau_sample.copy())
-                        time.sleep(1.0 / 300)
+                    print("[TARE] Holding position, calibrating observer (1s)...")
 
-                    observer_tare = np.mean(tare_samples, axis=0)
-                    print(f" Tare offsets: {[f'{x:+.3f}' for x in observer_tare]} Nm")
+            # ── PHASE: TARE ──────────────────────────────────────────
+            elif phase == "TARE":
+                t_rel = t_now - tare_start_t
 
-                    tare_std = np.std(tare_samples, axis=0)
+                system.driver.set_joints(target_raw.tolist())
+                tare_samples.append(tau_ext.copy())
+
+                if t_rel >= 1.0:
+                    tare_array = np.asarray(tare_samples, dtype=float)
+                    observer_tare = np.mean(tare_array, axis=0)
+                    tare_std = np.std(tare_array, axis=0)
                     observer_deadband = 2.0 * tare_std
-                    print(f" Deadband (2σ): {[f'{x:.3f}' for x in observer_deadband]} Nm")
 
+                    print(f"  Tare offset: {[f'{x:+.3f}' for x in observer_tare]} Nm")
+                    print(f"  Deadband 2σ: {[f'{x:.3f}' for x in observer_deadband]} Nm")
 
-                    print(f"[{phase}] Switching to POSITION MODE "
-                          "for admittance tracking.")
-
-                    # Switch Dynamixel to position mode
-                    system.driver.set_torque_mode(False)
-                    time.sleep(0.05)
-                    system.driver.set_operating_mode(3)
-                    time.sleep(0.05)
-                    system.driver.set_torque_mode(True)
-                    time.sleep(0.05)
-
-                    replay_start_t = time.time() - t_start
-
-                    # Reset observer so EMA starts clean in position mode
                     shi.reset()
 
-                    # Initialise admittance state at trajectory start
-                    q_c  = trajectory_q[0][1].copy()
+                    phase = "REPLAY"
+                    replay_start_t = time.time() - t_start
+
+                    q_c = trajectory_q[0][1].copy()
                     dq_c = np.zeros(n)
                     if args.mode == "task":
                         x_c, _ = compute_task_kinematics(system, q_c)
                         dx_c = np.zeros(3)
+
+                    print("[REPLAY] Admittance tracking active.")
 
             # ── PHASE: REPLAY (admittance loop) ──────────────────────
             elif phase == "REPLAY":
@@ -390,8 +406,6 @@ def main() -> int:
                 )
                 idx = min(idx, len(trajectory_q) - 1)
                 _, q_ref, dq_ref = trajectory_q[idx]
-
-                tau_ext = shi.update(q. dq. currents_arm)
 
                 tau_ext_compensated = tau_ext - observer_tare
 
@@ -505,8 +519,9 @@ def main() -> int:
             try:
                 system.set_leader_joint_torque(np.zeros(n), 0.0)
                 time.sleep(0.05)
-                system.driver.set_operating_mode(3)
-                time.sleep(0.05)
+                if system.driver is not None:
+                    system.driver.set_operating_mode(3)
+                    time.sleep(0.05)
                 system.shutdown()
             except Exception:
                 pass
