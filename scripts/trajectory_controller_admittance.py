@@ -713,19 +713,19 @@ def main() -> int:
 
                     q_c = trajectory_q[0][1].copy()
                     dq_c = np.zeros(n)
-                      q_ref_init_check = trajectory_q[0][1]
+                    q_ref_init_check = trajectory_q[0][1]
 
-                      # Initialization verification for q_c/q_ref consistency.
-                      init_dev = (q_c - q_ref_init_check) * 57.3
-                      print("  [INIT CHECK] q_c == q_ref[0]: "
+                    # Initialization verification for q_c/q_ref consistency.
+                    init_dev = (q_c - q_ref_init_check) * 57.3
+                    print("  [INIT CHECK] q_c == q_ref[0]: "
                           f"{np.allclose(q_c, q_ref_init_check)}")
-                      print("  [INIT CHECK] q_c (deg): "
+                    print("  [INIT CHECK] q_c (deg): "
                           f"[{' '.join(f'{x*57.3:+.1f}' for x in q_c)}]")
-                      print("  [INIT CHECK] q_ref[0] (deg): "
+                    print("  [INIT CHECK] q_ref[0] (deg): "
                           f"[{' '.join(f'{x*57.3:+.1f}' for x in q_ref_init_check)}]")
-                      print("  [INIT CHECK] deviation (deg): "
+                    print("  [INIT CHECK] deviation (deg): "
                           f"[{' '.join(f'{x:+.1f}' for x in init_dev)}]")
-                      print("  [INIT CHECK] traj len: "
+                    print("  [INIT CHECK] traj len: "
                           f"{len(trajectory_q)}, "
                           f"t_range: [{trajectory_q[0][0]:.4f}, "
                           f"{trajectory_q[-1][0]:.4f}]s")
@@ -753,20 +753,20 @@ def main() -> int:
                 idx = min(idx, len(trajectory_q) - 1)
                 _, q_ref, dq_ref = trajectory_q[idx]
 
-                    # First-step verification (runs once at REPLAY entry).
-                    if debug_counter == 0:
-                      print(f"  [REPLAY STEP 0] idx={idx}, t_rel={t_rel:.6f}s")
-                      print("  [REPLAY STEP 0] q_c (deg):   "
+                # First-step verification (runs once at REPLAY entry).
+                if debug_counter == 0:
+                    print(f"  [REPLAY STEP 0] idx={idx}, t_rel={t_rel:.6f}s")
+                    print("  [REPLAY STEP 0] q_c (deg):   "
                           f"[{' '.join(f'{x*57.3:+.1f}' for x in q_c)}]")
-                      print("  [REPLAY STEP 0] q_ref (deg): "
+                    print("  [REPLAY STEP 0] q_ref (deg): "
                           f"[{' '.join(f'{x*57.3:+.1f}' for x in q_ref)}]")
-                      print("  [REPLAY STEP 0] q_actual (deg): "
+                    print("  [REPLAY STEP 0] q_actual (deg): "
                           f"[{' '.join(f'{x*57.3:+.1f}' for x in q)}]")
-                      print("  [REPLAY STEP 0] q_c is q_ref: "
+                    print("  [REPLAY STEP 0] q_c is q_ref: "
                           f"{q_c is q_ref_init_check}, "
                           "q_ref is traj[0][1]: "
                           f"{q_ref is trajectory_q[0][1]}")
-                      print("  [REPLAY STEP 0] measured_dt: "
+                    print("  [REPLAY STEP 0] measured_dt: "
                           f"{measured_dt*1000:.2f}ms")
 
                 tau_ext_comp = tau_ext - observer_tare
