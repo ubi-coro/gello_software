@@ -872,12 +872,30 @@ def main() -> int:
 
                 debug_counter += 1
                 if debug_counter % 30 == 1:
+                    q_ref_arr = np.asarray(q_ref, dtype=float)
+                    q_c_arr = np.asarray(q_c, dtype=float)
+                    same_joint_dim = q_ref_arr.shape == q_c_arr.shape
+                    if same_joint_dim:
+                        # Paranoid check to verify the exact q_c-q_ref state at print time.
+                        _check_dev = (q_c_arr - q_ref_arr) * 57.3
+                        _check_max = float(np.max(np.abs(_check_dev)))
+                        if _check_max > 1.0 and debug_counter <= 2:
+                            print(f"  [BUG?] q_c     = {q_c_arr}")
+                            print(f"  [BUG?] q_ref   = {q_ref_arr}")
+                            print(f"  [BUG?] q_c-ref = {_check_dev}")
+                            print(f"  [BUG?] q_ref is traj[{idx}][1]: "
+                                  f"{q_ref is trajectory_q[idx][1]}")
+                            print(f"  [BUG?] id(q_c)={id(q_c)}, id(q_ref)={id(q_ref)}")
+                        dq_deg_str = ' '.join(f'{x:+5.1f}' for x in _check_dev)
+                    else:
+                        dq_deg_str = "n/a(mode=task)"
+
                     print(
                         f"  [t={t_rel:5.2f}] "
                         f"d={[f'{int(x):+d}' for x in shi.d_prev]}  "
                         f"tau_raw=[{' '.join(f'{x:+.3f}' for x in tau_ext)}]  "
                         f"tau_comp=[{' '.join(f'{x:+.3f}' for x in tau_ext_comp)}]  "
-                        f"dq_deg=[{' '.join(f'{(q_c[i]-q_ref[i])*57.3:+5.1f}' for i in range(n))}]"
+                        f"dq_deg=[{dq_deg_str}]"
                     )
 
                 # --- Live plot ---
