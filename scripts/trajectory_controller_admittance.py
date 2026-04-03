@@ -149,6 +149,303 @@ def compute_task_kinematics(system: FACTRGravityCompensation, q: np.ndarray):
     return x, J_full[:3, :n]
 
 
+# ── THESIS PLOT GENERATION ───────────────────────────────────────────
+
+def save_thesis_plots(
+    *,
+    t: np.ndarray,
+    tau_raw: np.ndarray,
+    tau_comp: np.ndarray,
+    d_prev: np.ndarray,
+    q_ref: np.ndarray,
+    q_act: np.ndarray,
+    q_c: np.ndarray,
+    currents: np.ndarray,
+    tare_offset: np.ndarray,
+    tare_std: np.ndarray,
+    deadband: np.ndarray,
+    tau_clamp: np.ndarray,
+    tare_samples: Optional[np.ndarray],
+    motor_kt: np.ndarray,
+    motor_gear_ratio: np.ndarray,
+    motor_eta: np.ndarray,
+    n_joints: int,
+    ts_str: str,
+) -> list:
+    """Generate publication-quality SVG figures for thesis.
+
+    Produces:
+      1. 4-panel replay failure analysis
+      2. Tare offset bar chart
+      3. eta-mechanism detail for J3
+    """
+    if plt is None:
+        print("matplotlib not available - skipping thesis plots.")
+        return []
+
+    saved: list = []
+
+    plt.rcParams.update({
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.titleweight": "bold",
+        "axes.labelsize": 11,
+        "legend.fontsize": 8.5,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "axes.linewidth": 1.0,
+        "lines.linewidth": 1.3,
+        "grid.linewidth": 0.5,
+        "grid.alpha": 0.25,
+        "figure.dpi": 150,
+        "savefig.dpi": 150,
+        "mathtext.default": "regular",
+    })
+
+    colors = [
+        "#1f77b4", "#ff7f0e", "#2ca02c",
+        "#d62728", "#9467bd", "#8c564b",
+    ][:n_joints]
+    labels = [f"J{i+1}" for i in range(n_joints)]
+    full_labels = [
+        "J1 (Base)", "J2 (Shoulder)", "J3 (Elbow)",
+        "J4 (Wrist 1)", "J5 (Wrist 2)", "J6 (Wrist 3)",
+    ][:n_joints]
+
+    n_samples = len(t)
+    if n_samples < 5:
+        print("Not enough REPLAY samples for thesis plots.")
+        return []
+
+    # FIGURE 1: Observer Failure Analysis (4 panels)
+    fig1, axes1 = plt.subplots(
+        4, 1,
+        figsize=(7.0, 9.5),
+        sharex=True,
+        gridspec_kw={"height_ratios": [2.5, 2.5, 1.0, 2.5], "hspace": 0.08},
+    )
+
+    ax = axes1[0]
+    for i in range(n_joints):
+        ax.plot(t, tau_raw[:, i], color=colors[i], label=labels[i], lw=1.3)
+    ax.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
+    j3_db = deadband[2] if n_joints > 2 else 0.3
+    ax.axhspan(-j3_db, +j3_db, color="#4CAF50", alpha=0.08,
+               label=f"Deadband J3 (+/-{j3_db:.2f})")
+    ax.set_ylabel(r"$\hat{\tau}_{\mathrm{ext}}$  (Nm)")
+    ax.set_title("(a)  Raw Shi Observer Output", loc="left")
+    ax.legend(ncol=4, loc="upper right", framealpha=0.85, edgecolor="none")
+    ax.grid(True, ls="--")
+
+    ax = axes1[1]
+    for i in range(n_joints):
+        ax.plot(t, tau_comp[:, i], color=colors[i], label=labels[i], lw=1.3)
+    clamp_max = float(np.max(tau_clamp[:3]))
+    ax.axhline(+clamp_max, color="grey", ls=":", lw=1.0, alpha=0.6,
+               label=f"Clamp +/-{clamp_max:.2f}")
+    ax.axhline(-clamp_max, color="grey", ls=":", lw=1.0, alpha=0.6)
+    ax.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
+    ax.set_ylabel(r"$\hat{\tau}_{\mathrm{ext,filt}}$  (Nm)")
+    ax.set_title("(b)  After Tare + Deadband + Rate Limit + Clamp", loc="left")
+    ax.legend(ncol=4, loc="upper right", framealpha=0.85, edgecolor="none")
+    ax.grid(True, ls="--")
+
+    ax = axes1[2]
+    for i in range(n_joints):
+        ax.step(t, d_prev[:, i], where="post", color=colors[i],
+                label=labels[i], lw=1.0, alpha=0.85)
+    ax.set_ylabel("d")
+    ax.set_yticks([-1, 1])
+    ax.set_yticklabels(["-1 (bwd)", "+1 (fwd)"])
+    ax.set_ylim(-1.6, 1.6)
+    ax.set_title(
+        r"(c)  Drive Direction  ($\eta_{\mathrm{fwd}}$ vs. "
+        r"$\eta_{\mathrm{bwd}}^{-1}$  Selection)",
+        loc="left",
+    )
+    ax.grid(True, ls="--")
+
+    ax = axes1[3]
+    n_min = min(q_c.shape[0], q_ref.shape[0])
+    dev_deg = (q_c[:n_min] - q_ref[:n_min]) * (180.0 / np.pi)
+    t_dev = t[:n_min]
+    for i in range(n_joints):
+        ax.plot(t_dev, dev_deg[:, i], color=colors[i], label=labels[i], lw=1.3)
+    ax.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
+    ax.set_ylabel(r"$q_c - q_{\mathrm{ref}}$  (deg)")
+    ax.set_xlabel("Time  (s)")
+    ax.set_title("(d)  Admittance Output Deviation from Reference", loc="left")
+    ax.legend(ncol=3, loc="upper right", framealpha=0.85, edgecolor="none")
+    ax.grid(True, ls="--")
+
+    fig1.tight_layout()
+    fname1 = f"shi_observer_replay_analysis_{ts_str}.svg"
+    fig1.savefig(fname1, format="svg", bbox_inches="tight")
+    plt.close(fig1)
+    saved.append(fname1)
+    print(f"  Saved -> {fname1}")
+
+    # FIGURE 2: Observer Tare Offset (bar chart)
+    fig2, ax2 = plt.subplots(figsize=(6.0, 3.2))
+    x_pos = np.arange(n_joints)
+    bar_w = 0.50
+
+    ax2.bar(
+        x_pos, tare_offset, bar_w,
+        yerr=3.0 * tare_std,
+        capsize=5, ecolor="#555555",
+        color=colors, edgecolor="black", linewidth=0.6,
+        zorder=3,
+    )
+
+    for i in range(n_joints):
+        ax2.plot(
+            [i - bar_w / 2 - 0.05, i + bar_w / 2 + 0.05],
+            [+deadband[i]] * 2,
+            color="#E53935", ls="--", lw=1.2, zorder=4,
+        )
+        ax2.plot(
+            [i - bar_w / 2 - 0.05, i + bar_w / 2 + 0.05],
+            [-deadband[i]] * 2,
+            color="#E53935", ls="--", lw=1.2, zorder=4,
+        )
+
+    proxy = ax2.plot([], [], color="#E53935", ls="--", lw=1.2,
+                     label="Applied Deadband")[0]
+    ax2.legend(handles=[proxy], loc="upper left", framealpha=0.85)
+
+    ax2.axhline(0, color="k", ls="-", lw=0.5)
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels(full_labels, fontsize=9)
+    ax2.set_ylabel("Torque  (Nm)")
+    ax2.set_title("Observer Tare Offset at Rest  (error bars: 3sigma)",
+                  fontweight="bold")
+    ax2.grid(True, axis="y", ls="--")
+    fig2.tight_layout()
+    fname2 = f"shi_observer_tare_offsets_{ts_str}.svg"
+    fig2.savefig(fname2, format="svg", bbox_inches="tight")
+    plt.close(fig2)
+    saved.append(fname2)
+    print(f"  Saved -> {fname2}")
+
+    # FIGURE 3: eta-mechanism detail for J3 (XM430)
+    j = 2
+    if n_joints > j and currents.shape[0] == n_samples:
+        fig3, axes3 = plt.subplots(
+            4, 1,
+            figsize=(7.0, 8.0),
+            sharex=True,
+            gridspec_kw={"height_ratios": [1.5, 0.8, 2.0, 2.0], "hspace": 0.10},
+        )
+        c3 = colors[j]
+
+        ax = axes3[0]
+        i_ma = currents[:, j]
+        ax.plot(t, i_ma, color=c3, lw=1.0)
+        ax.set_ylabel("Current  (mA)")
+        ax.set_title(
+            f"(a)  Motor Current - {full_labels[j]} (XM430, r = {motor_gear_ratio[j]:.0f}:1)",
+            loc="left",
+        )
+        ax.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
+        ax.grid(True, ls="--")
+
+        ax = axes3[1]
+        ax.step(t, d_prev[:, j], where="post", color=c3, lw=1.2)
+        ax.set_ylabel("d")
+        ax.set_yticks([-1, 1])
+        ax.set_yticklabels(["-1", "+1"])
+        ax.set_ylim(-1.6, 1.6)
+        ax.set_title("(b)  Drive Direction", loc="left")
+        ax.grid(True, ls="--")
+
+        ax = axes3[2]
+        i_a = i_ma / 1000.0
+        tau_motor = motor_kt[j] * i_a
+        d_j = d_prev[:, j]
+        eta_j = motor_eta[j]
+        r_j = motor_gear_ratio[j]
+
+        eta_eff = np.where(d_j > 0, eta_j, 1.0 / eta_j)
+        tau_output = r_j * eta_eff * tau_motor
+        tau_output_fwd = r_j * eta_j * tau_motor
+        tau_output_bwd = r_j * (1.0 / eta_j) * tau_motor
+
+        ax.fill_between(
+            t, tau_output_fwd, tau_output_bwd,
+            alpha=0.12, color=c3,
+            label=(
+                f"Range eta={eta_j:.2f} vs. 1/eta={1.0/eta_j:.2f} "
+                f"(ratio {(1.0/eta_j)/eta_j:.1f}:1)"
+            ),
+        )
+        ax.plot(t, tau_output, color=c3, lw=1.3,
+                label=r"$\tau_{\mathrm{output}}$ (actual eta selection)")
+        ax.set_ylabel(r"$\tau_{\mathrm{output}}$  (Nm)")
+        ax.set_title(
+            r"(c)  Output Torque  "
+            r"$\tau_{\mathrm{out}} = r \cdot \eta_{\mathrm{eff}} \cdot K_t \cdot I$",
+            loc="left",
+        )
+        ax.legend(loc="upper right", framealpha=0.85, edgecolor="none", fontsize=8)
+        ax.grid(True, ls="--")
+
+        ax = axes3[3]
+        ax.plot(t, tau_raw[:, j], color=c3, lw=1.3,
+                label=r"$\hat{\tau}_{\mathrm{ext}}$ (raw)")
+        ax.axhline(
+            tare_offset[j], color="grey", ls=":", lw=1.0,
+            label=f"Tare ({tare_offset[j]:+.3f} Nm)",
+        )
+        ax.axhspan(
+            -deadband[j], +deadband[j],
+            color="#4CAF50", alpha=0.10,
+            label=f"Deadband (+/-{deadband[j]:.2f} Nm)",
+        )
+        ax.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
+        ax.set_ylabel(r"$\hat{\tau}_{\mathrm{ext}}$  (Nm)")
+        ax.set_xlabel("Time  (s)")
+        ax.set_title(
+            r"(d)  Estimated External Torque  "
+            r"$\hat{\tau}_{\mathrm{ext}} = -(\tau_{\mathrm{out}} - \tau_{\mathrm{grav}})$",
+            loc="left",
+        )
+        ax.legend(loc="lower right", framealpha=0.85, edgecolor="none", fontsize=8)
+        ax.grid(True, ls="--")
+
+        fig3.tight_layout()
+        fname3 = f"shi_observer_eta_detail_J3_{ts_str}.svg"
+        fig3.savefig(fname3, format="svg", bbox_inches="tight")
+        plt.close(fig3)
+        saved.append(fname3)
+        print(f"  Saved -> {fname3}")
+
+    # FIGURE 4: Tare sample time series
+    if tare_samples is not None and tare_samples.shape[0] > 10:
+        fig4, ax4 = plt.subplots(figsize=(6.0, 3.5))
+        t_tare = np.arange(tare_samples.shape[0]) / 300.0
+        for i in range(n_joints):
+            ax4.plot(t_tare, tare_samples[:, i],
+                     color=colors[i], lw=0.8, alpha=0.8,
+                     label=labels[i])
+        ax4.set_xlabel("Time during TARE phase  (s)")
+        ax4.set_ylabel(r"$\hat{\tau}_{\mathrm{ext}}$  (Nm)")
+        ax4.set_title("Observer Output During Stationary Hold (TARE Phase)",
+                      fontweight="bold")
+        ax4.legend(ncol=3, loc="upper right", framealpha=0.85, edgecolor="none")
+        ax4.grid(True, ls="--")
+        fig4.tight_layout()
+        fname4 = f"shi_observer_tare_timeseries_{ts_str}.svg"
+        fig4.savefig(fname4, format="svg", bbox_inches="tight")
+        plt.close(fig4)
+        saved.append(fname4)
+        print(f"  Saved -> {fname4}")
+
+    return saved
+
+
 # ── CLI ──────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
@@ -177,6 +474,11 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--plot-rate", type=float, default=10.0)
     p.add_argument("--no-plot",   action="store_true")
+    p.add_argument("--thesis-plots", dest="thesis_plots", action="store_true",
+                   default=True,
+                   help="Enable thesis plot generation at shutdown (default: enabled)")
+    p.add_argument("--no-thesis-plots", dest="thesis_plots", action="store_false",
+                   help="Disable thesis plot generation at shutdown")
     return p.parse_args()
 
 
@@ -208,6 +510,19 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _sig)
 
     plot_state = None
+    tau_raw_buf: deque = deque()
+    tau_comp_buf: deque = deque()
+    d_prev_buf: deque = deque()
+    qc_buf: deque = deque()
+    curr_buf: deque = deque()
+    t_buf: deque = deque()
+    ref_buf: deque = deque()
+    act_buf: deque = deque()
+    tare_samples_for_plot: Optional[np.ndarray] = None
+    observer_tare = np.zeros(n)
+    observer_deadband = np.zeros(n)
+    tau_ext_max = np.zeros(n)
+    shi: Optional[MinimalistTorqueEstimator] = None
 
     try:
         system = FACTRGravityCompensation(str(config_path),
@@ -253,6 +568,16 @@ def main() -> int:
         t_buf   = deque(maxlen=int(args.record_time * 500))
         ref_buf = deque(maxlen=int(args.record_time * 500))
         act_buf = deque(maxlen=int(args.record_time * 500))
+
+        # ── THESIS PLOT BUFFERS (Replay phase) ───────────────────
+        tau_raw_buf = deque(maxlen=int(args.record_time * 500))
+        tau_comp_buf = deque(maxlen=int(args.record_time * 500))
+        d_prev_buf = deque(maxlen=int(args.record_time * 500))
+        qc_buf = deque(maxlen=int(args.record_time * 500))
+        curr_buf = deque(maxlen=int(args.record_time * 500))
+
+        # Tare analysis storage (filled during TARE phase)
+        tare_samples_for_plot = None
 
         # Variables set during phase transitions
         record_start_t = 0.0
@@ -397,6 +722,9 @@ def main() -> int:
                         )
                     observer_deadband = np.maximum(3.0 * tare_std, min_deadband)
 
+                    # ── THESIS: store full tare array for plotting ─
+                    tare_samples_for_plot = tare_array.copy()
+
                     print(f"  Tare offset: {[f'{x:+.3f}' for x in observer_tare]} Nm")
                     print(f"  Deadband 3σ+min: {[f'{x:.3f}' for x in observer_deadband]} Nm")
 
@@ -458,6 +786,13 @@ def main() -> int:
 
                 tau_ext_comp = np.clip(tau_ext_comp, -tau_ext_max, tau_ext_max)
 
+                # ── THESIS LOGGING ───────────────────────────────
+                tau_raw_buf.append(tau_ext.copy())
+                tau_comp_buf.append(tau_ext_comp.copy())
+                d_prev_buf.append(shi.d_prev.copy())
+                curr_buf.append(currents_arm.copy())
+                # q_c is logged after admittance dynamics.
+
                 # --- Joint-Space Admittance ---
                 if args.mode == "joint":
                     ddq_c = (
@@ -476,6 +811,9 @@ def main() -> int:
                         system.arm_joint_limits_min,
                         system.arm_joint_limits_max,
                     )
+
+                    # ── THESIS: log q_c after dynamics ───────────
+                    qc_buf.append(q_c.copy())
 
                     t_buf.append(t_rel)
                     ref_buf.append(q_ref.copy())
@@ -508,6 +846,9 @@ def main() -> int:
                         system.arm_joint_limits_min,
                         system.arm_joint_limits_max,
                     )
+
+                    # ── THESIS: log q_c after dynamics ───────────
+                    qc_buf.append(q_c.copy())
 
                     t_buf.append(t_rel)
                     ref_buf.append(x_ref.copy())
@@ -578,13 +919,71 @@ def main() -> int:
             except Exception:
                 pass
 
+        safe_t_buf = t_buf
+        safe_ref_buf = ref_buf
+        safe_act_buf = act_buf
+        safe_shi = shi
+
+        # ── THESIS PLOT GENERATION ───────────────────────────
+        if args.thesis_plots and plt is not None and len(tau_raw_buf) > 10:
+            try:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                print(f"\nGenerating thesis plots ({len(tau_raw_buf)} samples)...")
+
+                t_arr = np.asarray(safe_t_buf, dtype=float)
+                tau_raw_arr = np.asarray(tau_raw_buf, dtype=float)
+                tau_comp_arr = np.asarray(tau_comp_buf, dtype=float)
+                d_prev_arr = np.asarray(d_prev_buf, dtype=float)
+                q_ref_arr = np.asarray(safe_ref_buf, dtype=float)
+                q_act_arr = np.asarray(safe_act_buf, dtype=float)
+                q_c_arr = np.asarray(qc_buf, dtype=float)
+                curr_arr = np.asarray(curr_buf, dtype=float)
+
+                if safe_shi is None:
+                    raise RuntimeError("Shi observer not initialized")
+                m_kt = safe_shi.kt[:n].copy()
+                m_gr = safe_shi.gear_ratio[:n].copy()
+                m_eta = safe_shi.eta[:n].copy()
+
+                files = save_thesis_plots(
+                    t=t_arr,
+                    tau_raw=tau_raw_arr,
+                    tau_comp=tau_comp_arr,
+                    d_prev=d_prev_arr,
+                    q_ref=q_ref_arr,
+                    q_act=q_act_arr,
+                    q_c=q_c_arr,
+                    currents=curr_arr,
+                    tare_offset=observer_tare,
+                    tare_std=(
+                        np.std(tare_samples_for_plot, axis=0)
+                        if tare_samples_for_plot is not None
+                        else np.zeros(n)
+                    ),
+                    deadband=observer_deadband,
+                    tau_clamp=tau_ext_max,
+                    tare_samples=tare_samples_for_plot,
+                    motor_kt=m_kt,
+                    motor_gear_ratio=m_gr,
+                    motor_eta=m_eta,
+                    n_joints=n,
+                    ts_str=ts,
+                )
+                print(f"Generated {len(files)} thesis plots.")
+
+            except Exception as e:
+                print(f"Thesis plot generation failed: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # ── Legacy live-plot save (if enabled) ───────────────
         if plt is not None:
             if "plot_state" in dir() and plot_state is not None:
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                path = f"trajectory_admittance_{args.mode}_{ts}.svg"
+                ts_legacy = time.strftime("%Y%m%d_%H%M%S")
+                path = f"trajectory_admittance_{args.mode}_{ts_legacy}.svg"
                 plot_state["fig"].savefig(path, format="svg",
                                           bbox_inches="tight")
-                print(f"\nSaved plot → {path}")
+                print(f"Saved live plot -> {path}")
             plt.ioff()
             plt.close("all")
 
