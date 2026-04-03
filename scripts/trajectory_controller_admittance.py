@@ -730,6 +730,19 @@ def main() -> int:
                           f"t_range: [{trajectory_q[0][0]:.4f}, "
                           f"{trajectory_q[-1][0]:.4f}]s")
 
+                    print("  [LIMITS] arm_joint_limits_min (deg): "
+                        f"[{' '.join(f'{x*57.3:+.1f}' for x in system.arm_joint_limits_min)}]")
+                    print("  [LIMITS] arm_joint_limits_max (deg): "
+                        f"[{' '.join(f'{x*57.3:+.1f}' for x in system.arm_joint_limits_max)}]")
+                    print("  [LIMITS] q_c at start (deg):         "
+                        f"[{' '.join(f'{x*57.3:+.1f}' for x in q_c)}]")
+                    below_min = q_c < system.arm_joint_limits_min
+                    above_max = q_c > system.arm_joint_limits_max
+                    if np.any(below_min) or np.any(above_max):
+                        print("  [LIMITS] WARNING: q_c OUTSIDE joint limits")
+                        print(f"  [LIMITS] Below min indices: {np.where(below_min)[0].tolist()}")
+                        print(f"  [LIMITS] Above max indices: {np.where(above_max)[0].tolist()}")
+
                     if args.mode == "task":
                         x_c, _ = compute_task_kinematics(system, q_c)
                         dx_c = np.zeros(3)
@@ -806,13 +819,6 @@ def main() -> int:
                     dq_c = leak * dq_c + ddq_c * measured_dt
                     q_c  = q_c  + dq_c  * measured_dt
 
-                    # Safety clamp — stay within joint limits
-                    q_c = np.clip(
-                        q_c,
-                        system.arm_joint_limits_min,
-                        system.arm_joint_limits_max,
-                    )
-
                     # ── THESIS: log q_c after dynamics ───────────
                     qc_buf.append(q_c.copy())
 
@@ -841,12 +847,6 @@ def main() -> int:
                     # Differential IK  dq = J^+ dx
                     dq_c_des = np.linalg.pinv(J_act) @ dx_c
                     q_c = q_c + dq_c_des * measured_dt
-
-                    q_c = np.clip(
-                        q_c,
-                        system.arm_joint_limits_min,
-                        system.arm_joint_limits_max,
-                    )
 
                     # ── THESIS: log q_c after dynamics ───────────
                     qc_buf.append(q_c.copy())
