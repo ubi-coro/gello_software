@@ -652,6 +652,16 @@ def main() -> int:
                     if system.num_motors > n:
                         target_raw[-1] = raw_pos_now[-1]
 
+                    # Ensure HOME interpolation takes the shortest angular path.
+                    for i in range(n):
+                        delta = target_raw[i] - home_start_raw[i]
+                        while delta > np.pi:
+                            target_raw[i] -= 2.0 * np.pi
+                            delta -= 2.0 * np.pi
+                        while delta < -np.pi:
+                            target_raw[i] += 2.0 * np.pi
+                            delta += 2.0 * np.pi
+
             # ── PHASE: HOME ──────────────────────────────────────────
             elif phase == "HOME":
                 t_rel = t_now - home_start_t

@@ -282,6 +282,17 @@ def main() -> int:
                     home_start_t = t_now
                     home_start_q = q.copy()
                     target_q = trajectory_q[0][1].copy()
+
+                    # Ensure HOME interpolation takes the shortest angular path.
+                    for i in range(n):
+                        delta = target_q[i] - home_start_q[i]
+                        while delta > np.pi:
+                            target_q[i] -= 2.0 * np.pi
+                            delta -= 2.0 * np.pi
+                        while delta < -np.pi:
+                            target_q[i] += 2.0 * np.pi
+                            delta += 2.0 * np.pi
+
                     print(f"[HOME] Returning to start ({args.home_time}s)")
 
             elif phase == "HOME":
@@ -365,7 +376,11 @@ def main() -> int:
                 if debug_counter % 30 == 1:
                     if args.mode == "joint":
                         err_terms = q - q_ref
-                        tau_print = tau_pd
+                        tau_print = np.clip(
+                            kp * (q_ref - q) + kd * (dq_ref - dq),
+                            -tau_max,
+                            tau_max,
+                        )
                         err_str = " ".join(f"{e*57.3:+5.1f}deg" for e in err_terms)
                         tau_str = " ".join(f"{t:+.2f}" for t in tau_print)
                         print(f"  [t={t_rel:5.2f}] err=[{err_str}]  tau_pd=[{tau_str}]")
