@@ -175,10 +175,12 @@ def save_thesis_plots(
     """Generate publication-quality SVG figures for thesis.
 
     Produces:
-      1. 4-panel replay failure analysis
+      1. Observer failure during replay (2-panel: τ_ext raw + Δq)
       2. Tare offset bar chart
-      3. eta-mechanism detail for J3
+      3. η-mechanism detail for J3 (2-panel: current + τ_ext)
     """
+    del tau_comp, q_act, tau_clamp, tare_samples
+
     if plt is None:
         print("matplotlib not available - skipping thesis plots.")
         return []
@@ -192,11 +194,11 @@ def save_thesis_plots(
         "axes.titlesize": 11,
         "axes.titleweight": "bold",
         "axes.labelsize": 11,
-        "legend.fontsize": 8.5,
+        "legend.fontsize": 9,
         "xtick.labelsize": 9,
         "ytick.labelsize": 9,
         "axes.linewidth": 1.0,
-        "lines.linewidth": 1.3,
+        "lines.linewidth": 1.4,
         "grid.linewidth": 0.5,
         "grid.alpha": 0.25,
         "figure.dpi": 150,
@@ -204,12 +206,12 @@ def save_thesis_plots(
         "mathtext.default": "regular",
     })
 
-    colors = [
-        "#1f77b4", "#ff7f0e", "#2ca02c",
-        "#d62728", "#9467bd", "#8c564b",
-    ][:n_joints]
-    labels = [f"J{i+1}" for i in range(n_joints)]
-    full_labels = [
+    colors = {
+        "J1": "#1f77b4", "J2": "#ff7f0e", "J3": "#2ca02c",
+        "J4": "#d62728", "J5": "#9467bd", "J6": "#8c564b",
+    }
+    joint_labels = [f"J{i+1}" for i in range(n_joints)]
+    joint_labels_full = [
         "J1 (Base)", "J2 (Shoulder)", "J3 (Elbow)",
         "J4 (Wrist 1)", "J5 (Wrist 2)", "J6 (Wrist 3)",
     ][:n_joints]
@@ -219,109 +221,105 @@ def save_thesis_plots(
         print("Not enough REPLAY samples for thesis plots.")
         return []
 
-    # FIGURE 1: Observer Failure Analysis (4 panels)
-    fig1, axes1 = plt.subplots(
-        4, 1,
-        figsize=(7.0, 9.5),
-        sharex=True,
-        gridspec_kw={"height_ratios": [2.5, 2.5, 1.0, 2.5], "hspace": 0.08},
+    c_list = [colors[f"J{i+1}"] for i in range(n_joints)]
+
+    # FIGURE 1: Observer failure analysis (2 panels)
+    fig1, (ax1a, ax1b) = plt.subplots(
+        2, 1, figsize=(7.0, 5.0), sharex=True,
+        gridspec_kw={"height_ratios": [1.2, 1.0], "hspace": 0.12},
     )
 
-    ax = axes1[0]
     for i in range(n_joints):
-        ax.plot(t, tau_raw[:, i], color=colors[i], label=labels[i], lw=1.3)
-    ax.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
-    j3_db = deadband[2] if n_joints > 2 else 0.3
-    ax.axhspan(-j3_db, +j3_db, color="#4CAF50", alpha=0.08,
-               label=f"Deadband J3 (+/-{j3_db:.2f})")
-    ax.set_ylabel(r"$\hat{\tau}_{\mathrm{ext}}$  (Nm)")
-    ax.set_title("(a)  Raw Shi Observer Output", loc="left")
-    ax.legend(ncol=4, loc="upper right", framealpha=0.85, edgecolor="none")
-    ax.grid(True, ls="--")
+        lw = 1.8 if i in (1, 2) else 0.9
+        alpha = 1.0 if i in (1, 2) else 0.35
+        ax1a.plot(t, tau_raw[:, i], color=c_list[i], lw=lw, alpha=alpha,
+                  label=joint_labels[i])
 
-    ax = axes1[1]
-    for i in range(n_joints):
-        ax.plot(t, tau_comp[:, i], color=colors[i], label=labels[i], lw=1.3)
-    clamp_max = float(np.max(tau_clamp[:3]))
-    ax.axhline(+clamp_max, color="grey", ls=":", lw=1.0, alpha=0.6,
-               label=f"Clamp +/-{clamp_max:.2f}")
-    ax.axhline(-clamp_max, color="grey", ls=":", lw=1.0, alpha=0.6)
-    ax.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
-    ax.set_ylabel(r"$\hat{\tau}_{\mathrm{ext,filt}}$  (Nm)")
-    ax.set_title("(b)  After Tare + Deadband + Rate Limit + Clamp", loc="left")
-    ax.legend(ncol=4, loc="upper right", framealpha=0.85, edgecolor="none")
-    ax.grid(True, ls="--")
+    ax1a.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
 
-    ax = axes1[2]
-    for i in range(n_joints):
-        ax.step(t, d_prev[:, i], where="post", color=colors[i],
-                label=labels[i], lw=1.0, alpha=0.85)
-    ax.set_ylabel("d")
-    ax.set_yticks([-1, 1])
-    ax.set_yticklabels(["-1 (bwd)", "+1 (fwd)"])
-    ax.set_ylim(-1.6, 1.6)
-    ax.set_title(
-        r"(c)  Drive Direction  ($\eta_{\mathrm{fwd}}$ vs. "
-        r"$\eta_{\mathrm{bwd}}^{-1}$  Selection)",
-        loc="left",
-    )
-    ax.grid(True, ls="--")
+    for j_idx, j_name in [(1, "J2"), (2, "J3")]:
+        if j_idx >= n_joints:
+            continue
+        peak_idx = int(np.argmax(np.abs(tau_raw[:, j_idx])))
+        peak_val = float(tau_raw[peak_idx, j_idx])
+        peak_t = float(t[peak_idx])
+        ax1a.annotate(
+            f"{j_name}: {peak_val:+.1f} Nm",
+            xy=(peak_t, peak_val),
+            xytext=(peak_t + 0.3, peak_val + 0.3 * np.sign(peak_val)),
+            fontsize=8.5,
+            color=c_list[j_idx],
+            fontweight="bold",
+            arrowprops={"arrowstyle": "->", "color": c_list[j_idx], "lw": 1.2},
+        )
 
-    ax = axes1[3]
-    n_min = min(q_c.shape[0], q_ref.shape[0])
+    ax1a.set_ylabel(r"$\hat{\tau}_{\mathrm{ext}}$  (Nm)")
+    ax1a.set_title("(a)  Raw Shi Observer Output During Trajectory Replay", loc="left")
+    ax1a.legend(ncol=6, loc="upper right", framealpha=0.9, edgecolor="none", fontsize=8)
+    ax1a.grid(True, ls="--")
+
+    n_min = min(q_c.shape[0], q_ref.shape[0], n_samples)
     dev_deg = (q_c[:n_min] - q_ref[:n_min]) * (180.0 / np.pi)
     t_dev = t[:n_min]
-    for i in range(n_joints):
-        ax.plot(t_dev, dev_deg[:, i], color=colors[i], label=labels[i], lw=1.3)
-    ax.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
-    ax.set_ylabel(r"$q_c - q_{\mathrm{ref}}$  (deg)")
-    ax.set_xlabel("Time  (s)")
-    ax.set_title("(d)  Admittance Output Deviation from Reference", loc="left")
-    ax.legend(ncol=3, loc="upper right", framealpha=0.85, edgecolor="none")
-    ax.grid(True, ls="--")
 
+    for i in range(n_joints):
+        lw = 1.8 if i in (1, 2) else 0.9
+        alpha = 1.0 if i in (1, 2) else 0.35
+        ax1b.plot(t_dev, dev_deg[:, i], color=c_list[i], lw=lw, alpha=alpha,
+                  label=joint_labels[i])
+
+    ax1b.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
+    ax1b.set_ylabel(r"$q_c - q_{\mathrm{ref}}$  (deg)")
+    ax1b.set_xlabel("Time  (s)")
+    ax1b.set_title("(b)  Resulting Admittance Output Deviation", loc="left")
+    ax1b.legend(ncol=6, loc="upper right", framealpha=0.9, edgecolor="none", fontsize=8)
+    ax1b.grid(True, ls="--")
+
+    fig1.align_ylabels([ax1a, ax1b])
     fig1.tight_layout()
-    fname1 = f"shi_observer_replay_analysis_{ts_str}.svg"
+    fname1 = f"shi_observer_replay_failure_{ts_str}.svg"
     fig1.savefig(fname1, format="svg", bbox_inches="tight")
     plt.close(fig1)
     saved.append(fname1)
     print(f"  Saved -> {fname1}")
 
-    # FIGURE 2: Observer Tare Offset (bar chart)
-    fig2, ax2 = plt.subplots(figsize=(6.0, 3.2))
+    # FIGURE 2: Tare offset bar chart
+    fig2, ax2 = plt.subplots(figsize=(5.5, 3.0))
     x_pos = np.arange(n_joints)
-    bar_w = 0.50
+    bar_w = 0.55
 
     ax2.bar(
         x_pos, tare_offset, bar_w,
         yerr=3.0 * tare_std,
-        capsize=5, ecolor="#555555",
-        color=colors, edgecolor="black", linewidth=0.6,
+        capsize=4,
+        ecolor="#555555",
+        color=c_list,
+        edgecolor="black",
+        linewidth=0.6,
         zorder=3,
     )
 
     for i in range(n_joints):
         ax2.plot(
-            [i - bar_w / 2 - 0.05, i + bar_w / 2 + 0.05],
+            [i - bar_w / 2 - 0.08, i + bar_w / 2 + 0.08],
             [+deadband[i]] * 2,
-            color="#E53935", ls="--", lw=1.2, zorder=4,
+            color="#E53935", ls="--", lw=1.1, zorder=4,
         )
         ax2.plot(
-            [i - bar_w / 2 - 0.05, i + bar_w / 2 + 0.05],
+            [i - bar_w / 2 - 0.08, i + bar_w / 2 + 0.08],
             [-deadband[i]] * 2,
-            color="#E53935", ls="--", lw=1.2, zorder=4,
+            color="#E53935", ls="--", lw=1.1, zorder=4,
         )
 
     proxy = ax2.plot([], [], color="#E53935", ls="--", lw=1.2,
                      label="Applied Deadband")[0]
-    ax2.legend(handles=[proxy], loc="upper left", framealpha=0.85)
+    ax2.legend(handles=[proxy], loc="upper left", framealpha=0.9)
 
     ax2.axhline(0, color="k", ls="-", lw=0.5)
     ax2.set_xticks(x_pos)
-    ax2.set_xticklabels(full_labels, fontsize=9)
+    ax2.set_xticklabels(joint_labels_full, fontsize=9)
     ax2.set_ylabel("Torque  (Nm)")
-    ax2.set_title("Observer Tare Offset at Rest  (error bars: 3sigma)",
-                  fontweight="bold")
+    ax2.set_title("Observer Tare Offset at Rest  (error bars: 3σ)", fontweight="bold")
     ax2.grid(True, axis="y", ls="--")
     fig2.tight_layout()
     fname2 = f"shi_observer_tare_offsets_{ts_str}.svg"
@@ -330,118 +328,87 @@ def save_thesis_plots(
     saved.append(fname2)
     print(f"  Saved -> {fname2}")
 
-    # FIGURE 3: eta-mechanism detail for J3 (XM430)
+    # FIGURE 3: eta-mechanism detail for J3 (2 panels)
     j = 2
     if n_joints > j and currents.shape[0] == n_samples:
-        fig3, axes3 = plt.subplots(
-            4, 1,
-            figsize=(7.0, 8.0),
-            sharex=True,
-            gridspec_kw={"height_ratios": [1.5, 0.8, 2.0, 2.0], "hspace": 0.10},
+        fig3, (ax3a, ax3b) = plt.subplots(
+            2, 1, figsize=(7.0, 5.0), sharex=True,
+            gridspec_kw={"height_ratios": [1.0, 1.2], "hspace": 0.12},
         )
-        c3 = colors[j]
 
-        ax = axes3[0]
+        c3 = c_list[j]
+        eta_j = float(motor_eta[j])
+        r_j = float(motor_gear_ratio[j])
+        kt_j = float(motor_kt[j])
+        ratio_str = f"{(1.0 / eta_j) / eta_j:.1f}"
+
         i_ma = currents[:, j]
-        ax.plot(t, i_ma, color=c3, lw=1.0)
-        ax.set_ylabel("Current  (mA)")
-        ax.set_title(
-            f"(a)  Motor Current - {full_labels[j]} (XM430, r = {motor_gear_ratio[j]:.0f}:1)",
+        ax3a.plot(t, i_ma, color=c3, lw=1.2, label="Motor Current")
+        ax3a.set_ylabel("Current  (mA)")
+        ax3a.set_title(
+            f"(a)  {joint_labels_full[j]}  -  Motor Current (r = {r_j:.0f}:1, eta = {eta_j:.2f})",
             loc="left",
         )
-        ax.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
-        ax.grid(True, ls="--")
+        ax3a.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
 
-        ax = axes3[1]
-        ax.step(t, d_prev[:, j], where="post", color=c3, lw=1.2)
-        ax.set_ylabel("d")
-        ax.set_yticks([-1, 1])
-        ax.set_yticklabels(["-1", "+1"])
-        ax.set_ylim(-1.6, 1.6)
-        ax.set_title("(b)  Drive Direction", loc="left")
-        ax.grid(True, ls="--")
-
-        ax = axes3[2]
-        i_a = i_ma / 1000.0
-        tau_motor = motor_kt[j] * i_a
         d_j = d_prev[:, j]
-        eta_j = motor_eta[j]
-        r_j = motor_gear_ratio[j]
+        for k in range(n_samples - 1):
+            c_bg = "#E3F2FD" if d_j[k] > 0 else "#FBE9E7"
+            ax3a.axvspan(t[k], t[k + 1], alpha=0.4, color=c_bg, linewidth=0)
 
-        eta_eff = np.where(d_j > 0, eta_j, 1.0 / eta_j)
-        tau_output = r_j * eta_eff * tau_motor
-        tau_output_fwd = r_j * eta_j * tau_motor
-        tau_output_bwd = r_j * (1.0 / eta_j) * tau_motor
+        p_fwd = ax3a.plot([], [], color="#E3F2FD", lw=8,
+                          label=f"d = +1 (eta = {eta_j:.2f})")[0]
+        p_bwd = ax3a.plot([], [], color="#FBE9E7", lw=8,
+                          label=f"d = -1 (1/eta = {1 / eta_j:.2f})")[0]
+        ax3a.legend(
+            handles=[ax3a.get_lines()[0], p_fwd, p_bwd],
+            loc="upper right", framealpha=0.9, edgecolor="none", fontsize=8,
+        )
+        ax3a.grid(True, ls="--")
 
-        ax.fill_between(
-            t, tau_output_fwd, tau_output_bwd,
-            alpha=0.12, color=c3,
-            label=(
-                f"Range eta={eta_j:.2f} vs. 1/eta={1.0/eta_j:.2f} "
-                f"(ratio {(1.0/eta_j)/eta_j:.1f}:1)"
-            ),
+        ax3b.plot(t, tau_raw[:, j], color=c3, lw=1.4,
+                  label=r"$\hat{\tau}_{\mathrm{ext}}$  (raw)")
+        ax3b.axhline(
+            tare_offset[j], color="#757575", ls=":", lw=1.2,
+            label=f"Tare offset ({tare_offset[j]:+.3f} Nm)",
         )
-        ax.plot(t, tau_output, color=c3, lw=1.3,
-                label=r"$\tau_{\mathrm{output}}$ (actual eta selection)")
-        ax.set_ylabel(r"$\tau_{\mathrm{output}}$  (Nm)")
-        ax.set_title(
-            r"(c)  Output Torque  "
-            r"$\tau_{\mathrm{out}} = r \cdot \eta_{\mathrm{eff}} \cdot K_t \cdot I$",
-            loc="left",
-        )
-        ax.legend(loc="upper right", framealpha=0.85, edgecolor="none", fontsize=8)
-        ax.grid(True, ls="--")
-
-        ax = axes3[3]
-        ax.plot(t, tau_raw[:, j], color=c3, lw=1.3,
-                label=r"$\hat{\tau}_{\mathrm{ext}}$ (raw)")
-        ax.axhline(
-            tare_offset[j], color="grey", ls=":", lw=1.0,
-            label=f"Tare ({tare_offset[j]:+.3f} Nm)",
-        )
-        ax.axhspan(
-            -deadband[j], +deadband[j],
-            color="#4CAF50", alpha=0.10,
+        ax3b.axhspan(
+            tare_offset[j] - deadband[j], tare_offset[j] + deadband[j],
+            color="#4CAF50", alpha=0.12, zorder=0,
             label=f"Deadband (+/-{deadband[j]:.2f} Nm)",
         )
-        ax.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
-        ax.set_ylabel(r"$\hat{\tau}_{\mathrm{ext}}$  (Nm)")
-        ax.set_xlabel("Time  (s)")
-        ax.set_title(
-            r"(d)  Estimated External Torque  "
-            r"$\hat{\tau}_{\mathrm{ext}} = -(\tau_{\mathrm{out}} - \tau_{\mathrm{grav}})$",
+        ax3b.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
+
+        for k in range(n_samples - 1):
+            c_bg = "#E3F2FD" if d_j[k] > 0 else "#FBE9E7"
+            ax3b.axvspan(t[k], t[k + 1], alpha=0.3, color=c_bg, linewidth=0)
+
+        ax3b.text(
+            0.02, 0.95,
+            f"eta ratio: {ratio_str}:1 -> torque jumps up to {r_j * abs(1 / eta_j - eta_j) * kt_j * 0.5:.1f} Nm",
+            transform=ax3b.transAxes,
+            fontsize=8.5,
+            va="top",
+            ha="left",
+            bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "#999", "alpha": 0.9},
+        )
+
+        ax3b.set_ylabel(r"$\hat{\tau}_{\mathrm{ext}}$  (Nm)")
+        ax3b.set_xlabel("Time  (s)")
+        ax3b.set_title(
+            r"(b)  Estimated External Torque  $\hat{\tau}_{\mathrm{ext}} = -(\tau_{\mathrm{out}} - \tau_{\mathrm{grav}})$",
             loc="left",
         )
-        ax.legend(loc="lower right", framealpha=0.85, edgecolor="none", fontsize=8)
-        ax.grid(True, ls="--")
+        ax3b.legend(loc="lower right", framealpha=0.9, edgecolor="none", fontsize=8)
+        ax3b.grid(True, ls="--")
 
+        fig3.align_ylabels([ax3a, ax3b])
         fig3.tight_layout()
         fname3 = f"shi_observer_eta_detail_J3_{ts_str}.svg"
         fig3.savefig(fname3, format="svg", bbox_inches="tight")
         plt.close(fig3)
         saved.append(fname3)
         print(f"  Saved -> {fname3}")
-
-    # FIGURE 4: Tare sample time series
-    if tare_samples is not None and tare_samples.shape[0] > 10:
-        fig4, ax4 = plt.subplots(figsize=(6.0, 3.5))
-        t_tare = np.arange(tare_samples.shape[0]) / 300.0
-        for i in range(n_joints):
-            ax4.plot(t_tare, tare_samples[:, i],
-                     color=colors[i], lw=0.8, alpha=0.8,
-                     label=labels[i])
-        ax4.set_xlabel("Time during TARE phase  (s)")
-        ax4.set_ylabel(r"$\hat{\tau}_{\mathrm{ext}}$  (Nm)")
-        ax4.set_title("Observer Output During Stationary Hold (TARE Phase)",
-                      fontweight="bold")
-        ax4.legend(ncol=3, loc="upper right", framealpha=0.85, edgecolor="none")
-        ax4.grid(True, ls="--")
-        fig4.tight_layout()
-        fname4 = f"shi_observer_tare_timeseries_{ts_str}.svg"
-        fig4.savefig(fname4, format="svg", bbox_inches="tight")
-        plt.close(fig4)
-        saved.append(fname4)
-        print(f"  Saved -> {fname4}")
 
     return saved
 
