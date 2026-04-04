@@ -157,12 +157,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--record-time", type=float, default=5.0)
     p.add_argument("--home-time", type=float, default=5.0)
 
-    p.add_argument("--kp-j", type=float, default=8.0, help="Joint Kp (Nm/rad).")
-    p.add_argument("--kd-j", type=float, default=2.0, help="Joint Kd (Nm*s/rad)")
+    p.add_argument("--kp-j", type=float, default=2.0,
+                   help="Joint Kp base (Nm/rad). Scaled per joint.")
+    p.add_argument("--kd-j", type=float, default=0.5,
+                   help="Joint Kd base (Nm*s/rad). Scaled per joint.")
 
     p.add_argument("--kp-t", type=float, default=150.0)
     p.add_argument("--kd-t", type=float, default=10.0)
     p.add_argument("--kd-null", type=float, default=0.5)
+
+    p.add_argument("--no-feedforward", action="store_true",
+                   help="Disable gravity/friction feedforward in REPLAY (debug only)")
 
     p.add_argument("--plot-rate", type=float, default=10.0)
     p.add_argument("--no-plot", action="store_true")
@@ -207,14 +212,17 @@ def main() -> int:
             raise RuntimeError("Driver not initialized")
         n = int(system.num_arm_joints)
 
-        servo_scale = np.array([0.8, 1.0, 1.0, 0.5, 0.5, 0.3], dtype=float)[:n]
-        kp = args.kp_j * servo_scale
-        kd = args.kd_j * servo_scale
+        kp_scale = np.array([0.8, 1.0, 1.0, 0.5, 0.5, 0.3], dtype=float)[:n]
+        kd_scale = np.array([0.8, 1.0, 1.0, 0.8, 0.8, 0.5], dtype=float)[:n]
+        kp = args.kp_j * kp_scale
+        kd = args.kd_j * kd_scale
         tau_max = np.array([1.2, 2.0, 2.0, 0.8, 0.8, 0.5], dtype=float)[:n]
 
-        print(f"Replay Kp: {[f'{x:.1f}' for x in kp]}")
-        print(f"Replay Kd: {[f'{x:.1f}' for x in kd]}")
+        print(f"Replay Kp: {[f'{x:.2f}' for x in kp]}")
+        print(f"Replay Kd: {[f'{x:.2f}' for x in kd]}")
         print(f"Torque limits: {[f'{x:.1f}' for x in tau_max]} Nm")
+        print(f"Feedforward (grav+fric+damp) in REPLAY: "
+              f"{'DISABLED' if args.no_feedforward else 'ENABLED'}")
 
         t_start = time.time()
         last_step_t = time.perf_counter()
@@ -356,9 +364,13 @@ def main() -> int:
                 idx = min(idx, len(trajectory_q) - 1)
                 _, q_ref, dq_ref = trajectory_q[idx]
 
-                tau_grav = system.gravity_compensation(q, dq)
-                tau_fric = system.friction_compensation(dq)
-                tau_damp = -float(system.gravity_comp_velocity_damping) * dq
+                if not args.no_feedforward:
+                    tau_grav = system.gravity_compensation(q, dq)
+                    tau_fric = system.friction_compensation(dq)
+                    tau_damp = -float(system.gravity_comp_velocity_damping) * dq
+                    tau_ff = tau_grav + tau_fric + tau_damp
+                else:
+                    tau_ff = system.gravity_compensation(q, np.zeros(n))
 
                 if args.mode == "joint":
                     # Wrap replay reference to the nearest turn relative to q.
@@ -369,9 +381,9 @@ def main() -> int:
                         while q_ref_near[i] - q[i] < -np.pi:
                             q_ref_near[i] += 2.0 * np.pi
 
-                    tau_pd = kp * (q_ref_near - q) + kd * (dq_ref - dq)
+                    tau_pd = kp * (q_ref_near - q) - kd * dq
                     tau_pd = np.clip(tau_pd, -tau_max, tau_max)
-                    tau_cmd = tau_grav + tau_fric + tau_damp + tau_pd
+                    tau_cmd = tau_ff + tau_pd
                     system.set_leader_joint_torque(tau_cmd, 0.0)
 
                     t_buf.append(t_rel)
@@ -381,10 +393,9 @@ def main() -> int:
                 else:
                     x_ref, j_ref = compute_task_kinematics(system, q_ref)
                     x_act, j_act = compute_task_kinematics(system, q)
-                    dx_ref = j_ref @ dq_ref
                     dx_act = j_act @ dq
 
-                    f_task = args.kp_t * (x_ref - x_act) + args.kd_t * (dx_ref - dx_act)
+                    f_task = args.kp_t * (x_ref - x_act) - args.kd_t * dx_act
                     tau_task = j_act.T @ f_task
                     null_proj = np.eye(n) - np.linalg.pinv(j_act) @ j_act
                     tau_null = null_proj @ (-args.kd_null * dq)
@@ -392,7 +403,7 @@ def main() -> int:
                     tau_imp = tau_task + tau_null
                     tau_imp = np.clip(tau_imp, -tau_max, tau_max)
 
-                    tau_cmd = tau_grav + tau_fric + tau_damp + tau_imp
+                    tau_cmd = tau_ff + tau_imp
                     system.set_leader_joint_torque(tau_cmd, 0.0)
 
                     t_buf.append(t_rel)
@@ -411,7 +422,7 @@ def main() -> int:
 
                         err_terms = q - q_ref_dbg
                         tau_print = np.clip(
-                            kp * (q_ref_dbg - q) + kd * (dq_ref - dq),
+                            kp * (q_ref_dbg - q) - kd * dq,
                             -tau_max,
                             tau_max,
                         )
