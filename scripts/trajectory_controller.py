@@ -4,15 +4,14 @@
 Records a human-guided trajectory in gravity compensation,
 then replays it using joint-space or task-space impedance control.
 
-All phases run in current control mode (no mode switch needed).
-
 Phases:
-  1. PREP    - Settle in gravity comp
-  2. RECORD  - User moves arm, trajectory is recorded
-  3. HOME    - Smooth return to trajectory start (PD + pure gravity)
-  4. SETTLE  - Hold at start position (1s)
-  5. REPLAY  - Impedance tracking of recorded trajectory
-  6. HOLD    - Hold final position until Ctrl+C
+    1. PREP    - Settle in gravity comp (current control)
+    2. RECORD  - User moves arm, trajectory recorded (current control)
+    3. HOME    - Return to trajectory start (position control)
+    4. SETTLE  - Hold at start in position control
+    5. SWITCH  - Switch back to current control
+    6. REPLAY  - Impedance tracking (current control)
+    7. HOLD    - Hold final position until Ctrl+C
 """
 
 from __future__ import annotations
@@ -158,15 +157,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--record-time", type=float, default=5.0)
     p.add_argument("--home-time", type=float, default=5.0)
 
-    p.add_argument("--kp-j", type=float, default=15.0, help="Joint Kp (Nm/rad). Lower = more compliant.")
-    p.add_argument("--kd-j", type=float, default=3.0, help="Joint Kd (Nm*s/rad)")
+    p.add_argument("--kp-j", type=float, default=8.0, help="Joint Kp (Nm/rad).")
+    p.add_argument("--kd-j", type=float, default=2.0, help="Joint Kd (Nm*s/rad)")
 
     p.add_argument("--kp-t", type=float, default=150.0)
     p.add_argument("--kd-t", type=float, default=10.0)
     p.add_argument("--kd-null", type=float, default=0.5)
-
-    p.add_argument("--home-kp", type=float, default=5.0)
-    p.add_argument("--home-kd", type=float, default=2.0)
 
     p.add_argument("--plot-rate", type=float, default=10.0)
     p.add_argument("--no-plot", action="store_true")
@@ -214,9 +210,7 @@ def main() -> int:
         servo_scale = np.array([0.8, 1.0, 1.0, 0.5, 0.5, 0.3], dtype=float)[:n]
         kp = args.kp_j * servo_scale
         kd = args.kd_j * servo_scale
-        home_kp = args.home_kp * servo_scale
-        home_kd = args.home_kd * servo_scale
-        tau_max = np.array([0.8, 1.5, 1.5, 0.5, 0.5, 0.3], dtype=float)[:n]
+        tau_max = np.array([1.2, 2.0, 2.0, 0.8, 0.8, 0.5], dtype=float)[:n]
 
         print(f"Replay Kp: {[f'{x:.1f}' for x in kp]}")
         print(f"Replay Kd: {[f'{x:.1f}' for x in kd]}")
@@ -236,6 +230,9 @@ def main() -> int:
         target_q = np.zeros(n)
         hold_q = np.zeros(n)
         debug_counter = 0
+        home_start_raw = np.zeros(system.num_motors)
+        target_raw = np.zeros(system.num_motors)
+        last_sent_raw = np.zeros(system.num_motors)
 
         plot_state = None if args.no_plot else _init_plot(args.mode)
         plot_period = 1.0 / max(args.plot_rate, 1e-3)
@@ -279,48 +276,68 @@ def main() -> int:
 
                 if t_rel >= args.record_time:
                     phase = "HOME"
+                    print(f"[HOME] Switching to position mode & returning to start ({args.home_time}s)")
+
+                    raw_pos_now = np.asarray(system.driver.get_joints(), dtype=float)
+                    system.driver.set_torque_mode(False)
+                    time.sleep(0.02)
+                    system.driver.set_operating_mode(3)
+                    time.sleep(0.02)
+                    system.driver.set_torque_mode(True)
+
+                    system.driver.set_joints(raw_pos_now.tolist())
+                    last_sent_raw = raw_pos_now.copy()
+                    time.sleep(0.02)
+
                     home_start_t = t_now
                     home_start_q = q.copy()
                     target_q = trajectory_q[0][1].copy()
+                    home_start_raw = raw_pos_now.copy()
+                    target_raw = np.zeros(system.num_motors)
+                    target_raw[:n] = (
+                        target_q * system.joint_signs[:n]
+                        + system.joint_offsets[:n]
+                    )
+                    if system.num_motors > n:
+                        target_raw[-1] = raw_pos_now[-1]
 
                     # Ensure HOME interpolation takes the shortest angular path.
-                    for i in range(n):
-                        delta = target_q[i] - home_start_q[i]
+                    for i in range(system.num_motors):
+                        delta = target_raw[i] - home_start_raw[i]
                         while delta > np.pi:
-                            target_q[i] -= 2.0 * np.pi
+                            target_raw[i] -= 2.0 * np.pi
                             delta -= 2.0 * np.pi
                         while delta < -np.pi:
-                            target_q[i] += 2.0 * np.pi
+                            target_raw[i] += 2.0 * np.pi
                             delta += 2.0 * np.pi
-
-                    print(f"[HOME] Returning to start ({args.home_time}s)")
 
             elif phase == "HOME":
                 t_rel = t_now - home_start_t
                 alpha_t = np.clip(t_rel / args.home_time, 0.0, 1.0)
                 s = 10 * alpha_t**3 - 15 * alpha_t**4 + 6 * alpha_t**5
-                des_q = home_start_q + s * (target_q - home_start_q)
-
-                tau_grav = system.gravity_compensation(q, np.zeros(n))
-                tau_pd = home_kp * (des_q - q) - home_kd * dq
-                tau_pd = np.clip(tau_pd, -tau_max, tau_max)
-                tau_cmd = tau_grav + tau_pd
-                system.set_leader_joint_torque(tau_cmd, 0.0)
+                des_raw = home_start_raw + s * (target_raw - home_start_raw)
+                system.driver.set_joints(des_raw.tolist())
+                last_sent_raw = des_raw.copy()
 
                 if t_rel >= args.home_time:
                     phase = "SETTLE"
                     settle_start_t = t_now
-                    print("[SETTLE] Holding start position (1s) ...")
+                    print("[SETTLE] Holding start position (1.5s) ...")
 
             elif phase == "SETTLE":
                 t_rel = t_now - settle_start_t
-                tau_grav = system.gravity_compensation(q, np.zeros(n))
-                tau_pd = home_kp * (target_q - q) - home_kd * dq
-                tau_pd = np.clip(tau_pd, -tau_max, tau_max)
-                tau_cmd = tau_grav + tau_pd
-                system.set_leader_joint_torque(tau_cmd, 0.0)
+                system.driver.set_joints(target_raw.tolist())
+                last_sent_raw = target_raw.copy()
 
-                if t_rel >= 1.0:
+                if t_rel >= 1.5:
+                    print("[SWITCH] Switching to current control for impedance replay...")
+                    system.driver.set_torque_mode(False)
+                    time.sleep(0.02)
+                    system.driver.set_operating_mode(0)
+                    time.sleep(0.02)
+                    system.driver.set_torque_mode(True)
+                    time.sleep(0.05)
+
                     phase = "REPLAY"
                     replay_start_t = time.time() - t_start
                     debug_counter = 0
@@ -339,7 +356,9 @@ def main() -> int:
                 idx = min(idx, len(trajectory_q) - 1)
                 _, q_ref, dq_ref = trajectory_q[idx]
 
-                tau_grav = system.gravity_compensation(q, np.zeros(n))
+                tau_grav = system.gravity_compensation(q, dq)
+                tau_fric = system.friction_compensation(dq)
+                tau_damp = -float(system.gravity_comp_velocity_damping) * dq
 
                 if args.mode == "joint":
                     # Wrap replay reference to the nearest turn relative to q.
@@ -352,7 +371,7 @@ def main() -> int:
 
                     tau_pd = kp * (q_ref_near - q) + kd * (dq_ref - dq)
                     tau_pd = np.clip(tau_pd, -tau_max, tau_max)
-                    tau_cmd = tau_grav + tau_pd
+                    tau_cmd = tau_grav + tau_fric + tau_damp + tau_pd
                     system.set_leader_joint_torque(tau_cmd, 0.0)
 
                     t_buf.append(t_rel)
@@ -373,7 +392,7 @@ def main() -> int:
                     tau_imp = tau_task + tau_null
                     tau_imp = np.clip(tau_imp, -tau_max, tau_max)
 
-                    tau_cmd = tau_grav + tau_imp
+                    tau_cmd = tau_grav + tau_fric + tau_damp + tau_imp
                     system.set_leader_joint_torque(tau_cmd, 0.0)
 
                     t_buf.append(t_rel)
@@ -383,9 +402,16 @@ def main() -> int:
                 debug_counter += 1
                 if debug_counter % 30 == 1:
                     if args.mode == "joint":
-                        err_terms = q - q_ref_near
+                        q_ref_dbg = q_ref.copy()
+                        for i in range(n):
+                            while q_ref_dbg[i] - q[i] > np.pi:
+                                q_ref_dbg[i] -= 2.0 * np.pi
+                            while q_ref_dbg[i] - q[i] < -np.pi:
+                                q_ref_dbg[i] += 2.0 * np.pi
+
+                        err_terms = q - q_ref_dbg
                         tau_print = np.clip(
-                            kp * (q_ref_near - q) + kd * (dq_ref - dq),
+                            kp * (q_ref_dbg - q) + kd * (dq_ref - dq),
                             -tau_max,
                             tau_max,
                         )
@@ -405,10 +431,12 @@ def main() -> int:
                     last_plot_t = wall_now
 
             elif phase == "HOLD":
-                tau_grav = system.gravity_compensation(q, np.zeros(n))
+                tau_grav = system.gravity_compensation(q, dq)
+                tau_fric = system.friction_compensation(dq)
+                tau_damp = -float(system.gravity_comp_velocity_damping) * dq
                 tau_pd = kp * (hold_q - q) - kd * dq
                 tau_pd = np.clip(tau_pd, -tau_max, tau_max)
-                tau_cmd = tau_grav + tau_pd
+                tau_cmd = tau_grav + tau_fric + tau_damp + tau_pd
                 system.set_leader_joint_torque(tau_cmd, 0.0)
 
             sleep_s = max(0.0, float(system.dt) - (time.perf_counter() - now_perf))
