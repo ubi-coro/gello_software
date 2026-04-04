@@ -556,6 +556,7 @@ def main() -> int:
         replay_start_t = 0.0
         home_start_raw = np.zeros(system.num_motors)
         target_raw = np.zeros(system.num_motors)
+        last_sent_raw = np.zeros(system.num_motors)
         q_ref_init_check: Optional[np.ndarray] = None
         tare_samples: List[np.ndarray] = []
         observer_tare = np.zeros(n)
@@ -637,6 +638,7 @@ def main() -> int:
 
                     # Immediately hold current raw position after switching.
                     system.driver.set_joints(raw_pos_now.tolist())
+                    last_sent_raw = raw_pos_now.copy()
                     time.sleep(0.02)
 
                     home_start_t = t_now
@@ -670,6 +672,7 @@ def main() -> int:
                 s = 10*alpha_t**3 - 15*alpha_t**4 + 6*alpha_t**5
                 des_raw = home_start_raw + s * (target_raw - home_start_raw)
                 system.driver.set_joints(des_raw.tolist())
+                last_sent_raw = des_raw.copy()
 
                 if t_rel >= args.home_time:
                     phase = "TARE"
@@ -682,6 +685,7 @@ def main() -> int:
                 t_rel = t_now - tare_start_t
 
                 system.driver.set_joints(target_raw.tolist())
+                last_sent_raw = target_raw.copy()
                 tare_samples.append(tau_ext.copy())
 
                 if t_rel >= 1.0:
@@ -714,6 +718,7 @@ def main() -> int:
             elif phase == "WARMUP":
                 t_rel = t_now - warmup_start_t
                 system.driver.set_joints(target_raw.tolist())
+                last_sent_raw = target_raw.copy()
 
                 if t_rel >= 0.5:
                     phase = "REPLAY"
@@ -878,7 +883,16 @@ def main() -> int:
                 # Keep gripper at its current raw position
                 if n_motors > n:
                     target_hw[-1] = system.leader_gripper_raw_rad
+
+                # Prevent 360° jumps by wrapping target to the nearest turn.
+                for i in range(n):
+                    while target_hw[i] - last_sent_raw[i] > np.pi:
+                        target_hw[i] -= 2.0 * np.pi
+                    while target_hw[i] - last_sent_raw[i] < -np.pi:
+                        target_hw[i] += 2.0 * np.pi
+
                 system.driver.set_joints(target_hw.tolist())
+                last_sent_raw = target_hw.copy()
 
                 debug_counter += 1
                 if debug_counter % 30 == 1:
