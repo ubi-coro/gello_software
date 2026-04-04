@@ -342,13 +342,21 @@ def main() -> int:
                 tau_grav = system.gravity_compensation(q, np.zeros(n))
 
                 if args.mode == "joint":
-                    tau_pd = kp * (q_ref - q) + kd * (dq_ref - dq)
+                    # Wrap replay reference to the nearest turn relative to q.
+                    q_ref_near = q_ref.copy()
+                    for i in range(n):
+                        while q_ref_near[i] - q[i] > np.pi:
+                            q_ref_near[i] -= 2.0 * np.pi
+                        while q_ref_near[i] - q[i] < -np.pi:
+                            q_ref_near[i] += 2.0 * np.pi
+
+                    tau_pd = kp * (q_ref_near - q) + kd * (dq_ref - dq)
                     tau_pd = np.clip(tau_pd, -tau_max, tau_max)
                     tau_cmd = tau_grav + tau_pd
                     system.set_leader_joint_torque(tau_cmd, 0.0)
 
                     t_buf.append(t_rel)
-                    ref_buf.append(q_ref.copy())
+                    ref_buf.append(q_ref_near.copy())
                     act_buf.append(q.copy())
 
                 else:
@@ -375,9 +383,9 @@ def main() -> int:
                 debug_counter += 1
                 if debug_counter % 30 == 1:
                     if args.mode == "joint":
-                        err_terms = q - q_ref
+                        err_terms = q - q_ref_near
                         tau_print = np.clip(
-                            kp * (q_ref - q) + kd * (dq_ref - dq),
+                            kp * (q_ref_near - q) + kd * (dq_ref - dq),
                             -tau_max,
                             tau_max,
                         )
