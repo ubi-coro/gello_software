@@ -65,6 +65,8 @@ THESIS_RCPARAMS = {
 }
 
 JOINT_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+SCRIPTS_DIR = Path(__file__).resolve().parent
+IMPEDANCE_PLOTS_DIR = SCRIPTS_DIR / "impedancePlots"
 
 
 def compute_task_kinematics(system: FACTRGravityCompensation, q: np.ndarray):
@@ -114,6 +116,7 @@ def save_thesis_plots(
     plt.rcParams.update(THESIS_RCPARAMS)
     saved: list = []
     colors = JOINT_COLORS[:n_joints]
+    IMPEDANCE_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
     errs_deg = (q_act - q_ref) * 57.3
     rms_per_t = np.sqrt(np.mean(errs_deg ** 2, axis=1))
@@ -147,27 +150,12 @@ def save_thesis_plots(
     ax1b.legend(ncol=4, loc="upper right")
     ax1b.grid(True, ls="--")
 
-    ax1a.text(
-        0.01, 0.02,
-        (
-            f"Kp = [{', '.join(f'{x:.2f}' for x in kp)}] Nm/rad\n"
-            f"Kd = [{', '.join(f'{x:.2f}' for x in kd)}] Nm*s/rad\n"
-            f"tau_max = [{', '.join(f'{x:.1f}' for x in tau_max)}] Nm"
-        ),
-        transform=ax1a.transAxes,
-        fontsize=7.5,
-        va="bottom",
-        ha="left",
-        fontfamily="monospace",
-        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", edgecolor="#cccccc", alpha=0.95),
-    )
-
     fig1.align_ylabels([ax1a, ax1b])
     fig1.tight_layout()
-    fname1 = f"impedance_tracking_{mode}_{ts_str}.svg"
+    fname1 = IMPEDANCE_PLOTS_DIR / f"impedance_tracking_{mode}_{ts_str}.svg"
     fig1.savefig(fname1, format="svg", bbox_inches="tight")
     plt.close(fig1)
-    saved.append(fname1)
+    saved.append(str(fname1))
     print(f"  Saved -> {fname1}")
 
     fig2, (ax2a, ax2b) = plt.subplots(
@@ -197,23 +185,13 @@ def save_thesis_plots(
 
     rms_ff = float(np.sqrt(np.mean(tau_ff ** 2)))
     rms_pd = float(np.sqrt(np.mean(tau_pd ** 2)))
-    ax2b.text(
-        0.01,
-        0.02,
-        f"RMS tau_ff = {rms_ff:.3f} Nm   RMS tau_pd = {rms_pd:.3f} Nm   Ratio: {rms_ff / max(rms_pd, 1e-6):.1f}:1",
-        transform=ax2b.transAxes,
-        fontsize=8,
-        va="bottom",
-        ha="left",
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="#cccccc", alpha=0.95),
-    )
 
     fig2.align_ylabels([ax2a, ax2b])
     fig2.tight_layout()
-    fname2 = f"impedance_torques_{mode}_{ts_str}.svg"
+    fname2 = IMPEDANCE_PLOTS_DIR / f"impedance_torques_{mode}_{ts_str}.svg"
     fig2.savefig(fname2, format="svg", bbox_inches="tight")
     plt.close(fig2)
-    saved.append(fname2)
+    saved.append(str(fname2))
     print(f"  Saved -> {fname2}")
 
     return saved

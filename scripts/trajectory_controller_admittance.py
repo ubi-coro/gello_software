@@ -53,6 +53,31 @@ from gello.bilat_4ch.gello_ur5e_observer_shi import (  # noqa: E402
     MotorType,
 )
 
+THESIS_RCPARAMS = {
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+    "font.size": 10,
+    "axes.titlesize": 11,
+    "axes.titleweight": "bold",
+    "axes.labelsize": 10,
+    "axes.linewidth": 1.0,
+    "lines.linewidth": 1.3,
+    "grid.linewidth": 0.5,
+    "grid.alpha": 0.25,
+    "legend.fontsize": 8,
+    "legend.framealpha": 0.9,
+    "legend.edgecolor": "none",
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "figure.dpi": 150,
+    "savefig.dpi": 150,
+    "mathtext.default": "regular",
+}
+
+JOINT_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+SCRIPTS_DIR = Path(__file__).resolve().parent
+ADMITTANCE_PLOTS_DIR = SCRIPTS_DIR / "admittancePlots"
+
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -87,46 +112,57 @@ def _infer_motor_params(servo_types: list[str], n: int) -> tuple[np.ndarray, np.
 def _init_plot(mode: str, window_s: float):
     if plt is None:
         return None
-    plt.rcParams.update({
-        "font.family": "sans-serif",
-        "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
-        "font.size": 12,
-        "axes.linewidth": 1.2,
-    })
+    plt.rcParams.update(THESIS_RCPARAMS)
     plt.ion()
-    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
-    fig.suptitle(f"Admittance Replay ({mode.capitalize()} Space)", fontweight="bold")
-
+    fig, axes = plt.subplots(
+        2, 1, figsize=(9, 6), sharex=True,
+        gridspec_kw={"height_ratios": [2, 1], "hspace": 0.08},
+    )
     n_dims = 6 if mode == "joint" else 3
-    colors = np.array([
-        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b",
-    ])[:n_dims]
-    lines_ref, lines_act = [], []
+    colors = JOINT_COLORS[:n_dims]
+    lines_ref, lines_act, lines_err = [], [], []
     for i in range(n_dims):
-        lbl = f"Joint {i+1}" if mode == "joint" else ["X", "Y", "Z"][i]
-        lr, = ax.plot([], [], "--", lw=1.5, alpha=0.5, color=colors[i], label=f"{lbl} Ref")
-        la, = ax.plot([], [], "-",  lw=1.5,            color=colors[i], label=f"{lbl} Act")
+        lbl = f"J{i+1}" if mode == "joint" else ["X", "Y", "Z"][i]
+        lr, = axes[0].plot([], [], "--", lw=1.2, alpha=0.5, color=colors[i], label=f"{lbl} ref")
+        la, = axes[0].plot([], [], "-", lw=1.3, color=colors[i], label=f"{lbl} act")
+        le, = axes[1].plot([], [], "-", lw=1.0, color=colors[i], label=lbl)
         lines_ref.append(lr)
         lines_act.append(la)
+        lines_err.append(le)
 
-    ax.set_ylabel("Joint Angle (rad)" if mode == "joint" else "TCP Position (m)")
-    ax.set_xlabel("Time (s)")
-    ax.grid(True, ls="--", alpha=0.5)
-    ax.legend(loc="center left", bbox_to_anchor=(1, 0.5), fontsize=10)
+    axes[0].set_ylabel("Joint Angle (rad)" if mode == "joint" else "TCP Position (m)")
+    axes[0].set_title(f"Admittance Replay ({mode.capitalize()} Space) (Live)", loc="left")
+    axes[0].legend(ncol=6, loc="upper right")
+    axes[0].grid(True, ls="--")
+    
+    axes[1].set_ylabel("Error (rad)" if mode == "joint" else "Error (m)")
+    axes[1].set_xlabel("Time (s)")
+    axes[1].legend(ncol=6, loc="upper right")
+    axes[1].grid(True, ls="--")
+
     fig.tight_layout()
-    return {"fig": fig, "ax": ax, "lines_ref": lines_ref, "lines_act": lines_act}
+    return {
+        "fig": fig,
+        "axes": axes,
+        "lines_ref": lines_ref,
+        "lines_act": lines_act,
+        "lines_err": lines_err,
+    }
 
 
 def _update_plot(ps, t_hist, ref_hist, act_hist):
     if ps is None or t_hist.size == 0:
         return
     tx = t_hist - t_hist[0]
+    errs = act_hist - ref_hist
     for i in range(ref_hist.shape[1]):
         ps["lines_ref"][i].set_data(tx, ref_hist[:, i])
         ps["lines_act"][i].set_data(tx, act_hist[:, i])
-    ps["ax"].set_xlim(tx[0], max(tx[-1], 1e-3))
-    ps["ax"].relim()
-    ps["ax"].autoscale_view(scaley=True)
+        ps["lines_err"][i].set_data(tx, errs[:, i])
+    for ax in ps["axes"]:
+        ax.set_xlim(tx[0], max(tx[-1], 0.1))
+        ax.relim()
+        ax.autoscale_view(scaley=True)
     ps["fig"].canvas.draw_idle()
     ps["fig"].canvas.flush_events()
 
@@ -187,29 +223,9 @@ def save_thesis_plots(
 
     saved: list = []
 
-    plt.rcParams.update({
-        "font.family": "sans-serif",
-        "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
-        "font.size": 10,
-        "axes.titlesize": 11,
-        "axes.titleweight": "bold",
-        "axes.labelsize": 11,
-        "legend.fontsize": 9,
-        "xtick.labelsize": 9,
-        "ytick.labelsize": 9,
-        "axes.linewidth": 1.0,
-        "lines.linewidth": 1.4,
-        "grid.linewidth": 0.5,
-        "grid.alpha": 0.25,
-        "figure.dpi": 150,
-        "savefig.dpi": 150,
-        "mathtext.default": "regular",
-    })
+    plt.rcParams.update(THESIS_RCPARAMS)
+    ADMITTANCE_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    colors = {
-        "J1": "#1f77b4", "J2": "#ff7f0e", "J3": "#2ca02c",
-        "J4": "#d62728", "J5": "#9467bd", "J6": "#8c564b",
-    }
     joint_labels = [f"J{i+1}" for i in range(n_joints)]
     joint_labels_full = [
         "J1 (Base)", "J2 (Shoulder)", "J3 (Elbow)",
@@ -221,7 +237,7 @@ def save_thesis_plots(
         print("Not enough REPLAY samples for thesis plots.")
         return []
 
-    c_list = [colors[f"J{i+1}"] for i in range(n_joints)]
+    c_list = JOINT_COLORS[:n_joints]
 
     # FIGURE 1: Observer failure analysis (2 panels)
     fig1, (ax1a, ax1b) = plt.subplots(
@@ -237,25 +253,9 @@ def save_thesis_plots(
 
     ax1a.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
 
-    for j_idx, j_name in [(1, "J2"), (2, "J3")]:
-        if j_idx >= n_joints:
-            continue
-        peak_idx = int(np.argmax(np.abs(tau_raw[:, j_idx])))
-        peak_val = float(tau_raw[peak_idx, j_idx])
-        peak_t = float(t[peak_idx])
-        ax1a.annotate(
-            f"{j_name}: {peak_val:+.1f} Nm",
-            xy=(peak_t, peak_val),
-            xytext=(peak_t + 0.3, peak_val + 0.3 * np.sign(peak_val)),
-            fontsize=8.5,
-            color=c_list[j_idx],
-            fontweight="bold",
-            arrowprops={"arrowstyle": "->", "color": c_list[j_idx], "lw": 1.2},
-        )
-
-    ax1a.set_ylabel(r"$\hat{\tau}_{\mathrm{ext}}$  (Nm)")
-    ax1a.set_title("(a)  Raw Shi Observer Output During Trajectory Replay", loc="left")
-    ax1a.legend(ncol=6, loc="upper right", framealpha=0.9, edgecolor="none", fontsize=8)
+    ax1a.set_ylabel(r"$\hat{\tau}_{\mathrm{ext}}$ (Nm)")
+    ax1a.set_title("(a) Raw Shi Observer Output During Trajectory Replay", loc="left")
+    ax1a.legend(ncol=6, loc="upper right")
     ax1a.grid(True, ls="--")
 
     n_min = min(q_c.shape[0], q_ref.shape[0], n_samples)
@@ -269,18 +269,18 @@ def save_thesis_plots(
                   label=joint_labels[i])
 
     ax1b.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
-    ax1b.set_ylabel(r"$q_c - q_{\mathrm{ref}}$  (deg)")
-    ax1b.set_xlabel("Time  (s)")
-    ax1b.set_title("(b)  Resulting Admittance Output Deviation", loc="left")
-    ax1b.legend(ncol=6, loc="upper right", framealpha=0.9, edgecolor="none", fontsize=8)
+    ax1b.set_ylabel(r"$q_c - q_{\mathrm{ref}}$ (deg)")
+    ax1b.set_xlabel("Time (s)")
+    ax1b.set_title("(b) Resulting Admittance Output Deviation", loc="left")
+    ax1b.legend(ncol=6, loc="upper right")
     ax1b.grid(True, ls="--")
 
     fig1.align_ylabels([ax1a, ax1b])
     fig1.tight_layout()
-    fname1 = f"shi_observer_replay_failure_{ts_str}.svg"
+    fname1 = ADMITTANCE_PLOTS_DIR / f"shi_observer_replay_failure_{ts_str}.svg"
     fig1.savefig(fname1, format="svg", bbox_inches="tight")
     plt.close(fig1)
-    saved.append(fname1)
+    saved.append(str(fname1))
     print(f"  Saved -> {fname1}")
 
     # FIGURE 2: Tare offset bar chart
@@ -313,19 +313,19 @@ def save_thesis_plots(
 
     proxy = ax2.plot([], [], color="#E53935", ls="--", lw=1.2,
                      label="Applied Deadband")[0]
-    ax2.legend(handles=[proxy], loc="upper left", framealpha=0.9)
+    ax2.legend(handles=[proxy], loc="upper left")
 
     ax2.axhline(0, color="k", ls="-", lw=0.5)
     ax2.set_xticks(x_pos)
     ax2.set_xticklabels(joint_labels_full, fontsize=9)
-    ax2.set_ylabel("Torque  (Nm)")
-    ax2.set_title("Observer Tare Offset at Rest  (error bars: 3σ)", fontweight="bold")
+    ax2.set_ylabel("Torque (Nm)")
+    ax2.set_title("Observer Tare Offset at Rest (error bars: 3σ)", fontweight="bold")
     ax2.grid(True, axis="y", ls="--")
     fig2.tight_layout()
-    fname2 = f"shi_observer_tare_offsets_{ts_str}.svg"
+    fname2 = ADMITTANCE_PLOTS_DIR / f"shi_observer_tare_offsets_{ts_str}.svg"
     fig2.savefig(fname2, format="svg", bbox_inches="tight")
     plt.close(fig2)
-    saved.append(fname2)
+    saved.append(str(fname2))
     print(f"  Saved -> {fname2}")
 
     # FIGURE 3: eta-mechanism detail for J3 (2 panels)
@@ -344,9 +344,9 @@ def save_thesis_plots(
 
         i_ma = currents[:, j]
         ax3a.plot(t, i_ma, color=c3, lw=1.2, label="Motor Current")
-        ax3a.set_ylabel("Current  (mA)")
+        ax3a.set_ylabel("Current (mA)")
         ax3a.set_title(
-            f"(a)  {joint_labels_full[j]}  -  Motor Current (r = {r_j:.0f}:1, eta = {eta_j:.2f})",
+            f"(a) {joint_labels_full[j]} - Motor Current (r = {r_j:.0f}:1, eta = {eta_j:.2f})",
             loc="left",
         )
         ax3a.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
@@ -362,12 +362,12 @@ def save_thesis_plots(
                           label=f"d = -1 (1/eta = {1 / eta_j:.2f})")[0]
         ax3a.legend(
             handles=[ax3a.get_lines()[0], p_fwd, p_bwd],
-            loc="upper right", framealpha=0.9, edgecolor="none", fontsize=8,
+            loc="upper right",
         )
         ax3a.grid(True, ls="--")
 
         ax3b.plot(t, tau_raw[:, j], color=c3, lw=1.4,
-                  label=r"$\hat{\tau}_{\mathrm{ext}}$  (raw)")
+                  label=r"$\hat{\tau}_{\mathrm{ext}}$ (raw)")
         ax3b.axhline(
             tare_offset[j], color="#757575", ls=":", lw=1.2,
             label=f"Tare offset ({tare_offset[j]:+.3f} Nm)",
@@ -383,32 +383,65 @@ def save_thesis_plots(
             c_bg = "#E3F2FD" if d_j[k] > 0 else "#FBE9E7"
             ax3b.axvspan(t[k], t[k + 1], alpha=0.3, color=c_bg, linewidth=0)
 
-        ax3b.text(
-            0.02, 0.95,
-            f"eta ratio: {ratio_str}:1 -> torque jumps up to {r_j * abs(1 / eta_j - eta_j) * kt_j * 0.5:.1f} Nm",
-            transform=ax3b.transAxes,
-            fontsize=8.5,
-            va="top",
-            ha="left",
-            bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "#999", "alpha": 0.9},
-        )
-
-        ax3b.set_ylabel(r"$\hat{\tau}_{\mathrm{ext}}$  (Nm)")
-        ax3b.set_xlabel("Time  (s)")
+        ax3b.set_ylabel(r"$\hat{\tau}_{\mathrm{ext}}$ (Nm)")
+        ax3b.set_xlabel("Time (s)")
         ax3b.set_title(
-            r"(b)  Estimated External Torque  $\hat{\tau}_{\mathrm{ext}} = -(\tau_{\mathrm{out}} - \tau_{\mathrm{grav}})$",
+            r"(b) Estimated External Torque $\hat{\tau}_{\mathrm{ext}} = -(\tau_{\mathrm{out}} - \tau_{\mathrm{grav}})$",
             loc="left",
         )
-        ax3b.legend(loc="lower right", framealpha=0.9, edgecolor="none", fontsize=8)
+        ax3b.legend(loc="lower right")
         ax3b.grid(True, ls="--")
 
         fig3.align_ylabels([ax3a, ax3b])
         fig3.tight_layout()
-        fname3 = f"shi_observer_eta_detail_J3_{ts_str}.svg"
+        fname3 = ADMITTANCE_PLOTS_DIR / f"shi_observer_eta_detail_J3_{ts_str}.svg"
         fig3.savefig(fname3, format="svg", bbox_inches="tight")
         plt.close(fig3)
-        saved.append(fname3)
+        saved.append(str(fname3))
         print(f"  Saved -> {fname3}")
+
+    # FIGURE 4: Admittance tracking performance (same as impedance)
+    n_min = min(q_act.shape[0], q_ref.shape[0], len(t))
+    errs_deg_act = (q_act[:n_min] - q_ref[:n_min]) * 57.3
+    rms_per_t = np.sqrt(np.mean(errs_deg_act ** 2, axis=1))
+    mean_rms = float(np.mean(rms_per_t))
+    max_err = float(np.max(np.abs(errs_deg_act)))
+
+    fig4, (ax4a, ax4b) = plt.subplots(
+        2, 1, figsize=(7.0, 5.5), sharex=True,
+        gridspec_kw={"height_ratios": [1.3, 1.0], "hspace": 0.10},
+    )
+
+    t_track = t[:n_min]
+    for i in range(n_joints):
+        ax4a.plot(t_track, q_ref[:n_min, i], "--", color=c_list[i], alpha=0.45, lw=1.1, label=f"J{i+1} ref")
+        ax4a.plot(t_track, q_act[:n_min, i], "-", color=c_list[i], lw=1.3, label=f"J{i+1} act")
+    ax4a.set_ylabel("Joint Angle (rad)")
+    ax4a.set_title("(a) Joint-space Admittance Replay: Reference vs Actual", loc="left")
+    ax4a.legend(ncol=6, loc="upper right")
+    ax4a.grid(True, ls="--")
+
+    for i in range(n_joints):
+        ax4b.plot(t_track, errs_deg_act[:, i], color=c_list[i], lw=1.0, label=f"J{i+1}")
+    ax4b.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
+    ax4b.axhline(+mean_rms, color="#E53935", ls="--", lw=0.9, alpha=0.6)
+    ax4b.axhline(-mean_rms, color="#E53935", ls="--", lw=0.9, alpha=0.6, label=f"+/-Mean RMS = {mean_rms:.2f} deg")
+    ax4b.set_ylabel("Tracking Error (deg)")
+    ax4b.set_xlabel("Time (s)")
+    ax4b.set_title(
+        f"(b) Per-joint Tracking Error (mean RMS = {mean_rms:.2f} deg, max = {max_err:.1f} deg)",
+        loc="left",
+    )
+    ax4b.legend(ncol=4, loc="upper right")
+    ax4b.grid(True, ls="--")
+
+    fig4.align_ylabels([ax4a, ax4b])
+    fig4.tight_layout()
+    fname4 = ADMITTANCE_PLOTS_DIR / f"admittance_tracking_{ts_str}.svg"
+    fig4.savefig(fname4, format="svg", bbox_inches="tight")
+    plt.close(fig4)
+    saved.append(str(fname4))
+    print(f"  Saved -> {fname4}")
 
     return saved
 
@@ -1023,7 +1056,8 @@ def main() -> int:
         if plt is not None:
             if "plot_state" in dir() and plot_state is not None:
                 ts_legacy = time.strftime("%Y%m%d_%H%M%S")
-                path = f"trajectory_admittance_{args.mode}_{ts_legacy}.svg"
+                ADMITTANCE_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+                path = ADMITTANCE_PLOTS_DIR / f"trajectory_admittance_{args.mode}_{ts_legacy}.svg"
                 plot_state["fig"].savefig(path, format="svg",
                                           bbox_inches="tight")
                 print(f"Saved live plot -> {path}")
