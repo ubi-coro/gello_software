@@ -1,17 +1,17 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Impedance Controller - Record & Replay on GELLO hardware.
 
 Records a human-guided trajectory in gravity compensation,
 then replays it using joint-space or task-space impedance control.
 
 Phases:
-    1. PREP    - Settle in gravity comp (current control)
-    2. RECORD  - User moves arm, trajectory recorded (current control)
-    3. HOME    - Return to trajectory start (position control)
-    4. SETTLE  - Hold at start in position control
-    5. SWITCH  - Switch back to current control
-    6. REPLAY  - Impedance tracking (current control)
-    7. HOLD    - Hold final position until Ctrl+C
+  1. PREP    - Settle in gravity comp (current control)
+  2. RECORD  - User moves arm, trajectory recorded (current control)
+  3. HOME    - Return to trajectory start (position control)
+  4. SETTLE  - Hold at start in position control
+  5. SWITCH  - Switch back to current control
+  6. REPLAY  - Impedance tracking (current control)
+  7. HOLD    - Hold final position until Ctrl+C
 """
 
 from __future__ import annotations
@@ -43,6 +43,30 @@ except ImportError:
 from gello.factr.gravity_compensation import FACTRGravityCompensation  # noqa: E402
 
 
+THESIS_RCPARAMS = {
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+    "font.size": 10,
+    "axes.titlesize": 11,
+    "axes.titleweight": "bold",
+    "axes.labelsize": 10,
+    "axes.linewidth": 1.0,
+    "lines.linewidth": 1.3,
+    "grid.linewidth": 0.5,
+    "grid.alpha": 0.25,
+    "legend.fontsize": 8,
+    "legend.framealpha": 0.9,
+    "legend.edgecolor": "none",
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "figure.dpi": 150,
+    "savefig.dpi": 150,
+    "mathtext.default": "regular",
+}
+
+JOINT_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+
+
 def compute_task_kinematics(system: FACTRGravityCompensation, q: np.ndarray):
     """Compute EE position and linear velocity Jacobian."""
     if pin is None:
@@ -64,39 +88,150 @@ def compute_task_kinematics(system: FACTRGravityCompensation, q: np.ndarray):
     return x, j_full[:3, :n]
 
 
+def save_thesis_plots(
+    *,
+    t: np.ndarray,
+    q_ref: np.ndarray,
+    q_act: np.ndarray,
+    tau_ff: np.ndarray,
+    tau_pd: np.ndarray,
+    n_joints: int,
+    mode: str,
+    kp: np.ndarray,
+    kd: np.ndarray,
+    tau_max: np.ndarray,
+    ts_str: str,
+) -> list:
+    """Generate two focused thesis figures for joint-space replay."""
+    if plt is None:
+        print("matplotlib not available - skipping thesis plots.")
+        return []
+
+    if len(t) < 10:
+        print("Not enough REPLAY samples for thesis plots.")
+        return []
+
+    plt.rcParams.update(THESIS_RCPARAMS)
+    saved: list = []
+    colors = JOINT_COLORS[:n_joints]
+
+    errs_deg = (q_act - q_ref) * 57.3
+    rms_per_t = np.sqrt(np.mean(errs_deg ** 2, axis=1))
+    mean_rms = float(np.mean(rms_per_t))
+    max_err = float(np.max(np.abs(errs_deg)))
+
+    fig1, (ax1a, ax1b) = plt.subplots(
+        2, 1, figsize=(7.0, 5.5), sharex=True,
+        gridspec_kw={"height_ratios": [1.3, 1.0], "hspace": 0.10},
+    )
+
+    for i in range(n_joints):
+        ax1a.plot(t, q_ref[:, i], "--", color=colors[i], alpha=0.45, lw=1.1, label=f"J{i+1} ref")
+        ax1a.plot(t, q_act[:, i], "-", color=colors[i], lw=1.3, label=f"J{i+1} act")
+    ax1a.set_ylabel("Joint Angle (rad)")
+    ax1a.set_title("(a) Joint-space Impedance Replay: Reference vs Actual", loc="left")
+    ax1a.legend(ncol=6, loc="upper right")
+    ax1a.grid(True, ls="--")
+
+    for i in range(n_joints):
+        ax1b.plot(t, errs_deg[:, i], color=colors[i], lw=1.0, label=f"J{i+1}")
+    ax1b.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
+    ax1b.axhline(+mean_rms, color="#E53935", ls="--", lw=0.9, alpha=0.6)
+    ax1b.axhline(-mean_rms, color="#E53935", ls="--", lw=0.9, alpha=0.6, label=f"+/-Mean RMS = {mean_rms:.2f} deg")
+    ax1b.set_ylabel("Tracking Error (deg)")
+    ax1b.set_xlabel("Time (s)")
+    ax1b.set_title(
+        f"(b) Per-joint Tracking Error (mean RMS = {mean_rms:.2f} deg, max = {max_err:.1f} deg)",
+        loc="left",
+    )
+    ax1b.legend(ncol=4, loc="upper right")
+    ax1b.grid(True, ls="--")
+
+    ax1a.text(
+        0.01, 0.02,
+        (
+            f"Kp = [{', '.join(f'{x:.2f}' for x in kp)}] Nm/rad\n"
+            f"Kd = [{', '.join(f'{x:.2f}' for x in kd)}] Nm*s/rad\n"
+            f"tau_max = [{', '.join(f'{x:.1f}' for x in tau_max)}] Nm"
+        ),
+        transform=ax1a.transAxes,
+        fontsize=7.5,
+        va="bottom",
+        ha="left",
+        fontfamily="monospace",
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", edgecolor="#cccccc", alpha=0.95),
+    )
+
+    fig1.align_ylabels([ax1a, ax1b])
+    fig1.tight_layout()
+    fname1 = f"impedance_tracking_{mode}_{ts_str}.svg"
+    fig1.savefig(fname1, format="svg", bbox_inches="tight")
+    plt.close(fig1)
+    saved.append(fname1)
+    print(f"  Saved -> {fname1}")
+
+    fig2, (ax2a, ax2b) = plt.subplots(
+        2, 1, figsize=(7.0, 5.5), sharex=True,
+        gridspec_kw={"height_ratios": [1.0, 1.0], "hspace": 0.10},
+    )
+
+    for i in range(n_joints):
+        ax2a.plot(t, tau_ff[:, i], color=colors[i], lw=1.0, label=f"J{i+1}")
+    ax2a.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
+    ax2a.set_ylabel("Torque (Nm)")
+    ax2a.set_title("(a) Feedforward Torques: tau_ff = tau_grav + tau_fric + tau_damp", loc="left")
+    ax2a.legend(ncol=6, loc="upper right")
+    ax2a.grid(True, ls="--")
+
+    for i in range(n_joints):
+        ax2b.plot(t, tau_pd[:, i], color=colors[i], lw=1.0, label=f"J{i+1}")
+    ax2b.axhline(0, color="k", ls="-", lw=0.4, alpha=0.4)
+    for lim in sorted(set(tau_max.tolist())):
+        ax2b.axhline(+lim, color="#999", ls=":", lw=0.7, alpha=0.5)
+        ax2b.axhline(-lim, color="#999", ls=":", lw=0.7, alpha=0.5)
+    ax2b.set_ylabel("Torque (Nm)")
+    ax2b.set_xlabel("Time (s)")
+    ax2b.set_title("(b) PD Correction Torques: tau_pd = Kp*(q_ref-q) - Kd*dq", loc="left")
+    ax2b.legend(ncol=6, loc="upper right")
+    ax2b.grid(True, ls="--")
+
+    rms_ff = float(np.sqrt(np.mean(tau_ff ** 2)))
+    rms_pd = float(np.sqrt(np.mean(tau_pd ** 2)))
+    ax2b.text(
+        0.01,
+        0.02,
+        f"RMS tau_ff = {rms_ff:.3f} Nm   RMS tau_pd = {rms_pd:.3f} Nm   Ratio: {rms_ff / max(rms_pd, 1e-6):.1f}:1",
+        transform=ax2b.transAxes,
+        fontsize=8,
+        va="bottom",
+        ha="left",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="#cccccc", alpha=0.95),
+    )
+
+    fig2.align_ylabels([ax2a, ax2b])
+    fig2.tight_layout()
+    fname2 = f"impedance_torques_{mode}_{ts_str}.svg"
+    fig2.savefig(fname2, format="svg", bbox_inches="tight")
+    plt.close(fig2)
+    saved.append(fname2)
+    print(f"  Saved -> {fname2}")
+
+    return saved
+
+
 def _init_plot(mode: str):
-    """Create publication-quality live plot."""
+    """Create lightweight live plot."""
     if plt is None:
         return None
-
-    plt.rcParams.update(
-        {
-            "font.family": "sans-serif",
-            "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
-            "font.size": 11,
-            "axes.titlesize": 12,
-            "axes.titleweight": "bold",
-            "axes.labelsize": 11,
-            "axes.linewidth": 1.0,
-            "lines.linewidth": 1.3,
-            "grid.linewidth": 0.5,
-            "grid.alpha": 0.25,
-            "legend.fontsize": 9,
-        }
-    )
+    plt.rcParams.update(THESIS_RCPARAMS)
     plt.ion()
     fig, axes = plt.subplots(
-        2,
-        1,
-        figsize=(9, 7),
-        sharex=True,
+        2, 1, figsize=(9, 6), sharex=True,
         gridspec_kw={"height_ratios": [2, 1], "hspace": 0.08},
     )
-
     n_dims = 6 if mode == "joint" else 3
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"][:n_dims]
+    colors = JOINT_COLORS[:n_dims]
     lines_ref, lines_act, lines_err = [], [], []
-
     for i in range(n_dims):
         lbl = f"J{i+1}" if mode == "joint" else ["X", "Y", "Z"][i]
         lr, = axes[0].plot([], [], "--", lw=1.2, alpha=0.5, color=colors[i], label=f"{lbl} ref")
@@ -105,18 +240,14 @@ def _init_plot(mode: str):
         lines_ref.append(lr)
         lines_act.append(la)
         lines_err.append(le)
-
-    axes[0].set_ylabel("Joint Angle (rad)" if mode == "joint" else "TCP Position (m)")
-    axes[0].set_title("Impedance Replay: Reference vs. Actual", loc="left")
-    axes[0].legend(ncol=6, loc="upper right", framealpha=0.85, edgecolor="none")
+    axes[0].set_ylabel("Joint Angle (rad)" if mode == "joint" else "Position (m)")
+    axes[0].set_title("Impedance Replay (Live)", loc="left")
+    axes[0].legend(ncol=6, loc="upper right")
     axes[0].grid(True, ls="--")
-
-    axes[1].set_ylabel("Tracking Error (rad)" if mode == "joint" else "Error (m)")
+    axes[1].set_ylabel("Error (rad)" if mode == "joint" else "Error (m)")
     axes[1].set_xlabel("Time (s)")
-    axes[1].set_title("Tracking Error", loc="left")
-    axes[1].legend(ncol=6, loc="upper right", framealpha=0.85, edgecolor="none")
+    axes[1].legend(ncol=6, loc="upper right")
     axes[1].grid(True, ls="--")
-
     fig.tight_layout()
     return {
         "fig": fig,
@@ -127,25 +258,21 @@ def _init_plot(mode: str):
     }
 
 
-def _update_plot(plot_state, t: np.ndarray, refs: np.ndarray, acts: np.ndarray):
-    if plot_state is None or t.size == 0:
+def _update_plot(ps, t, refs, acts):
+    if ps is None or t.size == 0:
         return
-
     tx = t - t[0]
     errs = acts - refs
-
     for i in range(refs.shape[1]):
-        plot_state["lines_ref"][i].set_data(tx, refs[:, i])
-        plot_state["lines_act"][i].set_data(tx, acts[:, i])
-        plot_state["lines_err"][i].set_data(tx, errs[:, i])
-
-    for ax in plot_state["axes"]:
+        ps["lines_ref"][i].set_data(tx, refs[:, i])
+        ps["lines_act"][i].set_data(tx, acts[:, i])
+        ps["lines_err"][i].set_data(tx, errs[:, i])
+    for ax in ps["axes"]:
         ax.set_xlim(tx[0], max(tx[-1], 0.1))
         ax.relim()
         ax.autoscale_view(scaley=True)
-
-    plot_state["fig"].canvas.draw_idle()
-    plot_state["fig"].canvas.flush_events()
+    ps["fig"].canvas.draw_idle()
+    ps["fig"].canvas.flush_events()
 
 
 def parse_args() -> argparse.Namespace:
@@ -157,20 +284,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--record-time", type=float, default=5.0)
     p.add_argument("--home-time", type=float, default=5.0)
 
-    p.add_argument("--kp-j", type=float, default=2.0,
-                   help="Joint Kp base (Nm/rad). Scaled per joint.")
-    p.add_argument("--kd-j", type=float, default=0.5,
-                   help="Joint Kd base (Nm*s/rad). Scaled per joint.")
+    p.add_argument("--kp-j", type=float, default=0.0,
+                   help="Joint Kp base (Nm/rad). 0 = pure gravity comp.")
+    p.add_argument("--kd-j", type=float, default=0.0,
+                   help="Joint Kd base (Nm*s/rad). 0 = no extra damping.")
 
     p.add_argument("--kp-t", type=float, default=150.0)
     p.add_argument("--kd-t", type=float, default=10.0)
     p.add_argument("--kd-null", type=float, default=0.5)
 
-    p.add_argument("--no-feedforward", action="store_true",
-                   help="Disable gravity/friction feedforward in REPLAY (debug only)")
-
     p.add_argument("--plot-rate", type=float, default=10.0)
     p.add_argument("--no-plot", action="store_true")
+    p.add_argument("--no-thesis-plots", action="store_true", help="Disable thesis figure generation")
     return p.parse_args()
 
 
@@ -197,6 +322,12 @@ def main() -> int:
     t_buf: deque = deque()
     ref_buf: deque = deque()
     act_buf: deque = deque()
+    tau_ff_buf: deque = deque()
+    tau_pd_buf: deque = deque()
+
+    kp = np.zeros(6)
+    kd = np.zeros(6)
+    tau_max = np.zeros(6)
 
     def _sig(signum, frame):
         del signum, frame
@@ -214,19 +345,25 @@ def main() -> int:
 
         kp_scale = np.array([0.8, 1.0, 1.0, 0.5, 0.5, 0.3], dtype=float)[:n]
         kd_scale = np.array([0.8, 1.0, 1.0, 0.8, 0.8, 0.5], dtype=float)[:n]
+
         kp = args.kp_j * kp_scale
         kd = args.kd_j * kd_scale
         tau_max = np.array([1.2, 2.0, 2.0, 0.8, 0.8, 0.5], dtype=float)[:n]
 
+        buf_size = int(max(args.record_time, 10.0) * 500)
+        t_buf = deque(maxlen=buf_size)
+        ref_buf = deque(maxlen=buf_size)
+        act_buf = deque(maxlen=buf_size)
+        tau_ff_buf = deque(maxlen=buf_size)
+        tau_pd_buf = deque(maxlen=buf_size)
+
         print(f"Replay Kp: {[f'{x:.2f}' for x in kp]}")
         print(f"Replay Kd: {[f'{x:.2f}' for x in kd]}")
         print(f"Torque limits: {[f'{x:.1f}' for x in tau_max]} Nm")
-        print(f"Feedforward (grav+fric+damp) in REPLAY: "
-              f"{'DISABLED' if args.no_feedforward else 'ENABLED'}")
+        if args.kp_j == 0.0 and args.kd_j == 0.0:
+            print("  WARNING: Kp=0, Kd=0: REPLAY is pure gravity comp (no tracking)")
 
         t_start = time.time()
-        last_step_t = time.perf_counter()
-
         phase = "PREP"
         trajectory_q: List[Tuple[float, np.ndarray, np.ndarray]] = []
 
@@ -234,28 +371,21 @@ def main() -> int:
         home_start_t = 0.0
         settle_start_t = 0.0
         replay_start_t = 0.0
-        home_start_q = np.zeros(n)
         target_q = np.zeros(n)
         hold_q = np.zeros(n)
         debug_counter = 0
+
         home_start_raw = np.zeros(system.num_motors)
         target_raw = np.zeros(system.num_motors)
-        last_sent_raw = np.zeros(system.num_motors)
 
         plot_state = None if args.no_plot else _init_plot(args.mode)
         plot_period = 1.0 / max(args.plot_rate, 1e-3)
         last_plot_t = time.time()
 
-        t_buf = deque(maxlen=10000)
-        ref_buf = deque(maxlen=10000)
-        act_buf = deque(maxlen=10000)
-
         print(f"[PREP] Settle in gravity comp for {args.prep_time}s ...")
 
         while running:
             now_perf = time.perf_counter()
-            measured_dt = max(now_perf - last_step_t, 1e-4)
-            last_step_t = now_perf
             t_now = time.time() - t_start
 
             q, dq, _, _ = system.get_leader_joint_states()
@@ -264,8 +394,7 @@ def main() -> int:
                 tau_grav = system.gravity_compensation(q, dq)
                 tau_fric = system.friction_compensation(dq)
                 tau_damp = -float(system.gravity_comp_velocity_damping) * dq
-                tau_cmd = tau_grav + tau_fric + tau_damp
-                system.set_leader_joint_torque(tau_cmd, 0.0)
+                system.set_leader_joint_torque(tau_grav + tau_fric + tau_damp, 0.0)
 
                 if t_now >= args.prep_time:
                     phase = "RECORD"
@@ -276,8 +405,7 @@ def main() -> int:
                 tau_grav = system.gravity_compensation(q, dq)
                 tau_fric = system.friction_compensation(dq)
                 tau_damp = -float(system.gravity_comp_velocity_damping) * dq
-                tau_cmd = tau_grav + tau_fric + tau_damp
-                system.set_leader_joint_torque(tau_cmd, 0.0)
+                system.set_leader_joint_torque(tau_grav + tau_fric + tau_damp, 0.0)
 
                 t_rel = t_now - record_start_t
                 trajectory_q.append((t_rel, q.copy(), dq.copy()))
@@ -287,29 +415,24 @@ def main() -> int:
                     print(f"[HOME] Switching to position mode & returning to start ({args.home_time}s)")
 
                     raw_pos_now = np.asarray(system.driver.get_joints(), dtype=float)
+
                     system.driver.set_torque_mode(False)
                     time.sleep(0.02)
                     system.driver.set_operating_mode(3)
                     time.sleep(0.02)
                     system.driver.set_torque_mode(True)
-
                     system.driver.set_joints(raw_pos_now.tolist())
-                    last_sent_raw = raw_pos_now.copy()
                     time.sleep(0.02)
 
                     home_start_t = t_now
-                    home_start_q = q.copy()
-                    target_q = trajectory_q[0][1].copy()
                     home_start_raw = raw_pos_now.copy()
+                    target_q = trajectory_q[0][1].copy()
+
                     target_raw = np.zeros(system.num_motors)
-                    target_raw[:n] = (
-                        target_q * system.joint_signs[:n]
-                        + system.joint_offsets[:n]
-                    )
+                    target_raw[:n] = target_q * system.joint_signs[:n] + system.joint_offsets[:n]
                     if system.num_motors > n:
                         target_raw[-1] = raw_pos_now[-1]
 
-                    # Ensure HOME interpolation takes the shortest angular path.
                     for i in range(system.num_motors):
                         delta = target_raw[i] - home_start_raw[i]
                         while delta > np.pi:
@@ -325,7 +448,6 @@ def main() -> int:
                 s = 10 * alpha_t**3 - 15 * alpha_t**4 + 6 * alpha_t**5
                 des_raw = home_start_raw + s * (target_raw - home_start_raw)
                 system.driver.set_joints(des_raw.tolist())
-                last_sent_raw = des_raw.copy()
 
                 if t_rel >= args.home_time:
                     phase = "SETTLE"
@@ -333,11 +455,9 @@ def main() -> int:
                     print("[SETTLE] Holding start position (1.5s) ...")
 
             elif phase == "SETTLE":
-                t_rel = t_now - settle_start_t
                 system.driver.set_joints(target_raw.tolist())
-                last_sent_raw = target_raw.copy()
 
-                if t_rel >= 1.5:
+                if (t_now - settle_start_t) >= 1.5:
                     print("[SWITCH] Switching to current control for impedance replay...")
                     system.driver.set_torque_mode(False)
                     time.sleep(0.02)
@@ -362,18 +482,14 @@ def main() -> int:
 
                 idx = np.searchsorted([p[0] for p in trajectory_q], t_rel)
                 idx = min(idx, len(trajectory_q) - 1)
-                _, q_ref, dq_ref = trajectory_q[idx]
+                _, q_ref, _dq_ref = trajectory_q[idx]
 
-                if not args.no_feedforward:
-                    tau_grav = system.gravity_compensation(q, dq)
-                    tau_fric = system.friction_compensation(dq)
-                    tau_damp = -float(system.gravity_comp_velocity_damping) * dq
-                    tau_ff = tau_grav + tau_fric + tau_damp
-                else:
-                    tau_ff = system.gravity_compensation(q, np.zeros(n))
+                tau_grav = system.gravity_compensation(q, dq)
+                tau_fric = system.friction_compensation(dq)
+                tau_damp = -float(system.gravity_comp_velocity_damping) * dq
+                tau_ff = tau_grav + tau_fric + tau_damp
 
                 if args.mode == "joint":
-                    # Wrap replay reference to the nearest turn relative to q.
                     q_ref_near = q_ref.copy()
                     for i in range(n):
                         while q_ref_near[i] - q[i] > np.pi:
@@ -382,16 +498,17 @@ def main() -> int:
                             q_ref_near[i] += 2.0 * np.pi
 
                     tau_pd = kp * (q_ref_near - q) - kd * dq
-                    tau_pd = np.clip(tau_pd, -tau_max, tau_max)
-                    tau_cmd = tau_ff + tau_pd
-                    system.set_leader_joint_torque(tau_cmd, 0.0)
+                    tau_pd_clipped = np.clip(tau_pd, -tau_max, tau_max)
+                    system.set_leader_joint_torque(tau_ff + tau_pd_clipped, 0.0)
 
                     t_buf.append(t_rel)
                     ref_buf.append(q_ref_near.copy())
                     act_buf.append(q.copy())
+                    tau_ff_buf.append(tau_ff.copy())
+                    tau_pd_buf.append(tau_pd_clipped.copy())
 
                 else:
-                    x_ref, j_ref = compute_task_kinematics(system, q_ref)
+                    x_ref, _ = compute_task_kinematics(system, q_ref)
                     x_act, j_act = compute_task_kinematics(system, q)
                     dx_act = j_act @ dq
 
@@ -399,40 +516,33 @@ def main() -> int:
                     tau_task = j_act.T @ f_task
                     null_proj = np.eye(n) - np.linalg.pinv(j_act) @ j_act
                     tau_null = null_proj @ (-args.kd_null * dq)
-
-                    tau_imp = tau_task + tau_null
-                    tau_imp = np.clip(tau_imp, -tau_max, tau_max)
-
-                    tau_cmd = tau_ff + tau_imp
-                    system.set_leader_joint_torque(tau_cmd, 0.0)
+                    tau_imp = np.clip(tau_task + tau_null, -tau_max, tau_max)
+                    system.set_leader_joint_torque(tau_ff + tau_imp, 0.0)
 
                     t_buf.append(t_rel)
                     ref_buf.append(x_ref.copy())
                     act_buf.append(x_act.copy())
+                    tau_ff_buf.append(tau_ff.copy())
+                    tau_pd_buf.append(tau_imp.copy())
 
                 debug_counter += 1
-                if debug_counter % 30 == 1:
-                    if args.mode == "joint":
-                        q_ref_dbg = q_ref.copy()
-                        for i in range(n):
-                            while q_ref_dbg[i] - q[i] > np.pi:
-                                q_ref_dbg[i] -= 2.0 * np.pi
-                            while q_ref_dbg[i] - q[i] < -np.pi:
-                                q_ref_dbg[i] += 2.0 * np.pi
+                if debug_counter % 30 == 1 and args.mode == "joint":
+                    q_ref_dbg = q_ref.copy()
+                    for i in range(n):
+                        while q_ref_dbg[i] - q[i] > np.pi:
+                            q_ref_dbg[i] -= 2.0 * np.pi
+                        while q_ref_dbg[i] - q[i] < -np.pi:
+                            q_ref_dbg[i] += 2.0 * np.pi
 
-                        err_terms = q - q_ref_dbg
-                        tau_print = np.clip(
-                            kp * (q_ref_dbg - q) - kd * dq,
-                            -tau_max,
-                            tau_max,
-                        )
-                        err_str = " ".join(f"{e*57.3:+5.1f}deg" for e in err_terms)
-                        tau_str = " ".join(f"{t:+.2f}" for t in tau_print)
-                        print(f"  [t={t_rel:5.2f}] err=[{err_str}]  tau_pd=[{tau_str}]")
+                    tau_dbg = np.clip(kp * (q_ref_dbg - q) - kd * dq, -tau_max, tau_max)
+                    err_terms = q - q_ref_dbg
+                    err_str = " ".join(f"{e*57.3:+5.1f}deg" for e in err_terms)
+                    tau_str = " ".join(f"{t:+.2f}" for t in tau_dbg)
+                    ff_str = " ".join(f"{t:+.2f}" for t in tau_ff)
+                    print(f"  [t={t_rel:5.2f}] err=[{err_str}]  tau_pd=[{tau_str}]  tau_ff=[{ff_str}]")
 
                 wall_now = time.time()
-                if (not args.no_plot and plot_state is not None and
-                        wall_now - last_plot_t >= plot_period):
+                if (not args.no_plot and plot_state is not None and wall_now - last_plot_t >= plot_period):
                     _update_plot(
                         plot_state,
                         np.asarray(t_buf, dtype=float),
@@ -445,10 +555,8 @@ def main() -> int:
                 tau_grav = system.gravity_compensation(q, dq)
                 tau_fric = system.friction_compensation(dq)
                 tau_damp = -float(system.gravity_comp_velocity_damping) * dq
-                tau_pd = kp * (hold_q - q) - kd * dq
-                tau_pd = np.clip(tau_pd, -tau_max, tau_max)
-                tau_cmd = tau_grav + tau_fric + tau_damp + tau_pd
-                system.set_leader_joint_torque(tau_cmd, 0.0)
+                tau_pd = np.clip(kp * (hold_q - q) - kd * dq, -tau_max, tau_max)
+                system.set_leader_joint_torque(tau_grav + tau_fric + tau_damp + tau_pd, 0.0)
 
             sleep_s = max(0.0, float(system.dt) - (time.perf_counter() - now_perf))
             if sleep_s > 0:
@@ -476,65 +584,35 @@ def main() -> int:
             except Exception:
                 pass
 
-        if plt is not None and len(t_buf) > 10:
+        if (
+            args.mode == "joint"
+            and not args.no_thesis_plots
+            and plt is not None
+            and len(t_buf) > 10
+            and len(tau_ff_buf) > 10
+        ):
             try:
                 ts_str = time.strftime("%Y%m%d_%H%M%S")
-                t_arr = np.asarray(t_buf, dtype=float)
-                refs = np.asarray(ref_buf, dtype=float)
-                acts = np.asarray(act_buf, dtype=float)
-                errs = acts - refs
+                print(f"\nGenerating thesis plots ({len(t_buf)} samples)...")
 
-                fig, axes = plt.subplots(3, 1, figsize=(8, 9), sharex=True,
-                                         gridspec_kw={"hspace": 0.08})
-
-                plt.rcParams.update(
-                    {
-                        "font.family": "sans-serif",
-                        "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
-                        "font.size": 10,
-                        "axes.titlesize": 11,
-                        "axes.titleweight": "bold",
-                    }
+                files = save_thesis_plots(
+                    t=np.asarray(t_buf, dtype=float),
+                    q_ref=np.asarray(ref_buf, dtype=float),
+                    q_act=np.asarray(act_buf, dtype=float),
+                    tau_ff=np.asarray(tau_ff_buf, dtype=float),
+                    tau_pd=np.asarray(tau_pd_buf, dtype=float),
+                    n_joints=n,
+                    mode=args.mode,
+                    kp=kp,
+                    kd=kd,
+                    tau_max=tau_max,
+                    ts_str=ts_str,
                 )
-
-                colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
-
-                for i in range(refs.shape[1]):
-                    lbl = f"J{i+1}" if args.mode == "joint" else ["X", "Y", "Z"][i]
-                    axes[0].plot(t_arr, refs[:, i], "--", color=colors[i], alpha=0.5,
-                                 lw=1.2, label=f"{lbl} ref")
-                    axes[0].plot(t_arr, acts[:, i], "-", color=colors[i],
-                                 lw=1.3, label=f"{lbl} act")
-                axes[0].set_ylabel("Joint Angle (rad)" if args.mode == "joint" else "TCP Position (m)")
-                axes[0].set_title("(a)  Impedance Replay: Reference vs. Actual", loc="left")
-                axes[0].legend(ncol=6, fontsize=8, framealpha=0.85, edgecolor="none")
-                axes[0].grid(True, ls="--", alpha=0.25)
-
-                for i in range(errs.shape[1]):
-                    lbl = f"J{i+1}" if args.mode == "joint" else ["X", "Y", "Z"][i]
-                    scale = 57.3 if args.mode == "joint" else 1000.0
-                    axes[1].plot(t_arr, errs[:, i] * scale, color=colors[i], lw=1.0, label=lbl)
-                unit = "deg" if args.mode == "joint" else "mm"
-                axes[1].set_ylabel(f"Tracking Error ({unit})")
-                axes[1].set_title("(b)  Per-Joint Tracking Error", loc="left")
-                axes[1].legend(ncol=6, fontsize=8, framealpha=0.85, edgecolor="none")
-                axes[1].grid(True, ls="--", alpha=0.25)
-
-                rms_scale = 57.3 if args.mode == "joint" else 1000.0
-                rms = np.sqrt(np.mean(errs**2, axis=1)) * rms_scale
-                axes[2].plot(t_arr, rms, "k-", lw=1.5)
-                axes[2].set_ylabel(f"RMS Error ({unit})")
-                axes[2].set_xlabel("Time (s)")
-                axes[2].set_title(f"(c)  RMS Tracking Error  (mean = {np.mean(rms):.2f}{unit})", loc="left")
-                axes[2].grid(True, ls="--", alpha=0.25)
-
-                fig.tight_layout()
-                fname = f"trajectory_impedance_{args.mode}_{ts_str}.svg"
-                fig.savefig(fname, format="svg", bbox_inches="tight")
-                print(f"\nSaved plot -> {fname}")
-                plt.close(fig)
+                print(f"Generated {len(files)} thesis plots.")
             except Exception as e:
-                print(f"Plot failed: {e}")
+                print(f"Thesis plot generation failed: {e}")
+                import traceback
+                traceback.print_exc()
 
         if plt is not None:
             if plot_state is not None:
