@@ -585,7 +585,7 @@ def main() -> int:
         observer_deadband = np.zeros(n)
         tau_ext_prev = np.zeros(n)
         tau_ext_rate_limit = 0.08
-        tau_ext_max = np.array([0.30, 0.30, 0.30, 0.15, 0.15, 0.08],
+        tau_ext_max = np.array([3.0, 3.0, 3.0, 1.5, 1.5, 0.8],
                                dtype=float)
         if n < len(tau_ext_max):
             tau_ext_max = tau_ext_max[:n]
@@ -638,30 +638,33 @@ def main() -> int:
             # Calculate tau_cmd from motor current similar to how Shi handles it
             d_prev = np.sign(dq)  # Simplify eta-mechanism direction
             eta_correction = np.where(d_prev > 0, motor_eta[:n], 1.0 / motor_eta[:n])
-            tau_motor = currents_arm * kt[:n] * gear_ratio[:n] * eta_correction
+            tau_motor = (currents_arm / 1000.0) * kt[:n] * gear_ratio[:n] * eta_correction
             if not np.all(np.isfinite(tau_motor)):
                 tau_motor = np.nan_to_num(tau_motor, nan=0.0, posinf=0.0, neginf=0.0)
                 nan_warn_counter += 1
                 if nan_warn_counter <= 5:
                     print("[WARN] Non-finite tau_motor detected; replaced invalid values with 0.")
             
-            # Momentum observer — runs every iteration so it stays warm
-            try:
-                _, tau_ext = mob.update(q, dq, tau_motor, dq)
-            except Exception as exc:
-                tau_ext = np.zeros(n, dtype=float)
-                mob.reset(q)
-                nan_warn_counter += 1
-                if nan_warn_counter <= 5:
-                    print(f"[WARN] MOB observer update failed ({exc}); using zero external torque and resetting observer.")
+            # MOB observer only runs in calibration/replay phases where tau_motor is meaningful.
+            if phase in ("TARE", "WARMUP", "REPLAY"):
+                try:
+                    _, tau_ext = mob.update(q, dq, tau_motor, dq)
+                except Exception as exc:
+                    tau_ext = np.zeros(n, dtype=float)
+                    mob.reset(q)
+                    nan_warn_counter += 1
+                    if nan_warn_counter <= 5:
+                        print(f"[WARN] MOB observer update failed ({exc}); using zero external torque and resetting observer.")
 
-            tau_ext = np.asarray(tau_ext, dtype=float)
-            if not np.all(np.isfinite(tau_ext)):
-                tau_ext = np.nan_to_num(tau_ext, nan=0.0, posinf=0.0, neginf=0.0)
-                mob.reset(q)
-                nan_warn_counter += 1
-                if nan_warn_counter <= 5:
-                    print("[WARN] Non-finite tau_ext from observer; using zeros and resetting observer.")
+                tau_ext = np.asarray(tau_ext, dtype=float)
+                if not np.all(np.isfinite(tau_ext)):
+                    tau_ext = np.zeros(n, dtype=float)
+                    mob.reset(q)
+                    nan_warn_counter += 1
+                    if nan_warn_counter <= 5:
+                        print("[WARN] Non-finite tau_ext from observer; using zeros and resetting observer.")
+            else:
+                tau_ext = np.zeros(n, dtype=float)
 
             # ── PHASE: PREP ──────────────────────────────────────────
             if phase == "PREP":
@@ -745,6 +748,7 @@ def main() -> int:
                     phase = "TARE"
                     tare_start_t = t_now
                     tare_samples = []
+                    tare_invalid_samples = 0
                     
                     # ── NEU: MOB Reset damit TARE von sauberem State startet ──
                     q_now, _, _, _ = system.get_leader_joint_states()
@@ -764,7 +768,7 @@ def main() -> int:
                     tare_invalid_samples += 1
 
                 if t_rel >= 1.0:
-                    min_deadband = np.array([0.05, 0.30, 0.30, 0.03, 0.03, 0.02],
+                    min_deadband = np.array([0.04, 0.08, 0.08, 0.03, 0.03, 0.02],
                                             dtype=float)
                     if n < len(min_deadband):
                         min_deadband = min_deadband[:n]

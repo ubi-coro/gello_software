@@ -215,7 +215,7 @@ def save_thesis_plots(
       2. Tare offset bar chart
       3. η-mechanism detail for J3 (2-panel: current + τ_ext)
     """
-    del tau_comp, q_act, tau_clamp, tare_samples
+    del tau_comp, tau_clamp, tare_samples
 
     if plt is None:
         print("matplotlib not available - skipping thesis plots.")
@@ -595,8 +595,8 @@ def main() -> int:
         observer_tare = np.zeros(n)
         observer_deadband = np.zeros(n)
         tau_ext_prev = np.zeros(n)
-        tau_ext_rate_limit = 0.08
-        tau_ext_max = np.array([0.30, 0.30, 0.30, 0.15, 0.15, 0.08],
+        tau_ext_rate_limit = 0.2
+        tau_ext_max = np.array([3.0, 3.0, 3.0, 1.5, 1.5, 0.8],
                                dtype=float)
         if n < len(tau_ext_max):
             tau_ext_max = tau_ext_max[:n]
@@ -725,7 +725,7 @@ def main() -> int:
                     tare_array = np.asarray(tare_samples, dtype=float)
                     observer_tare = np.mean(tare_array, axis=0)
                     tare_std = np.std(tare_array, axis=0)
-                    min_deadband = np.array([0.05, 0.30, 0.30, 0.03, 0.03, 0.02],
+                    min_deadband = np.array([0.10, 0.15, 0.15, 0.05, 0.05, 0.03],#[0.04, 0.08, 0.08, 0.03, 0.03, 0.02],
                                             dtype=float)
                     if n < len(min_deadband):
                         min_deadband = min_deadband[:n]
