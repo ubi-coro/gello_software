@@ -595,8 +595,8 @@ def main() -> int:
         observer_tare = np.zeros(n)
         observer_deadband = np.zeros(n)
         tau_ext_prev = np.zeros(n)
-        tau_ext_rate_limit = 0.05
-        tau_ext_max = np.array([0.15, 0.15, 0.15, 0.10, 0.10, 0.05],
+        tau_ext_rate_limit = 0.08
+        tau_ext_max = np.array([0.30, 0.30, 0.30, 0.15, 0.15, 0.08],
                                dtype=float)
         if n < len(tau_ext_max):
             tau_ext_max = tau_ext_max[:n]

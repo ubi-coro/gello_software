@@ -210,7 +210,7 @@ def save_thesis_plots(
       2. Tare offset bar chart
       3. η-mechanism detail for J3 (2-panel: current + τ_ext)
     """
-    del tau_comp, q_act, tau_clamp, tare_samples
+    del tau_comp, tau_clamp, tare_samples
 
     if plt is None:
         print("matplotlib not available - skipping thesis plots.")
@@ -584,8 +584,8 @@ def main() -> int:
         observer_tare = np.zeros(n)
         observer_deadband = np.zeros(n)
         tau_ext_prev = np.zeros(n)
-        tau_ext_rate_limit = 0.05
-        tau_ext_max = np.array([0.15, 0.15, 0.15, 0.10, 0.10, 0.05],
+        tau_ext_rate_limit = 0.08
+        tau_ext_max = np.array([0.30, 0.30, 0.30, 0.15, 0.15, 0.08],
                                dtype=float)
         if n < len(tau_ext_max):
             tau_ext_max = tau_ext_max[:n]
@@ -594,6 +594,8 @@ def main() -> int:
                                  mode="edge")
         leak = 0.995
         debug_counter = 0
+        nan_warn_counter = 0
+        tare_invalid_samples = 0
 
         # Admittance state (initialised properly when entering REPLAY)
         q_c  = np.zeros(n)
@@ -608,20 +610,58 @@ def main() -> int:
             t_now = time.time() - t_start
 
             q, dq, _, _ = system.get_leader_joint_states()
+            q = np.asarray(q, dtype=float)
+            dq = np.asarray(dq, dtype=float)
+            if not np.all(np.isfinite(q)):
+                q = np.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0)
+                nan_warn_counter += 1
+                if nan_warn_counter <= 5:
+                    print("[WARN] Non-finite joint position detected; replaced invalid values with 0.")
+            if not np.all(np.isfinite(dq)):
+                dq = np.nan_to_num(dq, nan=0.0, posinf=0.0, neginf=0.0)
+                nan_warn_counter += 1
+                if nan_warn_counter <= 5:
+                    print("[WARN] Non-finite joint velocity detected; replaced invalid values with 0.")
 
             # Motor currents (needed for MOB observer in every phase)
             currents_all = (system.driver.get_currents()
                            if system.driver is not None
                            else np.zeros(system.num_motors))
+            currents_all = np.asarray(currents_all, dtype=float)
+            if not np.all(np.isfinite(currents_all)):
+                currents_all = np.nan_to_num(currents_all, nan=0.0, posinf=0.0, neginf=0.0)
+                nan_warn_counter += 1
+                if nan_warn_counter <= 5:
+                    print("[WARN] Non-finite motor current detected; replaced invalid values with 0.")
             currents_arm = currents_all[:n] * system.joint_signs[:n]
 
             # Calculate tau_cmd from motor current similar to how Shi handles it
             d_prev = np.sign(dq)  # Simplify eta-mechanism direction
             eta_correction = np.where(d_prev > 0, motor_eta[:n], 1.0 / motor_eta[:n])
             tau_motor = currents_arm * kt[:n] * gear_ratio[:n] * eta_correction
+            if not np.all(np.isfinite(tau_motor)):
+                tau_motor = np.nan_to_num(tau_motor, nan=0.0, posinf=0.0, neginf=0.0)
+                nan_warn_counter += 1
+                if nan_warn_counter <= 5:
+                    print("[WARN] Non-finite tau_motor detected; replaced invalid values with 0.")
             
             # Momentum observer — runs every iteration so it stays warm
-            _, tau_ext = mob.update(q, dq, tau_motor, dq)
+            try:
+                _, tau_ext = mob.update(q, dq, tau_motor, dq)
+            except Exception as exc:
+                tau_ext = np.zeros(n, dtype=float)
+                mob.reset(q)
+                nan_warn_counter += 1
+                if nan_warn_counter <= 5:
+                    print(f"[WARN] MOB observer update failed ({exc}); using zero external torque and resetting observer.")
+
+            tau_ext = np.asarray(tau_ext, dtype=float)
+            if not np.all(np.isfinite(tau_ext)):
+                tau_ext = np.nan_to_num(tau_ext, nan=0.0, posinf=0.0, neginf=0.0)
+                mob.reset(q)
+                nan_warn_counter += 1
+                if nan_warn_counter <= 5:
+                    print("[WARN] Non-finite tau_ext from observer; using zeros and resetting observer.")
 
             # ── PHASE: PREP ──────────────────────────────────────────
             if phase == "PREP":
@@ -705,6 +745,11 @@ def main() -> int:
                     phase = "TARE"
                     tare_start_t = t_now
                     tare_samples = []
+                    
+                    # ── NEU: MOB Reset damit TARE von sauberem State startet ──
+                    q_now, _, _, _ = system.get_leader_joint_states()
+                    mob.reset(q_now)
+                    
                     print("[TARE] Holding position, calibrating observer (1s)...")
 
             # ── PHASE: TARE ──────────────────────────────────────────
@@ -713,12 +758,12 @@ def main() -> int:
 
                 system.driver.set_joints(target_raw.tolist())
                 last_sent_raw = target_raw.copy()
-                tare_samples.append(tau_ext.copy())
+                if np.all(np.isfinite(tau_ext)):
+                    tare_samples.append(tau_ext.copy())
+                else:
+                    tare_invalid_samples += 1
 
                 if t_rel >= 1.0:
-                    tare_array = np.asarray(tare_samples, dtype=float)
-                    observer_tare = np.mean(tare_array, axis=0)
-                    tare_std = np.std(tare_array, axis=0)
                     min_deadband = np.array([0.05, 0.30, 0.30, 0.03, 0.03, 0.02],
                                             dtype=float)
                     if n < len(min_deadband):
@@ -729,10 +774,22 @@ def main() -> int:
                             (0, n - len(min_deadband)),
                             mode="edge",
                         )
-                    observer_deadband = np.maximum(3.0 * tare_std, min_deadband)
+                    if len(tare_samples) == 0:
+                        observer_tare = np.zeros(n, dtype=float)
+                        tare_std = np.zeros(n, dtype=float)
+                        observer_deadband = min_deadband.copy()
+                        print("[WARN] No valid tare samples captured; using zero tare and minimum deadband.")
+                    else:
+                        tare_array = np.asarray(tare_samples, dtype=float)
+                        observer_tare = np.mean(tare_array, axis=0)
+                        tare_std = np.std(tare_array, axis=0)
+                        observer_deadband = np.maximum(3.0 * tare_std, min_deadband)
 
-                    # ── THESIS: store full tare array for plotting ─
-                    tare_samples_for_plot = tare_array.copy()
+                        # ── THESIS: store full tare array for plotting ─
+                        tare_samples_for_plot = tare_array.copy()
+
+                    if tare_invalid_samples > 0:
+                        print(f"[WARN] Dropped {tare_invalid_samples} invalid tare samples.")
 
                     print(f"  Tare offset: {[f'{x:+.3f}' for x in observer_tare]} Nm")
                     print(f"  Deadband 3σ+min: {[f'{x:.3f}' for x in observer_deadband]} Nm")
@@ -825,6 +882,9 @@ def main() -> int:
                           f"{measured_dt*1000:.2f}ms")
 
                 tau_ext_comp = tau_ext - observer_tare
+                tau_ext_comp = np.nan_to_num(
+                    tau_ext_comp, nan=0.0, posinf=0.0, neginf=0.0
+                )
 
                 tau_ext_comp = np.where(
                     np.abs(tau_ext_comp) < observer_deadband,
@@ -860,6 +920,12 @@ def main() -> int:
 
                     dq_c = leak * dq_c + ddq_c * measured_dt
                     q_c  = q_c  + dq_c  * measured_dt
+                    if not np.all(np.isfinite(q_c)):
+                        q_c = q_ref.copy()
+                        dq_c = np.zeros(n, dtype=float)
+                        if nan_warn_counter <= 5:
+                            print("[WARN] Non-finite q_c detected in joint admittance; resetting to q_ref.")
+                        nan_warn_counter += 1
 
                     # ── THESIS: log q_c after dynamics ───────────
                     qc_buf.append(q_c.copy())
@@ -889,6 +955,12 @@ def main() -> int:
                     # Differential IK  dq = J^+ dx
                     dq_c_des = np.linalg.pinv(J_act) @ dx_c
                     q_c = q_c + dq_c_des * measured_dt
+                    if not np.all(np.isfinite(q_c)):
+                        q_c = q_ref.copy()
+                        dx_c = np.zeros(3, dtype=float)
+                        if nan_warn_counter <= 5:
+                            print("[WARN] Non-finite q_c detected in task admittance; resetting to q_ref.")
+                        nan_warn_counter += 1
 
                     # ── THESIS: log q_c after dynamics ───────────
                     qc_buf.append(q_c.copy())
@@ -910,6 +982,12 @@ def main() -> int:
                 # Keep gripper at its current raw position
                 if n_motors > n:
                     target_hw[-1] = system.leader_gripper_raw_rad
+
+                if not np.all(np.isfinite(target_hw)):
+                    target_hw = np.where(np.isfinite(target_hw), target_hw, last_sent_raw)
+                    nan_warn_counter += 1
+                    if nan_warn_counter <= 5:
+                        print("[WARN] Non-finite hardware target detected; falling back to last valid command.")
 
                 # Prevent 360° jumps by wrapping target to the nearest turn.
                 for i in range(n):
