@@ -4,6 +4,13 @@
 Records a human-guided trajectory in gravity compensation,
 then replays it using joint-space or task-space impedance control.
 
+Architecture note (Policy rollout compatibility):
+    During REPLAY, the controller uses
+        tau_cmd = tau_ff(q, dq_filt) + tau_pd(q, q_ref, dq_filt)
+    where
+        tau_ff = gravity + friction feedforward + damping
+        tau_pd = Kp*(q_ref-q) - Kd*dq_filt
+
 Phases:
   1. PREP    - Settle in gravity comp (current control)
   2. RECORD  - User moves arm, trajectory recorded (current control)
@@ -90,6 +97,21 @@ def compute_task_kinematics(system: FACTRGravityCompensation, q: np.ndarray):
     return x, j_full[:3, :n]
 
 
+def friction_feedforward_only(
+    system: FACTRGravityCompensation,
+    dq: np.ndarray,
+) -> np.ndarray:
+    """Friction compensation without dither oscillation."""
+    n = system.num_arm_joints
+    tau = np.zeros(n)
+    for i in range(n):
+        vel = dq[i]
+        if abs(vel) > system.friction_velocity_deadband[i]:
+            tau[i] += system.friction_feedforward[i] * np.sign(vel)
+            tau[i] += system.viscous_friction[i] * vel
+    return tau
+
+
 def save_thesis_plots(
     *,
     t: np.ndarray,
@@ -102,6 +124,7 @@ def save_thesis_plots(
     kp: np.ndarray,
     kd: np.ndarray,
     tau_max: np.ndarray,
+    vel_alpha: float,
     ts_str: str,
 ) -> list:
     """Generate two focused thesis figures for joint-space replay."""
@@ -150,10 +173,23 @@ def save_thesis_plots(
     ax1b.legend(ncol=4, loc="upper right")
     ax1b.grid(True, ls="--")
 
+    ax1a.text(
+        0.01, 0.02,
+        (
+            f"Kp = [{', '.join(f'{x:.2f}' for x in kp)}] Nm/rad\n"
+            f"Kd = [{', '.join(f'{x:.2f}' for x in kd)}] Nm*s/rad\n"
+            f"tau_max = [{', '.join(f'{x:.1f}' for x in tau_max)}] Nm\n"
+            f"vel_filter alpha = {vel_alpha:.2f}"
+        ),
+        transform=ax1a.transAxes, fontsize=7.5, va="bottom", ha="left",
+        fontfamily="monospace",
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", edgecolor="#cccccc", alpha=0.95),
+    )
+
     fig1.align_ylabels([ax1a, ax1b])
     fig1.tight_layout()
     fname1 = IMPEDANCE_PLOTS_DIR / f"impedance_tracking_{mode}_{ts_str}.svg"
-    fig1.savefig(fname1, format="svg", bbox_inches="tight")
+    fig1.savefig(str(fname1), format="svg", bbox_inches="tight")
     plt.close(fig1)
     saved.append(str(fname1))
     print(f"  Saved -> {fname1}")
@@ -185,11 +221,17 @@ def save_thesis_plots(
 
     rms_ff = float(np.sqrt(np.mean(tau_ff ** 2)))
     rms_pd = float(np.sqrt(np.mean(tau_pd ** 2)))
+    ax2b.text(
+        0.01, 0.02,
+        f"RMS tau_ff = {rms_ff:.3f} Nm   RMS tau_pd = {rms_pd:.3f} Nm   Ratio: {rms_ff / max(rms_pd, 1e-6):.1f}:1",
+        transform=ax2b.transAxes, fontsize=8, va="bottom", ha="left",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="#cccccc", alpha=0.95),
+    )
 
     fig2.align_ylabels([ax2a, ax2b])
     fig2.tight_layout()
     fname2 = IMPEDANCE_PLOTS_DIR / f"impedance_torques_{mode}_{ts_str}.svg"
-    fig2.savefig(fname2, format="svg", bbox_inches="tight")
+    fig2.savefig(str(fname2), format="svg", bbox_inches="tight")
     plt.close(fig2)
     saved.append(str(fname2))
     print(f"  Saved -> {fname2}")
@@ -267,6 +309,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--kd-j", type=float, default=0.0,
                    help="Joint Kd base (Nm*s/rad). 0 = no extra damping.")
 
+    p.add_argument("--vel-alpha", type=float, default=0.15,
+                   help="EMA velocity filter. 0.01=heavy, 1.0=off. Default 0.15")
+
     p.add_argument("--kp-t", type=float, default=150.0)
     p.add_argument("--kd-t", type=float, default=10.0)
     p.add_argument("--kd-null", type=float, default=0.5)
@@ -306,6 +351,7 @@ def main() -> int:
     kp = np.zeros(6)
     kd = np.zeros(6)
     tau_max = np.zeros(6)
+    vel_alpha = 0.15
 
     def _sig(signum, frame):
         del signum, frame
@@ -327,6 +373,8 @@ def main() -> int:
         kp = args.kp_j * kp_scale
         kd = args.kd_j * kd_scale
         tau_max = np.array([1.2, 2.0, 2.0, 0.8, 0.8, 0.5], dtype=float)[:n]
+        vel_alpha = float(np.clip(args.vel_alpha, 0.01, 1.0))
+        dq_filt = np.zeros(n)
 
         buf_size = int(max(args.record_time, 10.0) * 500)
         t_buf = deque(maxlen=buf_size)
@@ -338,6 +386,9 @@ def main() -> int:
         print(f"Replay Kp: {[f'{x:.2f}' for x in kp]}")
         print(f"Replay Kd: {[f'{x:.2f}' for x in kd]}")
         print(f"Torque limits: {[f'{x:.1f}' for x in tau_max]} Nm")
+        print(f"Velocity filter alpha: {vel_alpha:.2f} "
+              f"({'off' if vel_alpha >= 0.99 else f'~{1/vel_alpha:.0f} sample avg'})")
+        print("Feedforward: grav(q,dq_filt) + fric_ff(dq_filt) + damp(dq_filt)")
         if args.kp_j == 0.0 and args.kd_j == 0.0:
             print("  WARNING: Kp=0, Kd=0: REPLAY is pure gravity comp (no tracking)")
 
@@ -444,6 +495,9 @@ def main() -> int:
                     system.driver.set_torque_mode(True)
                     time.sleep(0.05)
 
+                    _, dq_init, _, _ = system.get_leader_joint_states()
+                    dq_filt = dq_init.copy()
+
                     phase = "REPLAY"
                     replay_start_t = time.time() - t_start
                     debug_counter = 0
@@ -462,9 +516,11 @@ def main() -> int:
                 idx = min(idx, len(trajectory_q) - 1)
                 _, q_ref, _dq_ref = trajectory_q[idx]
 
-                tau_grav = system.gravity_compensation(q, dq)
-                tau_fric = system.friction_compensation(dq)
-                tau_damp = -float(system.gravity_comp_velocity_damping) * dq
+                dq_filt = vel_alpha * dq + (1.0 - vel_alpha) * dq_filt
+
+                tau_grav = system.gravity_compensation(q, dq_filt)
+                tau_fric = friction_feedforward_only(system, dq_filt)
+                tau_damp = -float(system.gravity_comp_velocity_damping) * dq_filt
                 tau_ff = tau_grav + tau_fric + tau_damp
 
                 if args.mode == "joint":
@@ -475,7 +531,7 @@ def main() -> int:
                         while q_ref_near[i] - q[i] < -np.pi:
                             q_ref_near[i] += 2.0 * np.pi
 
-                    tau_pd = kp * (q_ref_near - q) - kd * dq
+                    tau_pd = kp * (q_ref_near - q) - kd * dq_filt
                     tau_pd_clipped = np.clip(tau_pd, -tau_max, tau_max)
                     system.set_leader_joint_torque(tau_ff + tau_pd_clipped, 0.0)
 
@@ -488,12 +544,12 @@ def main() -> int:
                 else:
                     x_ref, _ = compute_task_kinematics(system, q_ref)
                     x_act, j_act = compute_task_kinematics(system, q)
-                    dx_act = j_act @ dq
+                    dx_act = j_act @ dq_filt
 
                     f_task = args.kp_t * (x_ref - x_act) - args.kd_t * dx_act
                     tau_task = j_act.T @ f_task
                     null_proj = np.eye(n) - np.linalg.pinv(j_act) @ j_act
-                    tau_null = null_proj @ (-args.kd_null * dq)
+                    tau_null = null_proj @ (-args.kd_null * dq_filt)
                     tau_imp = np.clip(tau_task + tau_null, -tau_max, tau_max)
                     system.set_leader_joint_torque(tau_ff + tau_imp, 0.0)
 
@@ -512,7 +568,7 @@ def main() -> int:
                         while q_ref_dbg[i] - q[i] < -np.pi:
                             q_ref_dbg[i] += 2.0 * np.pi
 
-                    tau_dbg = np.clip(kp * (q_ref_dbg - q) - kd * dq, -tau_max, tau_max)
+                    tau_dbg = np.clip(kp * (q_ref_dbg - q) - kd * dq_filt, -tau_max, tau_max)
                     err_terms = q - q_ref_dbg
                     err_str = " ".join(f"{e*57.3:+5.1f}deg" for e in err_terms)
                     tau_str = " ".join(f"{t:+.2f}" for t in tau_dbg)
@@ -530,10 +586,11 @@ def main() -> int:
                     last_plot_t = wall_now
 
             elif phase == "HOLD":
-                tau_grav = system.gravity_compensation(q, dq)
-                tau_fric = system.friction_compensation(dq)
-                tau_damp = -float(system.gravity_comp_velocity_damping) * dq
-                tau_pd = np.clip(kp * (hold_q - q) - kd * dq, -tau_max, tau_max)
+                dq_filt = vel_alpha * dq + (1.0 - vel_alpha) * dq_filt
+                tau_grav = system.gravity_compensation(q, dq_filt)
+                tau_fric = friction_feedforward_only(system, dq_filt)
+                tau_damp = -float(system.gravity_comp_velocity_damping) * dq_filt
+                tau_pd = np.clip(kp * (hold_q - q) - kd * dq_filt, -tau_max, tau_max)
                 system.set_leader_joint_torque(tau_grav + tau_fric + tau_damp + tau_pd, 0.0)
 
             sleep_s = max(0.0, float(system.dt) - (time.perf_counter() - now_perf))
@@ -584,6 +641,7 @@ def main() -> int:
                     kp=kp,
                     kd=kd,
                     tau_max=tau_max,
+                    vel_alpha=vel_alpha,
                     ts_str=ts_str,
                 )
                 print(f"Generated {len(files)} thesis plots.")
