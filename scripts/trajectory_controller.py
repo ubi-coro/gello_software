@@ -375,6 +375,15 @@ def main() -> int:
         tau_max = np.array([1.2, 2.0, 2.0, 0.8, 0.8, 0.5], dtype=float)[:n]
         vel_alpha = float(np.clip(args.vel_alpha, 0.01, 1.0))
         dq_filt = np.zeros(n)
+        tau_cmd_prev = np.zeros(n)
+
+        # Per-joint torque slew-rate limits in Nm/s (scaled each loop by dt_clamped).
+        tau_slew_rate = np.array([0.5, 1.0, 1.0, 0.3, 0.3, 0.2], dtype=float)[:n]
+
+        # Slow bias estimator compensates residual model bias without integral windup.
+        tau_bias = np.zeros(n)
+        bias_alpha = 0.001
+        bias_max = np.array([0.05, 0.10, 0.10, 0.03, 0.03, 0.02], dtype=float)[:n]
 
         buf_size = int(max(args.record_time, 10.0) * 500)
         t_buf = deque(maxlen=buf_size)
@@ -406,6 +415,8 @@ def main() -> int:
 
         home_start_raw = np.zeros(system.num_motors)
         target_raw = np.zeros(system.num_motors)
+        replay_cmd_initialized = False
+        prev_loop_perf = time.perf_counter() - float(system.dt)
 
         plot_state = None if args.no_plot else _init_plot(args.mode)
         plot_period = 1.0 / max(args.plot_rate, 1e-3)
@@ -415,6 +426,13 @@ def main() -> int:
 
         while running:
             now_perf = time.perf_counter()
+            measured_dt = now_perf - prev_loop_perf
+            prev_loop_perf = now_perf
+            dt_clamped = float(np.clip(measured_dt, 0.5 * float(system.dt), 2.0 * float(system.dt)))
+
+            # Preserve EMA dynamics under loop-time jitter.
+            alpha_eff = 1.0 - (1.0 - vel_alpha) ** (dt_clamped / float(system.dt))
+
             t_now = time.time() - t_start
 
             q, dq, _, _ = system.get_leader_joint_states()
@@ -501,6 +519,8 @@ def main() -> int:
                     phase = "REPLAY"
                     replay_start_t = time.time() - t_start
                     debug_counter = 0
+                    replay_cmd_initialized = False
+                    tau_bias.fill(0.0)
                     print(f"[REPLAY] Impedance tracking [{args.mode.upper()}] active.")
 
             elif phase == "REPLAY":
@@ -516,13 +536,18 @@ def main() -> int:
                 idx = min(idx, len(trajectory_q) - 1)
                 _, q_ref, _dq_ref = trajectory_q[idx]
 
-                dq_filt = vel_alpha * dq + (1.0 - vel_alpha) * dq_filt
+                dq_filt = alpha_eff * dq + (1.0 - alpha_eff) * dq_filt
 
                 tau_grav = system.gravity_compensation(q, dq_filt)
                 tau_fric = friction_feedforward_only(system, dq_filt)
                 tau_damp = -float(system.gravity_comp_velocity_damping) * dq_filt
                 tau_ff = tau_grav + tau_fric + tau_damp
 
+                if not replay_cmd_initialized:
+                    tau_cmd_prev = tau_ff.copy()
+                    replay_cmd_initialized = True
+
+                tau_pd_clipped = np.zeros(n)
                 if args.mode == "joint":
                     q_ref_near = q_ref.copy()
                     for i in range(n):
@@ -531,9 +556,20 @@ def main() -> int:
                         while q_ref_near[i] - q[i] < -np.pi:
                             q_ref_near[i] += 2.0 * np.pi
 
-                    tau_pd = kp * (q_ref_near - q) - kd * dq_filt
+                    pos_error = q_ref_near - q
+                    if np.max(np.abs(dq_filt)) < 0.1:
+                        bias_alpha_eff = 1.0 - (1.0 - bias_alpha) ** (dt_clamped / float(system.dt))
+                        tau_bias = tau_bias + bias_alpha_eff * pos_error
+                        tau_bias = np.clip(tau_bias, -bias_max, bias_max)
+
+                    tau_pd = kp * pos_error - kd * dq_filt + tau_bias
                     tau_pd_clipped = np.clip(tau_pd, -tau_max, tau_max)
-                    system.set_leader_joint_torque(tau_ff + tau_pd_clipped, 0.0)
+                    tau_cmd = tau_ff + tau_pd_clipped
+                    tau_slew_max_step = tau_slew_rate * dt_clamped
+                    delta_tau = np.clip(tau_cmd - tau_cmd_prev, -tau_slew_max_step, tau_slew_max_step)
+                    tau_cmd = tau_cmd_prev + delta_tau
+                    tau_cmd_prev = tau_cmd.copy()
+                    system.set_leader_joint_torque(tau_cmd, 0.0)
 
                     t_buf.append(t_rel)
                     ref_buf.append(q_ref_near.copy())
@@ -551,7 +587,12 @@ def main() -> int:
                     null_proj = np.eye(n) - np.linalg.pinv(j_act) @ j_act
                     tau_null = null_proj @ (-args.kd_null * dq_filt)
                     tau_imp = np.clip(tau_task + tau_null, -tau_max, tau_max)
-                    system.set_leader_joint_torque(tau_ff + tau_imp, 0.0)
+                    tau_cmd = tau_ff + tau_imp
+                    tau_slew_max_step = tau_slew_rate * dt_clamped
+                    delta_tau = np.clip(tau_cmd - tau_cmd_prev, -tau_slew_max_step, tau_slew_max_step)
+                    tau_cmd = tau_cmd_prev + delta_tau
+                    tau_cmd_prev = tau_cmd.copy()
+                    system.set_leader_joint_torque(tau_cmd, 0.0)
 
                     t_buf.append(t_rel)
                     ref_buf.append(x_ref.copy())
@@ -568,7 +609,7 @@ def main() -> int:
                         while q_ref_dbg[i] - q[i] < -np.pi:
                             q_ref_dbg[i] += 2.0 * np.pi
 
-                    tau_dbg = np.clip(kp * (q_ref_dbg - q) - kd * dq_filt, -tau_max, tau_max)
+                    tau_dbg = tau_pd_clipped
                     err_terms = q - q_ref_dbg
                     err_str = " ".join(f"{e*57.3:+5.1f}deg" for e in err_terms)
                     tau_str = " ".join(f"{t:+.2f}" for t in tau_dbg)
@@ -586,7 +627,7 @@ def main() -> int:
                     last_plot_t = wall_now
 
             elif phase == "HOLD":
-                dq_filt = vel_alpha * dq + (1.0 - vel_alpha) * dq_filt
+                dq_filt = alpha_eff * dq + (1.0 - alpha_eff) * dq_filt
                 tau_grav = system.gravity_compensation(q, dq_filt)
                 tau_fric = friction_feedforward_only(system, dq_filt)
                 tau_damp = -float(system.gravity_comp_velocity_damping) * dq_filt

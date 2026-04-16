@@ -6,6 +6,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from threading import Event, Lock, Thread
 from typing import Any, Optional
 
 import numpy as np
@@ -30,6 +31,7 @@ from gello.cr_dagger.ipc.shared_observation_snapshot import SharedObservationSna
 from gello.cr_dagger.ipc.shared_trajectory_buffer import SharedTrajectoryBuffer
 from gello.cr_dagger.policy.policy_worker import policy_worker
 from gello.cr_dagger.policy.trajectory_interpolator import TrajectoryInterpolator
+from gello.cameras.realsense_camera import RealSenseCamera, get_device_ids
 from gello.factr.gravity_compensation import FACTRGravityCompensation
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -88,6 +90,11 @@ def _build_shi(system: FACTRGravityCompensation, config_path: Path, n: int) -> M
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="CR-DAgger production data collection")
+    p.add_argument(
+        "--interventions",
+        action="store_true",
+        help="Enable CR-DAgger intervention/correction mode. If unset, records Phase A teleop data.",
+    )
     p.add_argument("--config", type=str, default="configs/ur5e_gello_factr_hw_V2.yaml")
 
     p.add_argument("--mass", type=float, default=1.0)
@@ -110,11 +117,103 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--num-episodes", type=int, default=5)
     p.add_argument("--max-episode-duration", type=float, default=30.0)
+    p.add_argument("--dataset-fps", type=int, default=30)
     p.add_argument("--push-to-hub", action="store_true")
     p.add_argument("--camera-names", nargs="*", default=None)
+    p.add_argument("--camera-device-ids", nargs="*", default=None)
+    p.add_argument("--camera-flips", nargs="*", default=None)
+    p.add_argument("--camera-warmup-s", type=float, default=2.0)
     p.add_argument("--enable-wrench", action="store_true")
     p.add_argument("--enable-wrench-feedback", action="store_true")
     return p.parse_args()
+
+
+class MultiRealSenseRig:
+    def __init__(
+        self,
+        camera_names: list[str],
+        camera_device_ids: list[str],
+        camera_flips: list[bool],
+    ):
+        if len(camera_names) != len(camera_device_ids):
+            raise ValueError("camera_names and camera_device_ids must have the same length")
+        if len(camera_names) != len(camera_flips):
+            raise ValueError("camera_names and camera_flips must have the same length")
+
+        self.camera_names = camera_names
+        self._cameras: dict[str, RealSenseCamera] = {}
+        self._threads: list[Thread] = []
+        self._latest_rgb: dict[str, np.ndarray] = {}
+        self._lock = Lock()
+        self._stop = Event()
+
+        for name, device_id, flip in zip(camera_names, camera_device_ids, camera_flips):
+            self._cameras[name] = RealSenseCamera(device_id=device_id, flip=flip)
+
+    def start(self) -> None:
+        for name, cam in self._cameras.items():
+            t = Thread(target=self._reader_loop, args=(name, cam), daemon=True, name=f"rs-{name}")
+            t.start()
+            self._threads.append(t)
+
+    def _reader_loop(self, name: str, cam: RealSenseCamera) -> None:
+        while not self._stop.is_set():
+            try:
+                rgb, _ = cam.read()
+                with self._lock:
+                    self._latest_rgb[name] = rgb
+            except Exception:
+                time.sleep(0.01)
+
+    def get_images(self) -> dict[str, np.ndarray] | None:
+        with self._lock:
+            if any(name not in self._latest_rgb for name in self.camera_names):
+                return None
+            return {name: self._latest_rgb[name].copy() for name in self.camera_names}
+
+    def close(self) -> None:
+        self._stop.set()
+        for t in self._threads:
+            t.join(timeout=1.0)
+        for cam in self._cameras.values():
+            try:
+                cam.disconnect()
+            except Exception:
+                pass
+
+
+def _resolve_camera_config(args: argparse.Namespace) -> tuple[list[str], list[str], list[bool]]:
+    camera_names = list(args.camera_names) if args.camera_names else []
+    camera_device_ids = list(args.camera_device_ids) if args.camera_device_ids else []
+
+    if camera_names and not camera_device_ids:
+        discovered = get_device_ids()
+        if len(discovered) < len(camera_names):
+            raise RuntimeError(
+                f"Requested {len(camera_names)} cameras but found only {len(discovered)} RealSense device(s): {discovered}"
+            )
+        camera_device_ids = discovered[: len(camera_names)]
+    elif camera_device_ids and not camera_names:
+        camera_names = [f"cam{i}" for i in range(len(camera_device_ids))]
+
+    if len(camera_names) != len(camera_device_ids):
+        raise ValueError("camera_names and camera_device_ids must have the same length")
+
+    if not camera_names:
+        return [], [], []
+
+    if args.camera_flips:
+        raw_flips = [bool(int(v)) for v in args.camera_flips]
+        if len(raw_flips) == 1:
+            camera_flips = raw_flips * len(camera_names)
+        elif len(raw_flips) == len(camera_names):
+            camera_flips = raw_flips
+        else:
+            raise ValueError("camera_flips must have length 1 or match number of cameras")
+    else:
+        camera_flips = [False] * len(camera_names)
+
+    return camera_names, camera_device_ids, camera_flips
 
 
 def main() -> int:
@@ -134,6 +233,10 @@ def main() -> int:
     policy_proc: mp.Process | None = None
     stop_event: Any | None = None
     npz_recorder: CorrectionRecorder | None = None
+    camera_rig: MultiRealSenseRig | None = None
+    traj_interp: TrajectoryInterpolator | None = None
+    detector: FusedInterventionDetector | None = None
+    admittance: JointSpaceAdmittanceController | None = None
     n = 6
 
     def _sig(*_: object) -> None:
@@ -144,6 +247,9 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _sig)
 
     try:
+        mode_str = "CR-DAgger interventions" if args.interventions else "Phase A baseline recording"
+        print(f"[MODE] {mode_str}")
+
         system = FACTRGravityCompensation(str(config_path), enable_visualization=False)
         n = int(system.num_arm_joints)
         if system.driver is None:
@@ -152,101 +258,120 @@ def main() -> int:
 
         q0, _, _, _ = system.get_leader_joint_states()
 
-        traj_buf = SharedTrajectoryBuffer(
-            name="cr_dagger_traj",
-            horizon=int(args.horizon),
-            n_joints=n,
-            create=True,
-        )
-        obs_snap = SharedObservationSnapshot(
-            name="cr_dagger_obs",
-            n_joints=n,
-            img_height=480,
-            img_width=640,
-            create=True,
-        )
+        if args.interventions:
+            traj_buf = SharedTrajectoryBuffer(
+                name="cr_dagger_traj",
+                horizon=int(args.horizon),
+                n_joints=n,
+                create=True,
+            )
+            obs_snap = SharedObservationSnapshot(
+                name="cr_dagger_obs",
+                n_joints=n,
+                img_height=480,
+                img_width=640,
+                create=True,
+            )
 
-        traj_buf.write(np.tile(q0, (int(args.horizon), 1)), time.monotonic())
+            traj_buf.write(np.tile(q0, (int(args.horizon), 1)), time.monotonic())
 
-        traj_interp = TrajectoryInterpolator(
-            traj_buf=traj_buf,
-            action_dt=float(args.action_dt),
-            stale_threshold_s=5.0,
-            fallback_q=q0.copy(),
-        )
+            traj_interp = TrajectoryInterpolator(
+                traj_buf=traj_buf,
+                action_dt=float(args.action_dt),
+                stale_threshold_s=5.0,
+                fallback_q=q0.copy(),
+            )
 
-        detector = FusedInterventionDetector(
-            params=FusedDetectorParams(min_votes=int(args.min_votes)),
-            n_joints=n,
-            dt=float(system.dt),
-        )
+            detector = FusedInterventionDetector(
+                params=FusedDetectorParams(min_votes=int(args.min_votes)),
+                n_joints=n,
+                dt=float(system.dt),
+            )
+
+        camera_names, camera_device_ids, camera_flips = _resolve_camera_config(args)
+        if camera_names:
+            camera_rig = MultiRealSenseRig(
+                camera_names=camera_names,
+                camera_device_ids=camera_device_ids,
+                camera_flips=camera_flips,
+            )
+            camera_rig.start()
+            print(f"[CAM] started {len(camera_names)} camera(s): {camera_names}")
+            print(f"[CAM] device ids: {camera_device_ids}")
+            time.sleep(max(0.0, float(args.camera_warmup_s)))
+
+        dataset_fps = int(args.dataset_fps)
+        if dataset_fps <= 0:
+            raise ValueError("dataset-fps must be > 0")
 
         lerobot_recorder = LeRobotCorrectionRecorder(
             repo_id=str(args.lerobot_repo),
-            fps=max(1, int(round(1.0 / float(system.dt)))),
+            fps=dataset_fps,
             task_description=str(args.task_description),
             n_joints=n,
-            camera_names=list(args.camera_names) if args.camera_names else None,
+            camera_names=camera_names if camera_names else None,
         )
 
-        if not args.no_npz:
+        if args.interventions and not args.no_npz:
             npz_recorder = CorrectionRecorder(
                 n_joints=n,
                 log_dir=str(args.log_dir),
                 latency_compensation_s=0.008,
             )
 
-        q_now, _, _, _ = system.get_leader_joint_states()
-        system.driver.set_torque_mode(False)
-        time.sleep(0.05)
-        system.driver.set_operating_mode(3)
-        time.sleep(0.05)
-        system.driver.set_torque_mode(True)
-        time.sleep(0.05)
         shi.reset()
 
-        admittance = JointSpaceAdmittanceController(
-            params=AdmittanceParams(
-                mass=float(args.mass),
-                damping=float(args.damping),
-                stiffness=float(args.stiffness),
-            ),
-            n_joints=n,
-            q_init=q_now.copy(),
-            q_min=system.arm_joint_limits_min,
-            q_max=system.arm_joint_limits_max,
-        )
+        if args.interventions:
+            q_now, _, _, _ = system.get_leader_joint_states()
+            system.driver.set_torque_mode(False)
+            time.sleep(0.05)
+            system.driver.set_operating_mode(3)
+            time.sleep(0.05)
+            system.driver.set_torque_mode(True)
+            time.sleep(0.05)
 
-        stop_event = mp.Event()
-        policy_config = {
-            "center": q_now.tolist(),
-            "amplitude": [float(args.amplitude)] * n,
-            "frequency": [float(args.frequency)] * n,
-            "q_hold": q_now.tolist(),
-        }
-        policy_proc = mp.Process(
-            target=policy_worker,
-            args=(
-                "cr_dagger_traj",
-                "cr_dagger_obs",
-                int(args.horizon),
-                n,
-                float(args.action_dt),
-                str(args.policy_type),
-                policy_config,
-                stop_event,
-            ),
-            daemon=True,
-        )
-        policy_proc.start()
-        print(f"[POLICY] started pid={policy_proc.pid}")
+            admittance = JointSpaceAdmittanceController(
+                params=AdmittanceParams(
+                    mass=float(args.mass),
+                    damping=float(args.damping),
+                    stiffness=float(args.stiffness),
+                ),
+                n_joints=n,
+                q_init=q_now.copy(),
+                q_min=system.arm_joint_limits_min,
+                q_max=system.arm_joint_limits_max,
+            )
 
-        if args.enable_wrench:
-            print("[WARN] --enable-wrench requested, but UR5e wrench source is not configured in this script; using zeros.")
-        if args.enable_wrench_feedback:
-            print("[WARN] --enable-wrench-feedback requested, but wrench mapping is not configured in this script; feedback disabled.")
-        if args.camera_names:
-            print("[WARN] camera names provided, but camera drivers are not configured in this script yet; images will be skipped.")
+            stop_event = mp.Event()
+            policy_config = {
+                "center": q_now.tolist(),
+                "amplitude": [float(args.amplitude)] * n,
+                "frequency": [float(args.frequency)] * n,
+                "q_hold": q_now.tolist(),
+            }
+            policy_proc = mp.Process(
+                target=policy_worker,
+                args=(
+                    "cr_dagger_traj",
+                    "cr_dagger_obs",
+                    int(args.horizon),
+                    n,
+                    float(args.action_dt),
+                    str(args.policy_type),
+                    policy_config,
+                    stop_event,
+                ),
+                daemon=True,
+            )
+            policy_proc.start()
+            print(f"[POLICY] started pid={policy_proc.pid}")
+
+        control_hz = max(1.0, 1.0 / float(system.dt))
+        record_every_n = max(1, int(round(control_hz / float(dataset_fps))))
+        print(
+            f"[DATASET] control_hz={control_hz:.1f}, dataset_fps={dataset_fps}, "
+            f"record_every_n={record_every_n}"
+        )
 
         total_overruns = 0
         total_steps = 0
@@ -262,10 +387,14 @@ def main() -> int:
             if not running:
                 break
 
-            t_mono = time.monotonic()
-            q_ref_now, _, _ = traj_interp.get_reference(t_mono)
-            admittance.reset(q_ref_now)
-            detector.reset()
+            if args.interventions:
+                assert traj_interp is not None
+                assert admittance is not None
+                assert detector is not None
+                t_mono = time.monotonic()
+                q_ref_now, _, _ = traj_interp.get_reference(t_mono)
+                admittance.reset(q_ref_now)
+                detector.reset()
 
             lerobot_recorder.start_episode(task_description=str(args.task_description))
             if npz_recorder is not None:
@@ -277,6 +406,7 @@ def main() -> int:
             ep_steps = 0
             ep_overruns = 0
             corr_steps = 0
+            ep_recorded_frames = 0
 
             while running:
                 now_perf = time.perf_counter()
@@ -291,27 +421,70 @@ def main() -> int:
                 currents_arm = currents_all[:n] * system.joint_signs[:n]
                 tau_ext = shi.update(q, dq, currents_arm)
 
+                q_follower = np.zeros(n)
+                dq_follower = np.zeros(n)
+                try:
+                    q_follower_raw, dq_follower_raw = system.get_follower_arm_state()
+                    q_follower = np.asarray(q_follower_raw[:n], dtype=float)
+                    dq_follower = np.asarray(dq_follower_raw[:n], dtype=float)
+                except Exception:
+                    pass
+
+                wrench_ur5e = np.zeros(6)
+                tau_wrench_fb = None
+                if args.enable_wrench or args.enable_wrench_feedback:
+                    wrench_ur5e, tcp_joint_torques = system.get_follower_tcp_force()
+                    if args.enable_wrench_feedback:
+                        tau_wrench_fb = np.asarray(tcp_joint_torques[:n], dtype=float)
+
                 t_mono = time.monotonic()
-                q_ref, dq_ref, is_stale = traj_interp.get_reference(t_mono)
-                q_c = admittance.step(q_ref=q_ref, tau_ext_human=tau_ext, dt=measured_dt)
-                adm_state = admittance.get_state()
+                if args.interventions:
+                    assert traj_interp is not None
+                    assert admittance is not None
+                    assert detector is not None
+                    q_ref, dq_ref, is_stale = traj_interp.get_reference(t_mono)
+                    _ = dq_ref
+                    q_c = admittance.step(
+                        q_ref=q_ref,
+                        tau_ext_human=tau_ext,
+                        dt=measured_dt,
+                        tau_wrench_fb=tau_wrench_fb,
+                    )
+                    adm_state = admittance.get_state()
 
-                is_corr = detector.update(
-                    tau_ext=tau_ext,
-                    q_c=adm_state["q_c"],
-                    q_ref=q_ref,
-                    dq_c=adm_state["dq_c"],
-                    wrench=None,
-                )
-                diag = detector.get_diagnostics()
-                if is_corr:
-                    corr_steps += 1
+                    is_corr = detector.update(
+                        tau_ext=tau_ext,
+                        q_c=adm_state["q_c"],
+                        q_ref=q_ref,
+                        dq_c=adm_state["dq_c"],
+                        wrench=wrench_ur5e if args.enable_wrench else None,
+                    )
+                    diag = detector.get_diagnostics()
+                    if is_corr:
+                        corr_steps += 1
 
-                target_hw = np.zeros(system.num_motors)
-                target_hw[:n] = q_c * system.joint_signs[:n] + system.joint_offsets[:n]
-                if system.num_motors > n:
-                    target_hw[-1] = system.leader_gripper_raw_rad
-                system.driver.set_joints(target_hw.tolist())
+                    target_hw = np.zeros(system.num_motors)
+                    target_hw[:n] = q_c * system.joint_signs[:n] + system.joint_offsets[:n]
+                    if system.num_motors > n:
+                        target_hw[-1] = system.leader_gripper_raw_rad
+                    system.driver.set_joints(target_hw.tolist())
+                else:
+                    is_stale = False
+                    q_ref = q_follower.copy()
+                    q_c = q_follower.copy()
+                    adm_state = {
+                        "q_c": q_follower.copy(),
+                        "dq_c": dq_follower.copy(),
+                    }
+                    is_corr = False
+                    diag = {
+                        "votes": {
+                            "torque": False,
+                            "delta": False,
+                            "energy": False,
+                            "wrench": False,
+                        }
+                    }
 
                 if npz_recorder is not None:
                     npz_recorder.record(
@@ -322,8 +495,8 @@ def main() -> int:
                         q_compliant=adm_state["q_c"],
                         dq_compliant=adm_state["dq_c"],
                         tau_ext_gello=tau_ext,
-                        q_follower=np.zeros(6),
-                        wrench_ur5e=np.zeros(6),
+                        q_follower=q_follower,
+                        wrench_ur5e=wrench_ur5e,
                         is_correction=bool(is_corr),
                         detector_diagnostics=diag,
                     )
@@ -339,41 +512,66 @@ def main() -> int:
                     dtype=bool,
                 )
 
-                lerobot_recorder.add_frame(
-                    timestamp=t_mono,
-                    q=q,
-                    dq=dq,
-                    gripper=float(grip),
-                    tau_ext=tau_ext,
-                    wrench_ur5e=np.zeros(6),
-                    q_ref=q_ref,
-                    q_compliant=adm_state["q_c"],
-                    dq_compliant=adm_state["dq_c"],
-                    is_correction=bool(is_corr),
-                    detector_votes=detector_votes,
-                    images=None,
-                )
+                if ep_steps % record_every_n == 0:
+                    images_for_frame = None
+                    can_record_frame = True
+                    if camera_rig is not None:
+                        images_for_frame = camera_rig.get_images()
+                        if images_for_frame is None:
+                            can_record_frame = False
 
-                obs_write_counter += 1
-                if obs_write_counter >= int(args.obs_decimation):
-                    obs_write_counter = 0
-                    obs_snap.write(
-                        timestamp=t_mono,
-                        q=q,
-                        dq=dq,
-                        grip=float(grip),
-                        tau_ext=tau_ext,
-                        wrench=np.zeros(6),
-                    )
+                    if can_record_frame:
+                        obs_q = q if args.interventions else q_follower
+                        obs_dq = dq if args.interventions else dq_follower
+                        lerobot_recorder.add_frame(
+                            timestamp=t_mono,
+                            q=obs_q,
+                            dq=obs_dq,
+                            gripper=float(grip),
+                            tau_ext=tau_ext,
+                            wrench_ur5e=wrench_ur5e,
+                            q_ref=q_ref,
+                            q_compliant=adm_state["q_c"],
+                            dq_compliant=adm_state["dq_c"],
+                            is_correction=bool(is_corr),
+                            detector_votes=detector_votes,
+                            images=images_for_frame,
+                        )
+                        ep_recorded_frames += 1
+
+                if args.interventions and obs_snap is not None:
+                    obs_write_counter += 1
+                    if obs_write_counter >= int(args.obs_decimation):
+                        obs_write_counter = 0
+                        obs_image = None
+                        if camera_rig is not None:
+                            latest_images = camera_rig.get_images()
+                            if latest_images is not None and camera_names:
+                                obs_image = latest_images[camera_names[0]]
+                        obs_snap.write(
+                            timestamp=t_mono,
+                            q=q,
+                            dq=dq,
+                            grip=float(grip),
+                            tau_ext=tau_ext,
+                            wrench=wrench_ur5e,
+                            image=obs_image,
+                        )
 
                 ep_steps += 1
                 if ep_steps % 330 == 0:
-                    print(
-                        f"[ep {ep:03d} {now_perf - ep_start:6.1f}s] "
-                        f"INT={'YES' if is_corr else 'no '} "
-                        f"|delta_q|={np.linalg.norm(admittance.get_delta_q()):.4f} "
-                        f"|tau|={np.linalg.norm(tau_ext):.3f} stale={is_stale}"
-                    )
+                    if args.interventions and admittance is not None:
+                        print(
+                            f"[ep {ep:03d} {now_perf - ep_start:6.1f}s] "
+                            f"INT={'YES' if is_corr else 'no '} "
+                            f"|delta_q|={np.linalg.norm(admittance.get_delta_q()):.4f} "
+                            f"|tau|={np.linalg.norm(tau_ext):.3f} stale={is_stale}"
+                        )
+                    else:
+                        print(
+                            f"[ep {ep:03d} {now_perf - ep_start:6.1f}s] "
+                            f"PHASE_A |tau|={np.linalg.norm(tau_ext):.3f}"
+                        )
 
                 loop_time = time.perf_counter() - now_perf
                 if loop_time > float(system.dt):
@@ -382,7 +580,11 @@ def main() -> int:
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 
-            ep_idx = lerobot_recorder.end_episode()
+            if ep_recorded_frames > 0:
+                ep_idx = lerobot_recorder.end_episode()
+            else:
+                ep_idx = -1
+                print("[WARN] No dataset frames recorded in this episode; skipping save_episode().")
             if npz_recorder is not None:
                 npz_recorder.end_episode()
 
@@ -390,6 +592,7 @@ def main() -> int:
             print(f"\nEpisode {ep_idx} complete:")
             print(f"  Steps: {ep_steps}")
             print(f"  Duration: {duration_s:.1f}s")
+            print(f"  Dataset frames: {ep_recorded_frames}")
             print(f"  Correction steps: {corr_steps} ({100.0 * corr_steps / max(ep_steps, 1):.1f}%)")
             print(f"  Timing overruns: {ep_overruns}/{ep_steps} ({100.0 * ep_overruns / max(ep_steps, 1):.1f}%)")
 
@@ -442,11 +645,17 @@ def main() -> int:
             except Exception:
                 pass
 
+        if camera_rig is not None:
+            try:
+                camera_rig.close()
+            except Exception:
+                pass
+
         if system is not None:
             try:
                 system.set_leader_joint_torque(np.zeros(n), 0.0)
                 time.sleep(0.05)
-                if system.driver is not None:
+                if args.interventions and system.driver is not None:
                     system.driver.set_operating_mode(3)
                 time.sleep(0.05)
                 system.shutdown()

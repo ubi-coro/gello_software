@@ -99,7 +99,7 @@ class CorrectionRecorder:
         )
         self.frames.append(frame)
 
-    def end_episode(self) -> Path:
+    def end_episode(self) -> Path | None:
         if not self.frames:
             return None
             

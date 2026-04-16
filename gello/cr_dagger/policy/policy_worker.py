@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import time
+from typing import Any
 
 import numpy as np
 
@@ -14,7 +15,7 @@ def policy_worker(
     action_dt: float,
     policy_type: str,
     policy_config: dict,
-    stop_event: mp.Event,
+    stop_event: Any,
 ) -> None:
     
     from gello.cr_dagger.ipc.shared_trajectory_buffer import SharedTrajectoryBuffer
@@ -56,7 +57,7 @@ def policy_worker(
         traj_buf.write(trajectory=actions, t_write=t_now)
 
         inference_time = time.monotonic() - t_loop_start
-        sleep_time = max(0.0, 1.0 - inference_time)
+        sleep_time = max(0.0, float(action_dt) - inference_time)
         if sleep_time > 0:
             time.sleep(sleep_time)
 

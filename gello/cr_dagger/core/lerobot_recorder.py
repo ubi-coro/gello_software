@@ -8,9 +8,14 @@ from typing import Any
 
 import numpy as np
 
+torch: Any = None
+LeRobotDataset: Any = None
+
 try:
-    import torch
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    import torch as _torch
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset as _LeRobotDataset
+    torch = _torch
+    LeRobotDataset = _LeRobotDataset
     HAS_LEROBOT = True
 except ImportError:
     HAS_LEROBOT = False
@@ -98,8 +103,10 @@ class LeRobotCorrectionRecorder:
             h, w, c = self.camera_shapes[cam]
             self.features[f"observation.images.{cam}"] = {
                 "dtype": "video",
-                "shape": (h, w, c),
-                "names": ["height", "width", "channels"],
+                # LeRobot expects image/video shape metadata in (C, H, W).
+                # The writer accepts either CHW or HWC arrays at runtime.
+                "shape": (c, h, w),
+                "names": ["channels", "height", "width"],
                 "video_info": {
                     "video.fps": 30,
                     "video.codec": "av1",
@@ -148,6 +155,13 @@ class LeRobotCorrectionRecorder:
 
         delta_q = self._compute_delta_q_compensated(q_compliant, timestamp)
 
+        detector_votes_arr = np.asarray(
+            detector_votes if detector_votes is not None else [False, False, False, False],
+            dtype=bool,
+        )
+        if detector_votes_arr.shape != (4,):
+            raise ValueError(f"detector_votes must have shape (4,), got {detector_votes_arr.shape}")
+
         frame = {
             "observation.state": torch.tensor(
                 np.concatenate([q[:self.n_joints], dq[:self.n_joints], [gripper]]),
@@ -166,7 +180,7 @@ class LeRobotCorrectionRecorder:
                 [is_correction], dtype=torch.bool,
             ),
             "observation.detector_votes": torch.tensor(
-                detector_votes if detector_votes is not None else [False, False, False, False],
+                detector_votes_arr,
                 dtype=torch.bool,
             ),
             "action": torch.tensor(
@@ -177,19 +191,50 @@ class LeRobotCorrectionRecorder:
                 np.concatenate([q_compliant[:self.n_joints], [gripper_compliant]]),
                 dtype=torch.float32,
             ),
+            "task": self.task_description,
         }
 
-        if images is not None:
-            for cam_name, img_array in images.items():
+        if self.camera_names:
+            if images is None:
+                raise ValueError(
+                    "Camera features are enabled but `images` is None. "
+                    "Either provide image frames or disable camera_names."
+                )
+
+            for cam_name in self.camera_names:
                 key = f"observation.images.{cam_name}"
-                if key in self.features:
-                    frame[key] = torch.from_numpy(img_array.transpose(2, 0, 1).copy())
+                if cam_name not in images:
+                    raise ValueError(f"Missing image for configured camera '{cam_name}'")
+
+                img_array = images[cam_name]
+                h, w, c = self.camera_shapes[cam_name]
+                expected_hwc = (h, w, c)
+                expected_chw = (c, h, w)
+
+                if img_array.shape == expected_hwc:
+                    img_hwc = img_array
+                elif img_array.shape == expected_chw:
+                    img_hwc = np.transpose(img_array, (1, 2, 0))
+                else:
+                    raise ValueError(
+                        f"Camera '{cam_name}' shape mismatch: got {img_array.shape}, "
+                        f"expected {expected_hwc} (HWC) or {expected_chw} (CHW)"
+                    )
+
+                if img_hwc.dtype != np.uint8:
+                    img_hwc = np.clip(img_hwc, 0, 255).astype(np.uint8)
+
+                frame[key] = img_hwc
 
         self.dataset.add_frame(frame)
         self._frame_count += 1
 
     def end_episode(self) -> int:
-        self.dataset.save_episode(task=self.task_description)
+        try:
+            self.dataset.save_episode()
+        except TypeError:
+            # Backward compatibility with older LeRobot versions.
+            self.dataset.save_episode(task=self.task_description)
         episode_idx = self._episode_count
         self._episode_count += 1
         print(f"[LeRobotRecorder] Episode {episode_idx} saved: {self._frame_count} frames")

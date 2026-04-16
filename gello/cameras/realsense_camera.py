@@ -46,6 +46,7 @@ class RealSenseCamera(CameraDriver):
         config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
         self._pipeline.start(config)
         self._flip = flip
+        self._connected = True
 
     def read(
         self,
@@ -84,6 +85,23 @@ class RealSenseCamera(CameraDriver):
             depth = depth[:, :, None]
 
         return image, depth
+
+    def disconnect(self) -> None:
+        if not getattr(self, "_connected", False):
+            return
+        try:
+            self._pipeline.stop()
+        finally:
+            self._connected = False
+
+    def close(self) -> None:
+        self.disconnect()
+
+    def __del__(self) -> None:
+        try:
+            self.disconnect()
+        except Exception:
+            pass
 
 
 def _debug_read(camera, save_datastream=False):
