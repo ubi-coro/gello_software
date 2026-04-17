@@ -754,6 +754,9 @@ class FACTRGravityCompensation:
         self.calibration_sanity_threshold = float(
             init_cfg.get("calibration_sanity_threshold", 0.35)
         )
+        self.use_precomputed_offsets = bool(init_cfg.get("use_precomputed_offsets", False))
+        precomputed_offsets = init_cfg.get("joint_offsets", [])
+        self.precomputed_joint_offsets = np.asarray(precomputed_offsets, dtype=float)
 
         # Gripper parameters
         self.gripper_limit_min = 0.0
@@ -1029,8 +1032,23 @@ class FACTRGravityCompensation:
 
     def _calibrate_system(self) -> None:
         """Calibrate Dynamixel offsets and match initial position."""
-        print("Calibrating Dynamixel offsets...")
-        self._get_dynamixel_offsets()
+        if self.use_precomputed_offsets and self.precomputed_joint_offsets.size >= self.num_arm_joints:
+            print("Using precomputed Dynamixel offsets from config...")
+            offsets = self.precomputed_joint_offsets.copy()
+
+            # If config only provides arm offsets, keep any extra joints (e.g. gripper) at current raw position.
+            if offsets.size < self.num_motors:
+                if self.driver is None:
+                    raise RuntimeError("Driver not initialized")
+                curr_joints, _ = self.driver.get_positions_and_velocities()
+                for j in range(offsets.size, self.num_motors):
+                    offsets = np.append(offsets, float(curr_joints[j]))
+
+            self.joint_offsets = np.asarray(offsets[: self.num_motors], dtype=float)
+            print(f"Loaded offsets (rad): {[f'{x:.4f}' for x in self.joint_offsets]}")
+        else:
+            print("Calibrating Dynamixel offsets...")
+            self._get_dynamixel_offsets()
 
         # Sanity check: after applying offsets, the current pose should be close to calibration_joint_pos.
         try:

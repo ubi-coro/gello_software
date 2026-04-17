@@ -4,8 +4,9 @@
 This script provides two modes:
 1) calibrate: compute leader offsets so GELLO decoded joints match current UR5e joints
 2) verify:   check that current GELLO decoded joints match current UR5e joints
+3) assist_match: slowly drive GELLO leader to configured startup pose
 
-The script is read-only with respect to robot motion: it never commands the UR5e or GELLO.
+The script never commands UR5e motion. In assist_match mode, it commands GELLO only.
 It is intended for safe bring-up checks before starting teleoperation.
 """
 
@@ -34,7 +35,10 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "ur5e_ge
 @dataclass
 class Args:
     mode: str = "calibrate"
-    """Mode: 'calibrate' (compute offsets) or 'verify' (check existing offsets)."""
+    """Mode: 'calibrate', 'verify', or 'assist_match'."""
+
+    verify_reference: str = "target"
+    """Verify reference: 'target' (startup target pose) or 'mapped_ur' (current UR pose via teleop mapping)."""
 
     config_path: str = str(DEFAULT_CONFIG_PATH)
     """Path to the YAML config used to populate defaults."""
@@ -77,9 +81,33 @@ class Args:
     continuous: bool = False
     print_hz: float = 5.0
 
+    # Assist mode behavior
+    assist_target: str = "initial"
+    """Assist target pose: 'initial' uses initial_match_joint_pos, 'calibration' uses calibration_joint_pos."""
+    assist_rate_hz: float = 50.0
+    """Command update rate for assist mode."""
+    assist_speed_deg_s: float = 20.0
+    """Approximate joint speed limit for assist mode."""
+    assist_min_duration_s: float = 2.0
+    """Minimum move duration in assist mode."""
+    assist_timeout_s: float = 20.0
+    """Maximum allowed assist motion time."""
+    assist_tolerance_deg: float = 3.0
+    """Success tolerance after assist motion."""
+    assist_max_displacement_deg: float = 45.0
+    """Abort assist if required move exceeds this unless overridden."""
+    assist_allow_large_motion: bool = False
+    """If true, allow assist motion above assist_max_displacement_deg."""
+
     def __post_init__(self) -> None:
-        if self.mode not in ("calibrate", "verify"):
-            raise ValueError("mode must be 'calibrate' or 'verify'")
+        if self.mode not in ("calibrate", "verify", "assist_match"):
+            raise ValueError("mode must be 'calibrate', 'verify' or 'assist_match'")
+
+        if self.verify_reference not in ("target", "mapped_ur"):
+            raise ValueError("verify_reference must be 'target' or 'mapped_ur'")
+
+        if self.assist_target not in ("initial", "calibration"):
+            raise ValueError("assist_target must be 'initial' or 'calibration'")
 
         if self.config_path is not None and not self.config_path:
             raise ValueError("config_path cannot be empty")
@@ -129,6 +157,24 @@ class Args:
         if self.print_hz <= 0:
             raise ValueError("print_hz must be > 0")
 
+        if self.assist_rate_hz <= 0:
+            raise ValueError("assist_rate_hz must be > 0")
+
+        if self.assist_speed_deg_s <= 0:
+            raise ValueError("assist_speed_deg_s must be > 0")
+
+        if self.assist_min_duration_s <= 0:
+            raise ValueError("assist_min_duration_s must be > 0")
+
+        if self.assist_timeout_s <= 0:
+            raise ValueError("assist_timeout_s must be > 0")
+
+        if self.assist_tolerance_deg <= 0:
+            raise ValueError("assist_tolerance_deg must be > 0")
+
+        if self.assist_max_displacement_deg <= 0:
+            raise ValueError("assist_max_displacement_deg must be > 0")
+
 
 def _load_yaml_config(config_path: str) -> dict:
     with open(config_path, "r", encoding="utf-8") as f:
@@ -155,6 +201,7 @@ def _resolve_runtime_values(args: Args) -> tuple[Args, dict]:
 
     resolved = Args(
         mode=args.mode,
+        verify_reference=args.verify_reference,
         config_path=args.config_path,
         gello_port=args.gello_port or dynamixel_cfg.get("dynamixel_port", "/dev/ttyDXL_gello"),
         gello_baudrate=int(args.gello_baudrate or dynamixel_cfg.get("baudrate", 1000000)),
@@ -199,6 +246,20 @@ def _decode_gello(raw_q: np.ndarray, signs: np.ndarray, offsets: np.ndarray) -> 
     return signs * (raw_q - offsets)
 
 
+def _wrap_to_pi(x: np.ndarray) -> np.ndarray:
+    return (x + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def _angle_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Shortest signed angular difference a-b in [-pi, pi)."""
+    return _wrap_to_pi(a - b)
+
+
+def _raw_from_decoded(decoded_q: np.ndarray, signs: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    """Invert q_decoded = sign * (q_raw - offset) to get q_raw."""
+    return signs * decoded_q + offsets
+
+
 def _calibrate_offsets(raw_q: np.ndarray, target_q: np.ndarray, signs: np.ndarray, args: Args) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n_joints = int(args.num_arm_joints or 0)
     search_grid = np.linspace(args.search_min_pi * np.pi, args.search_max_pi * np.pi, args.search_steps)
@@ -222,7 +283,7 @@ def _calibrate_offsets(raw_q: np.ndarray, target_q: np.ndarray, signs: np.ndarra
 
 
 def _print_alignment_table(raw_q: np.ndarray, decoded_q: np.ndarray, ur_q: np.ndarray, offsets: np.ndarray) -> np.ndarray:
-    err = decoded_q - ur_q
+    err = _angle_diff(decoded_q, ur_q)
     print("\nJoint alignment summary:")
     print("-" * 92)
     print(f"{'J':>2} | {'GELLO raw [deg]':>15} | {'offset [deg]':>13} | {'decoded [deg]':>14} | {'ref [deg]':>10} | {'err [deg]':>10}")
@@ -270,10 +331,15 @@ def run(args: Args) -> None:
     print("UR5e <-> GELLO STARTUP ALIGNMENT")
     print("=" * 70)
     print(f"Mode: {args.mode}")
+    if args.mode == "verify":
+        print(f"Verify reference: {args.verify_reference}")
     print(f"Config: {args.config_path}")
     print(f"GELLO port: {gello_port}")
     print(f"UR robot ip: {ur_robot_ip}")
-    print("This script does not command motion. It only reads states and computes checks.")
+    if args.mode == "assist_match":
+        print("This script will command GELLO only (slow assist). UR5e remains read-only.")
+    else:
+        print("This script does not command motion. It only reads states and computes checks.")
     if args.initial_match_joint_pos:
         print(f"Startup target from config: {[f'{np.rad2deg(x):.1f}°' for x in target_pose]}")
     elif args.calibration_joint_pos:
@@ -344,44 +410,205 @@ def run(args: Args) -> None:
             if max_abs_err_deg > args.warn_error_deg:
                 print("  action: Re-check the configured startup pose and retry calibration.")
 
-        else:
+        elif args.mode == "verify":
             offsets = leader_offsets
+            map_signs_arr = np.array(map_signs[:n_joints], dtype=float)
+            map_offsets_arr = np.array(map_offsets[:n_joints], dtype=float)
 
-            def verify_once() -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+            def verify_once() -> tuple[
+                float,
+                np.ndarray,
+                np.ndarray,
+                np.ndarray,
+                np.ndarray,
+                np.ndarray,
+                str,
+                np.ndarray,
+                np.ndarray,
+                np.ndarray,
+            ]:
                 raw_q, ur_q = _mean_samples(driver, ur, args)
                 decoded_q = _decode_gello(raw_q, signs, offsets)
-                leader_err = decoded_q - target_pose
-                follower_err = ur_q - target_pose
+
+                if args.verify_reference == "mapped_ur":
+                    # Compare decoded leader joints against current UR joints through mapping,
+                    # i.e., does map_sign * q_leader + map_offset match q_ur now?
+                    follower_pred = map_signs_arr * decoded_q + map_offsets_arr
+                    follower_err = _angle_diff(follower_pred, ur_q)
+                    # Express error back in leader space for easier interpretation.
+                    leader_ref_from_ur = (ur_q - map_offsets_arr) / np.where(
+                        np.abs(map_signs_arr) < 1e-9, 1.0, map_signs_arr
+                    )
+                    leader_err = _angle_diff(decoded_q, leader_ref_from_ur)
+                    max_abs_err_deg = float(np.max(np.abs(np.rad2deg(follower_err))))
+                    ref_label = "current UR pose via teleop mapping"
+
+                    # Offset consistency diagnostic:
+                    # implied_offset = raw - sign * q_ref
+                    implied_offsets = raw_q - signs * leader_ref_from_ur
+                    step = np.pi
+                    implied_k = np.round(implied_offsets / step)
+                    implied_permanent = implied_k * step
+                    implied_residual = implied_offsets - implied_permanent
+                    return (
+                        max_abs_err_deg,
+                        raw_q,
+                        decoded_q,
+                        leader_ref_from_ur,
+                        leader_err,
+                        follower_err,
+                        ref_label,
+                        implied_permanent,
+                        implied_residual,
+                        implied_k,
+                    )
+
+                leader_err = _angle_diff(decoded_q, target_pose)
+                follower_err = _angle_diff(ur_q, target_pose)
                 max_abs_err_deg = float(
                     max(
                         np.max(np.abs(np.rad2deg(leader_err))),
                         np.max(np.abs(np.rad2deg(follower_err))),
                     )
                 )
-                return max_abs_err_deg, raw_q, decoded_q, ur_q
+                ref_label = "configured startup target pose"
+                return (
+                    max_abs_err_deg,
+                    raw_q,
+                    decoded_q,
+                    target_pose,
+                    leader_err,
+                    follower_err,
+                    ref_label,
+                    np.zeros_like(decoded_q),
+                    np.zeros_like(decoded_q),
+                    np.zeros_like(decoded_q),
+                )
 
             if args.continuous:
                 period = 1.0 / args.print_hz
                 print("\nContinuous verify mode. Ctrl+C to stop.")
                 while True:
                     t0 = time.monotonic()
-                    max_err, raw_q, decoded_q, ur_q = verify_once()
+                    max_err, _, decoded_q, ref_q, leader_err, _, ref_label, _, _, _ = verify_once()
                     st = _status(max_err, args)
                     print(
                         f"status={st:>6}  max_err_deg={max_err:6.2f}  "
-                        f"leader0={np.rad2deg(decoded_q[0]):7.2f}  ur0={np.rad2deg(ur_q[0]):7.2f}"
+                        f"leader0={np.rad2deg(decoded_q[0]):7.2f}  "
+                        f"ref0={np.rad2deg(ref_q[0]):7.2f}  "
+                        f"err0={np.rad2deg(leader_err[0]):+7.2f}  "
+                        f"ref='{ref_label}'"
                     )
                     dt = time.monotonic() - t0
                     if dt < period:
                         time.sleep(period - dt)
             else:
-                max_err, raw_q, decoded_q, ur_q = verify_once()
-                _print_alignment_table(raw_q, decoded_q, target_pose, offsets)
+                max_err, raw_q, decoded_q, ref_q, leader_err, follower_err, ref_label, implied_permanent, implied_residual, implied_k = verify_once()
+                print(f"\nVerification reference: {ref_label}")
+                _print_alignment_table(raw_q, decoded_q, ref_q, offsets)
                 print("\nStartup safety result:")
                 print(f"  max_abs_error_deg: {max_err:.3f}")
                 print(f"  status: {_status(max_err, args)}")
+                print(
+                    "  follower_mapping_error_deg: "
+                    f"{[float(f'{x:.3f}') for x in np.rad2deg(follower_err)]}"
+                )
+                if args.verify_reference == "mapped_ur":
+                    print(
+                        "  implied_permanent_offset_pi: "
+                        f"{[float(f'{x:.3f}') for x in (implied_permanent / np.pi)]}"
+                    )
+                    print(
+                        "  implied_turn_index_k: "
+                        f"{[int(x) for x in implied_k.astype(int)]}"
+                    )
+                    print(
+                        "  implied_residual_deg (hold/model error): "
+                        f"{[float(f'{x:.3f}') for x in np.rad2deg(implied_residual)]}"
+                    )
                 if max_err > args.warn_error_deg:
-                    print("  action: Do not start teleop. Re-align to the configured startup pose or re-run calibrate mode.")
+                    if args.verify_reference == "mapped_ur":
+                        print("  action: Leader/Follower are not aligned in current pose. Re-check permanent offsets and mapping.")
+                    else:
+                        print("  action: Do not start teleop. Re-align to the configured startup pose or re-run calibrate mode.")
+
+        else:  # assist_match
+            if driver is None:
+                raise RuntimeError("Dynamixel driver not available")
+
+            target_decoded = (
+                np.array(args.initial_match_joint_pos[:n_joints], dtype=float)
+                if args.assist_target == "initial"
+                else np.array(args.calibration_joint_pos[:n_joints], dtype=float)
+            )
+
+            raw_now, _ = driver.get_positions_and_velocities()
+            raw_now = np.asarray(raw_now[:n_joints], dtype=float)
+
+            # Compute desired raw target and wrap to nearest turn relative to current raw,
+            # so the assist movement takes the shortest path and avoids large rotations.
+            raw_target_nominal = _raw_from_decoded(target_decoded, signs, leader_offsets)
+            raw_target = raw_now + _angle_diff(raw_target_nominal, raw_now)
+
+            diff = _angle_diff(raw_target, raw_now)
+            max_disp_deg = float(np.max(np.abs(np.rad2deg(diff))))
+            duration_s = max(args.assist_min_duration_s, max_disp_deg / args.assist_speed_deg_s)
+            duration_s = min(duration_s, args.assist_timeout_s)
+            steps = max(2, int(duration_s * args.assist_rate_hz))
+
+            print("\nAssist motion setup:")
+            print(f"  target: {args.assist_target}")
+            print(f"  max_displacement_deg: {max_disp_deg:.2f}")
+            print(f"  duration_s: {duration_s:.2f}")
+            print(f"  steps: {steps}")
+
+            if (not args.assist_allow_large_motion) and max_disp_deg > args.assist_max_displacement_deg:
+                print("\nAssist aborted for safety:")
+                print(
+                    f"  required move ({max_disp_deg:.2f} deg) exceeds "
+                    f"assist_max_displacement_deg ({args.assist_max_displacement_deg:.2f} deg)."
+                )
+                print("  hint: initial_match_joint_pos should be a decoded leader pose, not raw offsets.")
+                print("  hint: if intentional, rerun with --assist-allow-large-motion.")
+                return
+
+            driver.set_torque_mode(False)
+            time.sleep(0.02)
+            driver.set_operating_mode(3)  # position mode
+            time.sleep(0.02)
+            driver.set_torque_mode(True)
+            time.sleep(0.02)
+
+            print("Starting slow assist motion... (Ctrl+C to stop)")
+            interrupted = False
+            try:
+                for jnt in np.linspace(raw_now, raw_target, steps):
+                    driver.set_joints(jnt.tolist())
+                    time.sleep(1.0 / args.assist_rate_hz)
+            except KeyboardInterrupt:
+                interrupted = True
+                print("\nAssist interrupted by user.")
+
+            # Hold briefly and verify result in decoded space.
+            time.sleep(0.2)
+            raw_end, _ = driver.get_positions_and_velocities()
+            raw_end = np.asarray(raw_end[:n_joints], dtype=float)
+            decoded_end = _decode_gello(raw_end, signs, leader_offsets)
+            err_end = _angle_diff(decoded_end, target_decoded)
+            max_err_deg = float(np.max(np.abs(np.rad2deg(err_end))))
+
+            print("\nAssist result:")
+            print(f"  decoded_target_deg: {[float(f'{x:.2f}') for x in np.rad2deg(target_decoded)]}")
+            print(f"  decoded_final_deg:  {[float(f'{x:.2f}') for x in np.rad2deg(decoded_end)]}")
+            print(f"  error_deg:          {[float(f'{x:.2f}') for x in np.rad2deg(err_end)]}")
+            print(f"  max_abs_error_deg:  {max_err_deg:.2f}")
+            if interrupted:
+                print("  status: INTERRUPTED")
+                return
+            if max_err_deg <= args.assist_tolerance_deg:
+                print("  status: OK")
+            else:
+                print("  status: WARN (reposition leader manually and re-run assist_match)")
 
     finally:
         if driver is not None:
