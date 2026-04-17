@@ -684,6 +684,14 @@ class FACTRGravityCompensation:
         # Teleop smoothing (match baseline non-FACTR behavior)
         self.teleop_smoothing_alpha: float = 0.99
         self._teleop_last_action: Optional[np.ndarray] = None
+        # Turn-safe follower targets keep command continuity across multi-turn joints
+        self.enable_turn_safe_follower_targets: bool = False
+        self._last_follower_arm_cmd: Optional[np.ndarray] = None
+        # Mapping alignment mode: legacy_auto_align | turn_disambiguate | none
+        self.mapping_alignment_mode: str = "legacy_auto_align"
+        self.enable_mapping_turn_disambiguation: bool = False
+        # Leader offset handling: precomputed permanent offset + per-boot turn disambiguation
+        self.enable_leader_turn_disambiguation: bool = True
 
         # Semi-manual torque calculation (Jacobian based)
         self.J_semi: Optional[np.ndarray] = None
@@ -757,6 +765,13 @@ class FACTRGravityCompensation:
         self.use_precomputed_offsets = bool(init_cfg.get("use_precomputed_offsets", False))
         precomputed_offsets = init_cfg.get("joint_offsets", [])
         self.precomputed_joint_offsets = np.asarray(precomputed_offsets, dtype=float)
+        turn_cfg = init_cfg.get("turn_disambiguation", {})
+        if not isinstance(turn_cfg, dict):
+            turn_cfg = {}
+        # Default to enabled when using persistent offsets, but allow explicit opt-out.
+        self.enable_leader_turn_disambiguation = bool(
+            turn_cfg.get("enable", self.use_precomputed_offsets)
+        )
 
         # Gripper parameters
         self.gripper_limit_min = 0.0
@@ -1030,22 +1045,118 @@ class FACTRGravityCompensation:
                 "This code assumes fixed-base manipulators where nq==nv."
             )
 
+    @staticmethod
+    def _wrap_to_pi(x: npt.ArrayLike) -> np.ndarray:
+        """Wrap angles to [-pi, pi)."""
+        arr = np.asarray(x, dtype=float)
+        return (arr + np.pi) % (2.0 * np.pi) - np.pi
+
+    def _nearest_turn_target(
+        self,
+        target: npt.NDArray[np.float64],
+        reference: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        """Return the equivalent angular target nearest to reference."""
+        return reference + self._wrap_to_pi(target - reference)
+
+    def _disambiguate_leader_offset(
+        self,
+        raw: float,
+        permanent_offset: float,
+        sign: float,
+        expected_decoded: float,
+    ) -> tuple[float, int, float]:
+        """Compute per-boot session offset from permanent offset via integer turn index."""
+        base_decoded = sign * (raw - permanent_offset)
+        k = int(np.round((base_decoded - expected_decoded) / (2.0 * np.pi)))
+        # Offset correction is applied in raw space.
+        session_offset = permanent_offset + sign * k * 2.0 * np.pi
+        final_decoded = sign * (raw - session_offset)
+        residual = float(self._wrap_to_pi(final_decoded - expected_decoded))
+        return float(session_offset), k, residual
+
+    def _turn_disambiguate_mapping_offsets(
+        self,
+        leader_mapped: npt.NDArray[np.float64],
+        follower_slice: npt.NDArray[np.float64],
+        map_offsets: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        """Adjust mapping offsets by integer 2pi turns while preserving permanent offsets."""
+        expected_follower = leader_mapped + map_offsets
+        diff = self._wrap_to_pi(expected_follower - follower_slice)
+        turn_error = expected_follower - follower_slice - diff
+        return map_offsets - turn_error
+
+    def _calibrate_with_turn_disambiguation(self, verbose: bool = True) -> None:
+        """Two-stage offset calibration using permanent offsets + per-boot turn disambiguation."""
+        if self.driver is None:
+            raise RuntimeError("Driver not initialized")
+        if self.precomputed_joint_offsets.size < self.num_arm_joints:
+            raise RuntimeError(
+                "turn_disambiguation requires arm_teleop.initialization.joint_offsets "
+                "with at least num_arm_joints entries"
+            )
+
+        raw, _ = self.driver.get_positions_and_velocities()
+        if len(raw) < self.num_arm_joints:
+            raise RuntimeError(
+                f"Dynamixel returned {len(raw)} joints, but num_arm_joints={self.num_arm_joints}."
+            )
+
+        raw = np.asarray(raw, dtype=float)
+        permanent = self.precomputed_joint_offsets[: self.num_arm_joints].copy()
+        session_offsets = np.zeros((self.num_arm_joints,), dtype=float)
+
+        print("Applying turn-disambiguated leader calibration from permanent offsets...")
+        for i in range(self.num_arm_joints):
+            session_offset, k, residual = self._disambiguate_leader_offset(
+                raw=float(raw[i]),
+                permanent_offset=float(permanent[i]),
+                sign=float(self.joint_signs[i]),
+                expected_decoded=float(self.calibration_joint_pos[i]),
+            )
+            session_offsets[i] = session_offset
+            if verbose:
+                print(
+                    f"  Joint {i+1}: k={k:+d}, residual={np.rad2deg(residual):+6.2f}°, "
+                    f"session_offset={session_offset:+.4f}"
+                )
+
+        # Keep non-arm joints defined relative to the current raw reading (e.g., gripper trigger).
+        full_offsets = session_offsets.tolist()
+        for j in range(self.num_arm_joints, self.num_motors):
+            if j < len(raw):
+                full_offsets.append(float(raw[j]))
+            elif j < len(self.precomputed_joint_offsets):
+                full_offsets.append(float(self.precomputed_joint_offsets[j]))
+            else:
+                full_offsets.append(0.0)
+
+        self.joint_offsets = np.asarray(full_offsets[: self.num_motors], dtype=float)
+        print(
+            "Turn-disambiguated offsets (rad): "
+            + str([float(f"{x:.4f}") for x in self.joint_offsets])
+        )
+
     def _calibrate_system(self) -> None:
         """Calibrate Dynamixel offsets and match initial position."""
         if self.use_precomputed_offsets and self.precomputed_joint_offsets.size >= self.num_arm_joints:
-            print("Using precomputed Dynamixel offsets from config...")
-            offsets = self.precomputed_joint_offsets.copy()
+            if self.enable_leader_turn_disambiguation:
+                self._calibrate_with_turn_disambiguation(verbose=True)
+            else:
+                print("Using precomputed Dynamixel offsets from config...")
+                offsets = self.precomputed_joint_offsets.copy()
 
-            # If config only provides arm offsets, keep any extra joints (e.g. gripper) at current raw position.
-            if offsets.size < self.num_motors:
-                if self.driver is None:
-                    raise RuntimeError("Driver not initialized")
-                curr_joints, _ = self.driver.get_positions_and_velocities()
-                for j in range(offsets.size, self.num_motors):
-                    offsets = np.append(offsets, float(curr_joints[j]))
+                # If config only provides arm offsets, keep any extra joints (e.g. gripper) at current raw position.
+                if offsets.size < self.num_motors:
+                    if self.driver is None:
+                        raise RuntimeError("Driver not initialized")
+                    curr_joints, _ = self.driver.get_positions_and_velocities()
+                    for j in range(offsets.size, self.num_motors):
+                        offsets = np.append(offsets, float(curr_joints[j]))
 
-            self.joint_offsets = np.asarray(offsets[: self.num_motors], dtype=float)
-            print(f"Loaded offsets (rad): {[f'{x:.4f}' for x in self.joint_offsets]}")
+                self.joint_offsets = np.asarray(offsets[: self.num_motors], dtype=float)
+                print(f"Loaded offsets (rad): {[f'{x:.4f}' for x in self.joint_offsets]}")
         else:
             print("Calibrating Dynamixel offsets...")
             self._get_dynamixel_offsets()
@@ -1054,7 +1165,7 @@ class FACTRGravityCompensation:
         try:
             curr_pos, _, _, _ = self.get_leader_joint_states()
             target = self.calibration_joint_pos[0 : self.num_arm_joints]
-            pose_err = np.abs(curr_pos - target)
+            pose_err = np.abs(self._wrap_to_pi(curr_pos - target))
             max_err = float(np.max(pose_err)) if pose_err.size else 0.0
             mean_err = float(np.mean(pose_err)) if pose_err.size else 0.0
             print(
@@ -1286,6 +1397,34 @@ class FACTRGravityCompensation:
         signs = mapping_cfg.get("signs")
         offsets = mapping_cfg.get("offsets")
         auto_align = bool(mapping_cfg.get("auto_align", True))
+        alignment_mode = str(
+            mapping_cfg.get("alignment_mode", "legacy_auto_align")
+        ).strip().lower()
+        if alignment_mode not in ("legacy_auto_align", "turn_disambiguate", "none"):
+            print(
+                f"Warning: invalid teleop.mapping.alignment_mode='{alignment_mode}', using legacy_auto_align"
+            )
+            alignment_mode = "legacy_auto_align"
+        self.mapping_alignment_mode = alignment_mode
+        # Explicit boolean keeps old configs simple while allowing easy mode switch.
+        self.enable_mapping_turn_disambiguation = bool(
+            mapping_cfg.get(
+                "turn_disambiguate_offsets",
+                alignment_mode == "turn_disambiguate",
+            )
+        )
+        self.enable_turn_safe_follower_targets = bool(
+            mapping_cfg.get(
+                "turn_safe_targets",
+                alignment_mode == "turn_disambiguate",
+            )
+        )
+        print(
+            "Teleop mapping alignment mode: "
+            f"{self.mapping_alignment_mode}, "
+            f"turn_disambiguate_offsets={self.enable_mapping_turn_disambiguation}, "
+            f"turn_safe_targets={self.enable_turn_safe_follower_targets}"
+        )
 
         if index_map is None:
             self.map_index = default_index
@@ -1330,21 +1469,39 @@ class FACTRGravityCompensation:
             except Exception as e:
                 print(f"Warning: failed to move follower to start position: {e}")
 
-        # Optional auto-alignment: compute offsets so current follower == mapped leader
-        if auto_align:
+        # Optional offset alignment at startup.
+        # - legacy_auto_align: offsets = follower - mapped_leader (old behavior)
+        # - turn_disambiguate: keep permanent offsets and only adjust integer 2pi turns
+        run_turn_disambiguation = self.enable_mapping_turn_disambiguation or (
+            self.mapping_alignment_mode == "turn_disambiguate"
+        )
+        if auto_align or run_turn_disambiguation:
             try:
                 obs = self.teleop_env.get_obs()
                 follower_curr = obs["joint_positions"]
                 leader_arm_pos, _, _, _ = self.get_leader_joint_states()
                 leader_mapped = map_signs_local * leader_arm_pos[map_index_local]
                 follower_slice = follower_curr[: int(len(map_index_local))]
-                self.map_offsets = follower_slice - leader_mapped
+
+                if auto_align and self.mapping_alignment_mode == "legacy_auto_align":
+                    self.map_offsets = follower_slice - leader_mapped
+                else:
+                    self.map_offsets = self._turn_disambiguate_mapping_offsets(
+                        leader_mapped=leader_mapped,
+                        follower_slice=follower_slice,
+                        map_offsets=map_offsets_local,
+                    )
+
                 map_offsets_local = cast(np.ndarray, self.map_offsets)
                 print(
-                    f"Teleop auto-aligned offsets set to: {[float(x) for x in map_offsets_local]}"
+                    f"Teleop mapping offsets ({self.mapping_alignment_mode}) set to: "
+                    f"{[float(x) for x in map_offsets_local]}"
                 )
             except Exception as e:
-                print(f"Warning: auto_align failed: {e}")
+                print(f"Warning: mapping alignment failed: {e}")
+
+        # Reset target continuity cache after startup alignment updates.
+        self._last_follower_arm_cmd = None
 
         # Mark prepared; DO NOT start thread yet (start in run() after running=True)
         self.teleop_prepared = True
@@ -1417,7 +1574,7 @@ class FACTRGravityCompensation:
                 else:
                     follower_mapped = follower_pos[:self.num_arm_joints]
                 
-                init_error = np.abs(follower_mapped - leader_pos)
+                init_error = np.abs(self._wrap_to_pi(follower_mapped - leader_pos))
                 max_error = np.max(init_error)
                 
                 print(f"\n[Force-Position Feedback Startup Check]")
@@ -1478,6 +1635,32 @@ class FACTRGravityCompensation:
             map_offsets = self.map_offsets
 
         arm_cmd = map_signs * self_arm_pos[map_index] + map_offsets
+
+        # Keep command continuity across multi-turn joints by choosing nearest equivalent target.
+        if self.enable_turn_safe_follower_targets and len(arm_cmd) > 0:
+            reference_cmd: Optional[np.ndarray] = None
+            if (
+                self._last_follower_arm_cmd is not None
+                and len(self._last_follower_arm_cmd) == len(arm_cmd)
+            ):
+                reference_cmd = self._last_follower_arm_cmd
+            else:
+                try:
+                    if self.teleop_env is not None:
+                        follower_curr = np.asarray(
+                            self.teleop_env.get_obs()["joint_positions"], dtype=float
+                        )
+                    else:
+                        follower_curr = np.asarray(self.teleop_client.get_joint_state(), dtype=float)
+                    if len(follower_curr) >= len(arm_cmd):
+                        reference_cmd = follower_curr[: len(arm_cmd)]
+                except Exception:
+                    reference_cmd = None
+
+            if reference_cmd is not None and len(reference_cmd) == len(arm_cmd):
+                arm_cmd = self._nearest_turn_target(arm_cmd, reference_cmd)
+
+            self._last_follower_arm_cmd = arm_cmd.copy()
 
         # Compose final command with optional gripper channel
         if follower_dofs == len(arm_cmd) + 1:
@@ -1716,7 +1899,7 @@ class FACTRGravityCompensation:
             joint_sign_i = self.joint_signs[index]
             joint_i = joint_sign_i * (joint_state[index] - offset)
             start_i = calibration_joint_pos[index]
-            return np.abs(joint_i - start_i)
+            return float(np.abs(self._wrap_to_pi(joint_i - start_i)))
 
         # Get current raw positions
         curr_joints, _ = self.driver.get_positions_and_velocities()
@@ -1779,8 +1962,9 @@ class FACTRGravityCompensation:
         """Wait for leader arm to be moved to initial position."""
         while True:
             curr_pos, _, _, _ = self.get_leader_joint_states()
+            target = self.initial_match_joint_pos[0 : self.num_arm_joints]
             current_joint_error = np.linalg.norm(
-                curr_pos - self.initial_match_joint_pos[0 : self.num_arm_joints]
+                self._wrap_to_pi(curr_pos - target)
             )
             if current_joint_error <= 0.6:
                 break
@@ -2194,7 +2378,7 @@ class FACTRGravityCompensation:
             np.ndarray: Force-feedback torques to apply to leader arm (Nm)
         """
         # Position error: when follower is behind leader (blocked), creates resistance
-        pos_error = follower_arm_pos - leader_arm_pos
+        pos_error = self._wrap_to_pi(follower_arm_pos - leader_arm_pos)
         vel_error = follower_arm_vel - leader_arm_vel
 
         # PD control law

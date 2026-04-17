@@ -32,6 +32,10 @@ arm_teleop:
     joint_offsets: [1.5708, 4.7124, 3.1416, 1.5708, 3.1416, 0.0]
     # If true, use joint_offsets above instead of running per-start offset search.
     use_precomputed_offsets: true
+    # Per-boot turn-index disambiguation on top of permanent offsets (recommended for reproducibility).
+    # Disable to fall back to previous behavior that applies precomputed offsets as-is.
+    turn_disambiguation:
+      enable: true
     # Set true to block until user manually moves to initial_match_joint_pos
     enforce_initial_match: false
     # Warn if calibrated pose differs from calibration_joint_pos by more than this (in rad)
@@ -113,8 +117,17 @@ teleop:
     # Additional offsets (radians) applied to follower after signs
     #offsets: [4.7124, 4.7124, 3.1416, 1.4835, 3.1416, -0.1745]
     offsets: [-0.016874, 0.000794, 3.148775, 0.054422, 0.010427, 0.139600]
-    # Auto-align offsets at startup so follower matches current leader pose
-    auto_align: true
+    # Alignment mode at startup:
+    # - legacy_auto_align: old behavior (offsets = follower - mapped leader)
+    # - turn_disambiguate: preserve configured offsets and only correct by integer 2pi turns
+    alignment_mode: turn_disambiguate
+    # Keep integer-turn correction active even if auto_align is false.
+    turn_disambiguate_offsets: true
+    # Build follower targets with nearest-turn continuity to avoid command jumps.
+    turn_safe_targets: true
+    # For reproducible cross-session mapping keep this false.
+    # Set true + alignment_mode=legacy_auto_align to restore previous startup auto_align behavior.
+    auto_align: false
   # Explicit gripper config for teleop normalization: [id, open_deg, close_deg]
   gripper_config: [7, 197, 155] 
 
