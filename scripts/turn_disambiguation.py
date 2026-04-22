@@ -167,7 +167,23 @@ def _extract_mapping(
     )
 
 
-def test_math() -> int:
+def _extract_servo_types(dyn_cfg: dict[str, Any], num_arm: int) -> list[str]:
+    """Return servo types aligned to the arm joint dimension."""
+    raw_servo_types = dyn_cfg.get("servo_types", [])
+    servo_types = [str(x) for x in raw_servo_types]
+    if len(servo_types) < num_arm:
+        raise ValueError(
+            f"dynamixel.servo_types has {len(servo_types)} entries but num_arm_joints is {num_arm}"
+        )
+    if len(servo_types) > num_arm:
+        print(
+            f"  {_YELLOW}WARNING: dynamixel.servo_types has {len(servo_types)} entries; "
+            f"using first {num_arm} arm joints.{_RESET}"
+        )
+    return servo_types[:num_arm]
+
+
+def run_math_checks() -> int:
     _reset_counters()
 
     _section("1a  wrap_to_pi edge cases")
@@ -393,7 +409,7 @@ def test_math() -> int:
     return _summary()
 
 
-def test_read(config_path: str) -> int:
+def run_read_only_hardware_checks(config_path: str) -> int:
     _reset_counters()
     _section("2  Read-Only Hardware Verification")
 
@@ -434,7 +450,7 @@ def test_read(config_path: str) -> int:
 
     port = _resolve_port(str(dyn_cfg.get("dynamixel_port", "/dev/ttyUSB0")))
     baudrate = int(dyn_cfg.get("baudrate", 4000000))
-    servo_types = list(dyn_cfg.get("servo_types", []))
+    servo_types = _extract_servo_types(dyn_cfg, num_arm)
     joint_ids = list(range(1, num_arm + 1))
 
     print(f"\n  Connecting to GELLO on {port}...")
@@ -492,8 +508,9 @@ def test_read(config_path: str) -> int:
         for _ in range(10):
             ur_samples.append(np.array(ur.get_joint_state()[: len(map_index)], dtype=float))
             time.sleep(0.02)
-        ur_q = np.mean(np.array(ur_samples), axis=0)
-        print(f"  UR5e joints (deg): {[f'{np.rad2deg(x):+.1f}' for x in ur_q]}")
+        ur_q_local = np.mean(np.array(ur_samples), axis=0)
+        ur_q = ur_q_local
+        print(f"  UR5e joints (deg): {[f'{np.rad2deg(x):+.1f}' for x in ur_q_local]}")
     except Exception as e:
         print(f"  {_YELLOW}WARNING: Could not connect to UR5e: {e}{_RESET}")
         print("  Skipping follower mapping checks.")
@@ -575,7 +592,7 @@ def test_read(config_path: str) -> int:
     return _summary()
 
 
-def test_sim(config_path: str) -> int:
+def run_simulated_multiboot_checks(config_path: str) -> int:
     _reset_counters()
     _section("3  Simulated Multi-Boot Reproducibility")
 
@@ -598,7 +615,7 @@ def test_sim(config_path: str) -> int:
 
     port = _resolve_port(str(dyn_cfg.get("dynamixel_port", "/dev/ttyUSB0")))
     baudrate = int(dyn_cfg.get("baudrate", 4000000))
-    servo_types = list(dyn_cfg.get("servo_types", []))
+    servo_types = _extract_servo_types(dyn_cfg, num_arm)
     joint_ids = list(range(1, num_arm + 1))
 
     print("  Connecting to GELLO...")
@@ -723,11 +740,11 @@ def main() -> int:
 
     rc = 0
     if args.level in ("math", "all"):
-        rc |= test_math()
+        rc |= run_math_checks()
     if args.level in ("read", "all"):
-        rc |= test_read(args.config)
+        rc |= run_read_only_hardware_checks(args.config)
     if args.level in ("sim", "all"):
-        rc |= test_sim(args.config)
+        rc |= run_simulated_multiboot_checks(args.config)
 
     return rc
 
