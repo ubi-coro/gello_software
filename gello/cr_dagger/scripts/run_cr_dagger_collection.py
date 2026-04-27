@@ -95,7 +95,7 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable CR-DAgger intervention/correction mode. If unset, records Phase A teleop data.",
     )
-    p.add_argument("--config", type=str, default="configs/ur5e_gello_factr_hw_V2.yaml")
+    p.add_argument("--config", type=str, default="configs/ur5e_gello_factr_hw_V3.yaml")
 
     p.add_argument("--mass", type=float, default=1.0)
     p.add_argument("--damping", type=float, default=5.0)
