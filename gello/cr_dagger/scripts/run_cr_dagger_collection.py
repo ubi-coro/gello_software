@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
+import re
 import signal
 import sys
 import time
@@ -10,6 +11,13 @@ from threading import Event, Lock, Thread
 from typing import Any, Optional
 
 import numpy as np
+
+try:
+    from pynput import keyboard as kb
+    _PYNPUT_AVAILABLE = True
+except ImportError:
+    _PYNPUT_AVAILABLE = False
+    kb = None  # type: ignore[assignment]
 
 from gello.bilat_4ch.gello_ur5e_observer_shi import (
     MinimalistEstimatorConfig,
@@ -39,6 +47,120 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# repo_id Validation
+# ══════════════════════════════════════════════════════════════════════════════
+
+_REPO_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
+
+
+def _validate_repo_id(repo_id: str) -> str:
+    """
+    Validate that repo_id follows LeRobot's required 'username/dataset_name' format.
+
+    LeRobot's LeRobotDataset and HuggingFace Hub both require this format.
+    A bare path like '/media/.../my_dataset' is NOT a valid repo_id.
+
+    Correct:  jstranghoener/cr_dagger_insertion
+    Wrong:    /media/internal/nvme/.../cr_dagger_teleoperation
+    """
+    if not _REPO_ID_PATTERN.match(repo_id):
+        raise ValueError(
+            f"\n[ERROR] Invalid repo_id: '{repo_id}'\n"
+            f"        repo_id must be in 'username/dataset_name' format.\n"
+            f"        Example: --lerobot-repo jstranghoener/cr_dagger_insertion\n"
+            f"        Use --lerobot-root for the local storage path.\n"
+            f"        Example: --lerobot-root /media/internal/nvme/jstranghoener/data"
+        )
+    return repo_id
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Keyboard Controller
+# ══════════════════════════════════════════════════════════════════════════════
+
+class EpisodeKeyboardController:
+    """
+    Non-blocking pynput keyboard controller for in-episode actions.
+
+    Keybindings (mirrors UR5eInsertionConfig key_mapping):
+        →  Right Arrow  →  stop recording, save episode, end collection
+        ←  Left Arrow   →  discard episode, re-record same index
+        Space           →  mark episode as success, continue to next
+    """
+
+    def __init__(self) -> None:
+        self.stop_recording: bool = False
+        self.rerecord_episode: bool = False
+        self.mark_success: bool = False
+        self._listener: Optional[Any] = None
+
+    def start(self) -> None:
+        if not _PYNPUT_AVAILABLE:
+            print("[KB] pynput not installed – keyboard episode controls disabled.")
+            return
+        self._listener = kb.Listener(on_press=self._on_press)
+        self._listener.daemon = True
+        self._listener.start()
+        print("[KB] In-episode keyboard controls active:")
+        print("       →  Right Arrow  →  stop & save episode")
+        print("       ←  Left Arrow   →  discard & re-record")
+        print("       Space           →  mark success & continue")
+
+    def _on_press(self, key: Any) -> None:
+        if key == kb.Key.right:
+            self.stop_recording = True
+        elif key == kb.Key.left:
+            self.rerecord_episode = True
+        elif key == kb.Key.space:
+            self.mark_success = True
+
+    def reset_episode(self) -> None:
+        """Reset per-episode flags. Call once before starting the inner loop."""
+        self.rerecord_episode = False
+        self.mark_success = False
+        # stop_recording intentionally NOT reset – once set it stops the run
+
+    def stop(self) -> None:
+        if self._listener is not None:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+            self._listener = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Episode discard helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _discard_episode(
+    lerobot_recorder: LeRobotCorrectionRecorder,
+    npz_recorder: Optional[CorrectionRecorder],
+) -> None:
+    """Best-effort discard of the current in-progress episode buffers."""
+    try:
+        if hasattr(lerobot_recorder, "discard_episode"):
+            lerobot_recorder.discard_episode()
+        elif hasattr(lerobot_recorder, "clear_episode_buffer"):
+            lerobot_recorder.clear_episode_buffer()
+        else:
+            print("[WARN] Recorder has no discard/clear method; buffer may persist.")
+    except Exception as exc:
+        print(f"[WARN] Could not discard lerobot episode: {exc}")
+
+    if npz_recorder is not None:
+        try:
+            if hasattr(npz_recorder, "discard_episode"):
+                npz_recorder.discard_episode()
+        except Exception as exc:
+            print(f"[WARN] Could not discard npz episode: {exc}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _resolve_leader_urdf(config_path: Path, leader_urdf: str) -> Path:
     for candidate in [
         (config_path.parent / leader_urdf).resolve(),
@@ -67,7 +189,9 @@ def _infer_motor_params(servo_types: list[str], n: int) -> tuple[np.ndarray, np.
     return np.asarray(gear_ratios, dtype=float), np.asarray(kts, dtype=float)
 
 
-def _build_shi(system: FACTRGravityCompensation, config_path: Path, n: int) -> MinimalistTorqueEstimator:
+def _build_shi(
+    system: FACTRGravityCompensation, config_path: Path, n: int
+) -> MinimalistTorqueEstimator:
     leader_urdf = str(system.config["arm_teleop"]["leader_urdf"])
     urdf_path = _resolve_leader_urdf(config_path, leader_urdf)
     servo_types = list(system.config["dynamixel"]["servo_types"])
@@ -96,25 +220,43 @@ def _parse_args() -> argparse.Namespace:
         help="Enable CR-DAgger intervention/correction mode. If unset, records Phase A teleop data.",
     )
     p.add_argument("--config", type=str, default="configs/ur5e_gello_factr_hw_V3.yaml")
-
     p.add_argument("--mass", type=float, default=1.0)
     p.add_argument("--damping", type=float, default=5.0)
     p.add_argument("--stiffness", type=float, default=20.0)
-
     p.add_argument("--policy-type", choices=["dummy_sine", "dummy_hold"], default="dummy_hold")
     p.add_argument("--amplitude", type=float, default=0.05)
     p.add_argument("--frequency", type=float, default=0.15)
     p.add_argument("--horizon", type=int, default=32)
     p.add_argument("--action-dt", type=float, default=0.1)
-
     p.add_argument("--min-votes", type=int, default=2)
     p.add_argument("--obs-decimation", type=int, default=33)
 
-    p.add_argument("--lerobot-repo", type=str, required=True)
+    # ── LeRobot dataset ───────────────────────────────────────────────────────
+    p.add_argument(
+        "--lerobot-repo",
+        type=str,
+        required=True,
+        help=(
+            "LeRobot repo_id in 'username/dataset_name' format. "
+            "This is used as the dataset identifier (HuggingFace-style). "
+            "Example: jstranghoener/cr_dagger_insertion"
+        ),
+    )
+    p.add_argument(
+        "--lerobot-root",
+        type=str,
+        default=None,
+        help=(
+            "Local root directory where the dataset is stored on disk. "
+            "Defaults to ~/.cache/lerobot/datasets/{repo_id}. "
+            "Example: /media/internal/nvme/jstranghoener/data"
+        ),
+    )
+    # ─────────────────────────────────────────────────────────────────────────
+
     p.add_argument("--task-description", type=str, default="CR-DAgger correction episode")
     p.add_argument("--log-dir", type=str, default="cr_dagger_data")
     p.add_argument("--no-npz", action="store_true")
-
     p.add_argument("--num-episodes", type=int, default=5)
     p.add_argument("--max-episode-duration", type=float, default=30.0)
     p.add_argument("--dataset-fps", type=int, default=30)
@@ -190,7 +332,8 @@ def _resolve_camera_config(args: argparse.Namespace) -> tuple[list[str], list[st
         discovered = get_device_ids()
         if len(discovered) < len(camera_names):
             raise RuntimeError(
-                f"Requested {len(camera_names)} cameras but found only {len(discovered)} RealSense device(s): {discovered}"
+                f"Requested {len(camera_names)} cameras but found only "
+                f"{len(discovered)} RealSense device(s): {discovered}"
             )
         camera_device_ids = discovered[: len(camera_names)]
     elif camera_device_ids and not camera_names:
@@ -238,8 +381,31 @@ def _start_prepared_teleop(system: FACTRGravityCompensation) -> bool:
     return True
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════════════════════
+
 def main() -> int:
     args = _parse_args()
+
+    # ── Validate repo_id early – fail fast before any hardware init ───────────
+    try:
+        repo_id = _validate_repo_id(args.lerobot_repo)
+    except ValueError as e:
+        print(e)
+        return 1
+
+    # ── Resolve local dataset root ────────────────────────────────────────────
+    if args.lerobot_root is not None:
+        lerobot_root = Path(args.lerobot_root)
+        lerobot_root.mkdir(parents=True, exist_ok=True)
+    else:
+        # LeRobot default: ~/.cache/lerobot/datasets/{repo_id}
+        lerobot_root = Path.home() / ".cache" / "lerobot" / "datasets" / repo_id
+        lerobot_root.mkdir(parents=True, exist_ok=True)
+
+    print(f"[DATASET] repo_id  : {repo_id}")
+    print(f"[DATASET] local root: {lerobot_root}")
 
     config_path = Path(args.config)
     if not config_path.is_absolute():
@@ -259,6 +425,7 @@ def main() -> int:
     traj_interp: TrajectoryInterpolator | None = None
     detector: FusedInterventionDetector | None = None
     admittance: JointSpaceAdmittanceController | None = None
+    kbd: Optional[EpisodeKeyboardController] = None
     n = 6
     teleop_started = False
 
@@ -270,6 +437,10 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _sig)
 
     try:
+        # ── Keyboard setup ────────────────────────────────────────────────────
+        kbd = EpisodeKeyboardController()
+        kbd.start()
+
         mode_str = "CR-DAgger interventions" if args.interventions else "Phase A baseline recording"
         print(f"[MODE] {mode_str}")
 
@@ -297,16 +468,13 @@ def main() -> int:
                 img_width=640,
                 create=True,
             )
-
             traj_buf.write(np.tile(q0, (int(args.horizon), 1)), time.monotonic())
-
             traj_interp = TrajectoryInterpolator(
                 traj_buf=traj_buf,
                 action_dt=float(args.action_dt),
                 stale_threshold_s=5.0,
                 fallback_q=q0.copy(),
             )
-
             detector = FusedInterventionDetector(
                 params=FusedDetectorParams(min_votes=int(args.min_votes)),
                 n_joints=n,
@@ -329,13 +497,16 @@ def main() -> int:
         if dataset_fps <= 0:
             raise ValueError("dataset-fps must be > 0")
 
+        # ── LeRobot recorder: repo_id + explicit local root ───────────────────
         lerobot_recorder = LeRobotCorrectionRecorder(
-            repo_id=str(args.lerobot_repo),
+            repo_id=repo_id,
+            root=lerobot_root,
             fps=dataset_fps,
             task_description=str(args.task_description),
             n_joints=n,
             camera_names=camera_names if camera_names else None,
         )
+        # ─────────────────────────────────────────────────────────────────────
 
         if args.interventions and not args.no_npz:
             npz_recorder = CorrectionRecorder(
@@ -401,16 +572,24 @@ def main() -> int:
         total_overruns = 0
         total_steps = 0
 
-        for ep in range(int(args.num_episodes)):
-            if not running:
-                break
+        # ── Episode loop (while instead of for → supports re-record) ─────────
+        ep = 0
+        num_episodes = int(args.num_episodes)
+
+        while ep < num_episodes and running:
+
             input(
                 f"\n{'=' * 40}\n"
-                f"Press Enter to start episode {ep + 1}/{int(args.num_episodes)}...\n"
+                f"Press Enter to start episode {ep + 1}/{num_episodes}...\n"
                 f"{'=' * 40}"
             )
             if not running:
                 break
+
+            # Reset per-episode keyboard flags AFTER the Enter prompt so any
+            # accidental key presses during the pause don't affect this episode.
+            if kbd is not None:
+                kbd.reset_episode()
 
             if system.teleop_enabled and not teleop_started:
                 teleop_started = _start_prepared_teleop(system)
@@ -439,14 +618,35 @@ def main() -> int:
             ep_overruns = 0
             corr_steps = 0
             ep_recorded_frames = 0
+            rerecord = False
+            marked_success = False
 
+            # ── Inner control loop ──────────────────────────────────────────
             while running:
                 now_perf = time.perf_counter()
                 measured_dt = max(now_perf - last_step_t, 1e-4)
                 last_step_t = now_perf
 
+                # Time limit
                 if now_perf - ep_start > float(args.max_episode_duration):
                     break
+
+                # ── Keyboard event handling ─────────────────────────────────
+                if kbd is not None:
+                    if kbd.stop_recording:
+                        print("\n[KB] STOP RECORDING – saving episode & ending run.")
+                        running = False
+                        break
+                    if kbd.rerecord_episode:
+                        print("\n[KB] RE-RECORD – discarding current episode.")
+                        rerecord = True
+                        break
+                    if kbd.mark_success:
+                        print("\n[KB] Episode marked as SUCCESS – saving & continuing.")
+                        marked_success = True
+                        kbd.mark_success = False
+                        break
+                # ───────────────────────────────────────────────────────────
 
                 q, dq, grip, _ = system.get_leader_joint_states()
                 currents_all = system.driver.get_currents()
@@ -612,28 +812,55 @@ def main() -> int:
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 
+            # ── Post-episode handling ───────────────────────────────────────
+
+            if rerecord:
+                _discard_episode(lerobot_recorder, npz_recorder)
+                print(f"[KB] Episode {ep + 1} discarded – will re-record.\n")
+                if not running:
+                    break
+                continue  # ep NOT incremented → same episode retried
+
+            # Save episode
             if ep_recorded_frames > 0:
                 ep_idx = lerobot_recorder.end_episode()
             else:
                 ep_idx = -1
-                print("[WARN] No dataset frames recorded in this episode; skipping save_episode().")
+                print("[WARN] No dataset frames recorded in this episode; skipping save.")
             if npz_recorder is not None:
                 npz_recorder.end_episode()
 
             duration_s = time.perf_counter() - ep_start
-            print(f"\nEpisode {ep_idx} complete:")
-            print(f"  Steps: {ep_steps}")
-            print(f"  Duration: {duration_s:.1f}s")
-            print(f"  Dataset frames: {ep_recorded_frames}")
-            print(f"  Correction steps: {corr_steps} ({100.0 * corr_steps / max(ep_steps, 1):.1f}%)")
-            print(f"  Timing overruns: {ep_overruns}/{ep_steps} ({100.0 * ep_overruns / max(ep_steps, 1):.1f}%)")
+            end_reason = (
+                "SUCCESS (keyboard)"
+                if marked_success
+                else "STOP (keyboard)"
+                if kbd is not None and kbd.stop_recording
+                else "time limit"
+            )
+            print(f"\nEpisode {ep_idx} complete ({end_reason}):")
+            print(f"  Steps:            {ep_steps}")
+            print(f"  Duration:         {duration_s:.1f}s")
+            print(f"  Dataset frames:   {ep_recorded_frames}")
+            print(
+                f"  Correction steps: {corr_steps} "
+                f"({100.0 * corr_steps / max(ep_steps, 1):.1f}%)"
+            )
+            print(
+                f"  Timing overruns:  {ep_overruns}/{ep_steps} "
+                f"({100.0 * ep_overruns / max(ep_steps, 1):.1f}%)"
+            )
 
             total_steps += ep_steps
             total_overruns += ep_overruns
+            ep += 1
 
+        # ── Finalize dataset ──────────────────────────────────────────────────
         local_path = lerobot_recorder.finalize()
         print(f"\nDataset finalized at: {local_path}")
-        print(f"Total episodes requested: {int(args.num_episodes)}")
+        print(f"  repo_id   : {repo_id}")
+        print(f"  local root: {lerobot_root}")
+        print(f"Total episodes recorded: {ep}/{num_episodes} requested")
         print(
             f"Total timing overruns: {total_overruns}/{total_steps} "
             f"({100.0 * total_overruns / max(total_steps, 1):.1f}%)"
@@ -650,10 +877,12 @@ def main() -> int:
     except Exception as exc:
         print(f"Run failed: {exc}")
         import traceback
-
         traceback.print_exc()
         return 1
     finally:
+        if kbd is not None:
+            kbd.stop()
+
         if system is not None:
             system.running = False
 
