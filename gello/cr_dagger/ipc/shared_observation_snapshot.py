@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from multiprocessing import shared_memory
-from typing import Optional
 
 import numpy as np
 
@@ -34,19 +33,44 @@ class SharedObservationSnapshot:
         self.offsets['wrench'] = curr; curr += 48
         
         self.img_size = img_height * img_width * 3
+        self._image_shape = (self.img_height, self.img_width, 3)
         self.offsets['image'] = curr; curr += self.img_size
         
         self.total_bytes = curr
         
         if create:
-            try:
-                self.shm = shared_memory.SharedMemory(name=name, create=True, size=self.total_bytes)
-            except FileExistsError:
-                self.shm = shared_memory.SharedMemory(name=name)
+            self.shm = self._create_fresh_segment()
         else:
             self.shm = shared_memory.SharedMemory(name=name)
+            if self.shm.size != self.total_bytes:
+                size = self.shm.size
+                self.shm.close()
+                raise ValueError(
+                    f"SharedObservationSnapshot '{name}' size mismatch: "
+                    f"expected {self.total_bytes}, got {size}"
+                )
             
         self.last_read_version = -1
+
+    def _create_fresh_segment(self) -> shared_memory.SharedMemory:
+        """Create a clean shared-memory segment, replacing stale leftovers."""
+        try:
+            shm = shared_memory.SharedMemory(
+                name=self.name, create=True, size=self.total_bytes
+            )
+        except FileExistsError:
+            stale = shared_memory.SharedMemory(name=self.name, create=False)
+            try:
+                stale.close()
+                stale.unlink()
+            except FileNotFoundError:
+                pass
+            shm = shared_memory.SharedMemory(
+                name=self.name, create=True, size=self.total_bytes
+            )
+
+        shm.buf[:] = b"\x00" * self.total_bytes
+        return shm
 
     def write(
         self,
@@ -60,7 +84,12 @@ class SharedObservationSnapshot:
     ) -> None:
         buf = self.shm.buf
         
-        version = np.frombuffer(buf[self.offsets['version']:self.offsets['version']+8], dtype=np.int64)[0] + 1
+        version = int(
+            np.frombuffer(
+                buf[self.offsets['version']:self.offsets['version'] + 8],
+                dtype=np.int64,
+            )[0]
+        ) + 1
         buf[self.offsets['version']:self.offsets['version']+8] = np.array([version], dtype=np.int64).tobytes()
         
         buf[self.offsets['timestamp']:self.offsets['timestamp']+8] = np.array([timestamp], dtype=np.float64).tobytes()
@@ -69,14 +98,32 @@ class SharedObservationSnapshot:
         buf[self.offsets['grip']:self.offsets['grip']+8] = np.array([grip], dtype=np.float64).tobytes()
         buf[self.offsets['tau_ext']:self.offsets['tau_ext']+(8*self.n_joints)] = np.array(tau_ext[:self.n_joints], dtype=np.float64).tobytes()
         buf[self.offsets['wrench']:self.offsets['wrench']+48] = np.array(wrench[:6], dtype=np.float64).tobytes()
-        
-        if image is not None:
-            img_view = np.ndarray((self.img_height, self.img_width, 3), dtype=np.uint8, buffer=buf, offset=self.offsets['image'])
-            np.copyto(img_view, image)
+
+        img_view = np.ndarray(
+            self._image_shape,
+            dtype=np.uint8,
+            buffer=buf,
+            offset=self.offsets['image'],
+        )
+        if image is None:
+            img_view.fill(0)
+            return
+
+        image_arr = np.asarray(image, dtype=np.uint8)
+        if image_arr.shape != self._image_shape:
+            raise ValueError(
+                f"image must have shape {self._image_shape}, got {image_arr.shape}"
+            )
+        np.copyto(img_view, image_arr)
 
     def read(self) -> dict | None:
         buf = self.shm.buf
-        version = np.frombuffer(buf[self.offsets['version']:self.offsets['version']+8], dtype=np.int64)[0]
+        version = int(
+            np.frombuffer(
+                buf[self.offsets['version']:self.offsets['version'] + 8],
+                dtype=np.int64,
+            )[0]
+        )
         
         if version == self.last_read_version:
             return None
@@ -90,7 +137,12 @@ class SharedObservationSnapshot:
         tau_ext = np.frombuffer(buf[self.offsets['tau_ext']:self.offsets['tau_ext']+(8*self.n_joints)], dtype=np.float64).copy()
         wrench = np.frombuffer(buf[self.offsets['wrench']:self.offsets['wrench']+48], dtype=np.float64).copy()
         
-        image = np.ndarray((self.img_height, self.img_width, 3), dtype=np.uint8, buffer=buf, offset=self.offsets['image']).copy()
+        image = np.ndarray(
+            self._image_shape,
+            dtype=np.uint8,
+            buffer=buf,
+            offset=self.offsets['image'],
+        ).copy()
         
         return {
             'timestamp': float(timestamp),

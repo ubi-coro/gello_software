@@ -216,6 +216,28 @@ def _resolve_camera_config(args: argparse.Namespace) -> tuple[list[str], list[st
     return camera_names, camera_device_ids, camera_flips
 
 
+def _start_prepared_teleop(system: FACTRGravityCompensation) -> bool:
+    """Start follower mirroring if FACTR teleop was prepared during init."""
+    if not system.teleop_enabled or not system.teleop_prepared:
+        return False
+
+    if system.teleop_thread is not None and system.teleop_thread.is_alive():
+        return True
+
+    system.running = True
+    if getattr(system, "use_impedance_control", False):
+        target = system._teleop_loop_impedance
+        mode = "impedance"
+    else:
+        target = system._teleop_loop
+        mode = "position"
+
+    system.teleop_thread = Thread(target=target, daemon=True, name="factr-teleop")
+    system.teleop_thread.start()
+    print(f"[TELEOP] started follower mirroring thread ({mode} mode)")
+    return True
+
+
 def main() -> int:
     args = _parse_args()
 
@@ -238,6 +260,7 @@ def main() -> int:
     detector: FusedInterventionDetector | None = None
     admittance: JointSpaceAdmittanceController | None = None
     n = 6
+    teleop_started = False
 
     def _sig(*_: object) -> None:
         nonlocal running
@@ -254,6 +277,8 @@ def main() -> int:
         n = int(system.num_arm_joints)
         if system.driver is None:
             raise RuntimeError("Dynamixel driver is not available")
+        if not system.teleop_enabled:
+            print("[WARN] teleop is disabled in config; follower motion and wrench feedback are unavailable.")
         shi = _build_shi(system, config_path, n)
 
         q0, _, _, _ = system.get_leader_joint_states()
@@ -386,6 +411,13 @@ def main() -> int:
             )
             if not running:
                 break
+
+            if system.teleop_enabled and not teleop_started:
+                teleop_started = _start_prepared_teleop(system)
+                if not teleop_started:
+                    raise RuntimeError(
+                        "teleop is enabled but follower mirroring thread could not be started"
+                    )
 
             if args.interventions:
                 assert traj_interp is not None
@@ -622,6 +654,9 @@ def main() -> int:
         traceback.print_exc()
         return 1
     finally:
+        if system is not None:
+            system.running = False
+
         if stop_event is not None:
             stop_event.set()
         if policy_proc is not None:

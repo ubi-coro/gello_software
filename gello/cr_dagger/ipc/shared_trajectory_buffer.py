@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from multiprocessing import shared_memory
-from typing import Optional
 
 import numpy as np
 
@@ -23,44 +22,88 @@ class SharedTrajectoryBuffer:
         self.data_bytes = horizon * n_joints * 8
         self.slot_bytes = self.HEADER_BYTES + self.data_bytes
         self.total_bytes = self.slot_bytes * 2
-        
+
         if create:
-            try:
-                self.shm = shared_memory.SharedMemory(name=name, create=True, size=self.total_bytes)
-            except FileExistsError:
-                self.shm = shared_memory.SharedMemory(name=name)
+            self.shm = self._create_fresh_segment()
         else:
             self.shm = shared_memory.SharedMemory(name=name)
+            if self.shm.size != self.total_bytes:
+                size = self.shm.size
+                self.shm.close()
+                raise ValueError(
+                    f"SharedTrajectoryBuffer '{name}' size mismatch: "
+                    f"expected {self.total_bytes}, got {size}"
+                )
+
+        self._last_version = -1
+
+    def _create_fresh_segment(self) -> shared_memory.SharedMemory:
+        """Create a clean shared-memory segment, replacing stale leftovers."""
+        try:
+            shm = shared_memory.SharedMemory(
+                name=self.name, create=True, size=self.total_bytes
+            )
+        except FileExistsError:
+            stale = shared_memory.SharedMemory(name=self.name, create=False)
+            try:
+                stale.close()
+                stale.unlink()
+            except FileNotFoundError:
+                pass
+            shm = shared_memory.SharedMemory(
+                name=self.name, create=True, size=self.total_bytes
+            )
+
+        shm.buf[:] = b"\x00" * self.total_bytes
+        return shm
 
     def write(self, trajectory: np.ndarray, t_write: float) -> None:
-        
+        traj = np.asarray(trajectory, dtype=np.float64)
+        expected_shape = (self.horizon, self.n_joints)
+        if traj.shape != expected_shape:
+            raise ValueError(
+                f"trajectory must have shape {expected_shape}, got {traj.shape}"
+            )
+
         active_slot_bytes = self.shm.buf[8:16]
-        active_slot = np.frombuffer(active_slot_bytes, dtype=np.int64)[0]
-        
+        active_slot = int(np.frombuffer(active_slot_bytes, dtype=np.int64)[0])
+        if active_slot not in (0, 1):
+            active_slot = 0
+
         next_slot = 1 - active_slot
         offset = next_slot * self.slot_bytes
-        
-        # write data header
-        header = np.array([1, next_slot], dtype=np.int64)
+
+        version = int(np.frombuffer(self.shm.buf[0:8], dtype=np.int64)[0]) + 1
         t_w = np.array([t_write], dtype=np.float64)
-        
-        self.shm.buf[offset+16:offset+24] = t_w.tobytes()
-        self.shm.buf[offset+24:offset+self.slot_bytes] = trajectory.tobytes()
-        
-        # switch active
+
+        # Write inactive slot first, then atomically switch active slot index.
+        self.shm.buf[offset:offset + 8] = np.array([version], dtype=np.int64).tobytes()
+        self.shm.buf[offset + 8:offset + 16] = np.array([next_slot], dtype=np.int64).tobytes()
+        self.shm.buf[offset + 16:offset + 24] = t_w.tobytes()
+        self.shm.buf[offset + 24:offset + self.slot_bytes] = traj.tobytes(order="C")
+
+        self.shm.buf[0:8] = np.array([version], dtype=np.int64).tobytes()
         self.shm.buf[8:16] = np.array([next_slot], dtype=np.int64).tobytes()
 
     def read(self) -> tuple[np.ndarray, float, bool]:
-        
-        active_slot = np.frombuffer(self.shm.buf[8:16], dtype=np.int64)[0]
+        active_slot = int(np.frombuffer(self.shm.buf[8:16], dtype=np.int64)[0])
+        if active_slot not in (0, 1):
+            active_slot = 0
+
         offset = active_slot * self.slot_bytes
-        
-        t_write = np.frombuffer(self.shm.buf[offset+16:offset+24], dtype=np.float64)[0]
-        traj_data = np.frombuffer(self.shm.buf[offset+24:offset+self.slot_bytes], dtype=np.float64)
-        
+        version = int(np.frombuffer(self.shm.buf[offset:offset + 8], dtype=np.int64)[0])
+        t_write = np.frombuffer(self.shm.buf[offset + 16:offset + 24], dtype=np.float64)[0]
+        traj_data = np.frombuffer(
+            self.shm.buf[offset + 24:offset + self.slot_bytes],
+            dtype=np.float64,
+            count=self.horizon * self.n_joints,
+        )
+
         traj = traj_data.reshape((self.horizon, self.n_joints)).copy()
-        
-        return traj, float(t_write), True
+        is_new = version != self._last_version
+        self._last_version = version
+
+        return traj, float(t_write), is_new
 
     def get_reference(self, t_now: float, action_dt: float = 0.1) -> np.ndarray:
         traj, t_write, _ = self.read()

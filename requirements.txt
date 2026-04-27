@@ -1,5 +1,6 @@
 # keep in alphabetical order
 dm_control
+lerobot>=0.4.0
 omegaconf==2.3.0
 Pillow
 pin==3.7.0
