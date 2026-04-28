@@ -1814,6 +1814,7 @@ class FACTRGravityCompensation:
                 
                 # 2. Apply teleop mapping (leader → follower coordinates)
                 target_joints = self._build_follower_action(leader_arm_pos, leader_gripper_pos)
+                self._teleop_last_action = target_joints.copy()
                 
                 # 3. Optionally map leader velocity
                 if use_leader_velocity and self.map_signs is not None:

@@ -150,10 +150,17 @@ class LeRobotCorrectionRecorder:
         is_correction: bool = False,
         detector_votes: np.ndarray | None = None,
         images: dict[str, np.ndarray] | None = None,
+        action: np.ndarray | None = None,
+        **kwargs: Any,
     ) -> None:
         self._q_ref_history.append((timestamp, q_ref.copy()))
 
         delta_q = self._compute_delta_q_compensated(q_compliant, timestamp)
+
+        action_arr = np.asarray(
+            action if action is not None else np.concatenate([q_ref[:self.n_joints], [gripper_ref]]),
+            dtype=np.float32,
+        )
 
         detector_votes_arr = np.asarray(
             detector_votes if detector_votes is not None else [False, False, False, False],
@@ -183,16 +190,17 @@ class LeRobotCorrectionRecorder:
                 detector_votes_arr,
                 dtype=torch.bool,
             ),
-            "action": torch.tensor(
-                np.concatenate([q_ref[:self.n_joints], [gripper_ref]]),
-                dtype=torch.float32,
-            ),
+            "action": torch.tensor(action_arr, dtype=torch.float32),
             "action.compliant": torch.tensor(
                 np.concatenate([q_compliant[:self.n_joints], [gripper_compliant]]),
                 dtype=torch.float32,
             ),
             "task": self.task_description,
         }
+
+        # Preserve optional metadata without breaking older callers.
+        if kwargs:
+            _ = kwargs
 
         if self.camera_names:
             if images is None:

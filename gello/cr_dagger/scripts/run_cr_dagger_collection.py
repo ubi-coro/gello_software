@@ -1,6 +1,8 @@
+# run_cr_dagger_collection.py
 from __future__ import annotations
 
 import argparse
+import enum
 import multiprocessing as mp
 import re
 import signal
@@ -48,6 +50,194 @@ if str(REPO_ROOT) not in sys.path:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# High-frequency sensor reader (decouples I/O from recording logic)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SensorSnapshot:
+    """Immutable snapshot of all sensor data at one timestep."""
+    __slots__ = (
+        "t_mono", "t_perf",
+        "q_leader", "dq_leader", "grip_leader", "leader_gripper_raw_rad",
+        "currents_arm",
+        "q_follower", "dq_follower", "gripper_follower",
+        "wrench_ur5e", "tcp_joint_torques",
+        "tau_ext",
+    )
+
+    def __init__(self, n: int = 6):
+        self.t_mono: float = 0.0
+        self.t_perf: float = 0.0
+        self.q_leader: np.ndarray = np.zeros(n)
+        self.dq_leader: np.ndarray = np.zeros(n)
+        self.grip_leader: float = 0.0
+        self.leader_gripper_raw_rad: float = 0.0
+        self.currents_arm: np.ndarray = np.zeros(n)
+        self.q_follower: np.ndarray = np.zeros(n)
+        self.dq_follower: np.ndarray = np.zeros(n)
+        self.gripper_follower: float = 0.0
+        self.wrench_ur5e: np.ndarray = np.zeros(6)
+        self.tcp_joint_torques: np.ndarray = np.zeros(n)
+        self.tau_ext: np.ndarray = np.zeros(n)
+
+
+class AsyncSensorReader:
+    """
+    Reads all sensors in a dedicated thread at maximum rate.
+    The control/recording loop just grabs the latest snapshot (near-zero cost read).
+
+    Solves:
+    1. Bus contention (single thread owns Dynamixel + RTDE reads)
+    2. Latency stacking (parallel I/O instead of sequential)
+    3. Consistent timestamps (all data from ~same instant)
+    """
+
+    def __init__(
+        self,
+        system: FACTRGravityCompensation,
+        shi: MinimalistTorqueEstimator,
+        n: int,
+        enable_wrench: bool = False,
+    ):
+        self._system = system
+        self._shi = shi
+        self._n = n
+        self._enable_wrench = enable_wrench
+
+        self._lock = Lock()
+        self._snapshot = SensorSnapshot(n)
+        self._stop = Event()
+        self._thread: Optional[Thread] = None
+        self._read_count = 0
+        self._overrun_count = 0
+        self._start_t = 0.0
+
+    @property
+    def snapshot(self) -> SensorSnapshot:
+        """Get latest sensor snapshot (thread-safe, near-zero cost)."""
+        with self._lock:
+            snap = SensorSnapshot(self._n)
+            # Shallow copy all attributes
+            snap.t_mono = self._snapshot.t_mono
+            snap.t_perf = self._snapshot.t_perf
+            snap.q_leader = self._snapshot.q_leader.copy()
+            snap.dq_leader = self._snapshot.dq_leader.copy()
+            snap.grip_leader = self._snapshot.grip_leader
+            snap.leader_gripper_raw_rad = self._snapshot.leader_gripper_raw_rad
+            snap.currents_arm = self._snapshot.currents_arm.copy()
+            snap.q_follower = self._snapshot.q_follower.copy()
+            snap.dq_follower = self._snapshot.dq_follower.copy()
+            snap.gripper_follower = self._snapshot.gripper_follower
+            snap.wrench_ur5e = self._snapshot.wrench_ur5e.copy()
+            snap.tcp_joint_torques = self._snapshot.tcp_joint_torques.copy()
+            snap.tau_ext = self._snapshot.tau_ext.copy()
+            return snap
+
+    @property
+    def read_hz(self) -> float:
+        """Actual achieved read rate."""
+        if self._read_count == 0:
+            return 0.0
+        elapsed = time.perf_counter() - self._start_t
+        return self._read_count / max(elapsed, 1e-6)
+
+    def start(self) -> None:
+        """Start the sensor reading thread."""
+        self._start_t = time.perf_counter()
+        self._thread = Thread(target=self._reader_loop, daemon=True, name="async-sensor-reader")
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the sensor reading thread."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _reader_loop(self) -> None:
+        """
+        Tight sensor read loop. Targets system.dt but doesn't sleep if reads
+        are already slow — just provides data as fast as possible.
+        """
+        system = self._system
+        shi = self._shi
+        n = self._n
+        dt_target = float(system.dt)
+
+        while not self._stop.is_set():
+            t0 = time.perf_counter()
+
+            snap = SensorSnapshot(n)
+            snap.t_perf = t0
+            snap.t_mono = time.monotonic()
+
+            # ── Dynamixel: combined position + velocity + current read ────
+            try:
+                if hasattr(system.driver, "get_positions_velocities_and_currents"):
+                    # Optimized: single bulk read
+                    pos, vel, cur = system.driver.get_positions_velocities_and_currents()
+                    q_raw = np.asarray(pos[:n], dtype=float)
+                    dq_raw = np.asarray(vel[:n], dtype=float)
+                    snap.q_leader = (q_raw - system.joint_offsets[:n]) * system.joint_signs[:n]
+                    snap.dq_leader = dq_raw * system.joint_signs[:n]
+                    snap.currents_arm = np.asarray(cur[:n], dtype=float) * system.joint_signs[:n]
+                    snap.leader_gripper_raw_rad = float(pos[-1]) if len(pos) > n else 0.0
+                    snap.grip_leader = (pos[-1] - system.joint_offsets[-1]) * system.joint_signs[-1] if len(pos) > n else 0.0
+                else:
+                    # Fallback: two separate reads
+                    q_arm, dq_arm, grip, _ = system.get_leader_joint_states()
+                    snap.q_leader = q_arm.copy()
+                    snap.dq_leader = dq_arm.copy()
+                    snap.grip_leader = grip
+                    snap.leader_gripper_raw_rad = system.leader_gripper_raw_rad
+
+                    cur_all = system.driver.get_currents()
+                    snap.currents_arm = np.asarray(cur_all[:n], dtype=float) * system.joint_signs[:n]
+            except Exception:
+                # On read failure, keep previous snapshot
+                pass
+
+            # ── Shi torque estimator (pure computation, <0.1ms) ───────────
+            try:
+                snap.tau_ext = shi.update(snap.q_leader, snap.dq_leader, snap.currents_arm)
+            except Exception:
+                snap.tau_ext = np.zeros(n)
+
+            # ── RTDE follower reads (separate interface, no bus conflict) ──
+            try:
+                if system._direct_follower_robot is not None and hasattr(system._direct_follower_robot, "r_inter"):
+                    r = system._direct_follower_robot.r_inter
+                    snap.q_follower = np.asarray(r.getActualQ()[:n], dtype=float)
+                    snap.dq_follower = np.asarray(r.getActualQd()[:n], dtype=float)
+
+                    if self._enable_wrench:
+                        snap.wrench_ur5e = np.asarray(r.getActualTCPForce(), dtype=float)
+                        if hasattr(system, "J_semi") and system.J_semi is not None:
+                            tcp_jt = system.J_semi.T @ snap.wrench_ur5e
+                            if hasattr(system, "J_semi_tare") and system.J_semi_tare is not None:
+                                tcp_jt -= system.J_semi_tare
+                            snap.tcp_joint_torques = tcp_jt[:n]
+                else:
+                    q_f, dq_f = system.get_follower_arm_state()
+                    snap.q_follower = np.asarray(q_f[:n], dtype=float)
+                    snap.dq_follower = np.asarray(dq_f[:n], dtype=float)
+            except Exception:
+                pass
+
+            # ── Publish snapshot ──────────────────────────────────────────
+            with self._lock:
+                self._snapshot = snap
+
+            self._read_count += 1
+
+            # ── Timing ────────────────────────────────────────────────────
+            elapsed = time.perf_counter() - t0
+            sleep_s = dt_target - elapsed
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            else:
+                self._overrun_count += 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # repo_id Validation
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -55,71 +245,141 @@ _REPO_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
 
 
 def _validate_repo_id(repo_id: str) -> str:
-    """
-    Validate that repo_id follows LeRobot's required 'username/dataset_name' format.
-
-    LeRobot's LeRobotDataset and HuggingFace Hub both require this format.
-    A bare path like '/media/.../my_dataset' is NOT a valid repo_id.
-
-    Correct:  jstranghoener/cr_dagger_insertion
-    Wrong:    /media/internal/nvme/.../cr_dagger_teleoperation
-    """
     if not _REPO_ID_PATTERN.match(repo_id):
         raise ValueError(
             f"\n[ERROR] Invalid repo_id: '{repo_id}'\n"
             f"        repo_id must be in 'username/dataset_name' format.\n"
             f"        Example: --lerobot-repo jstranghoener/cr_dagger_insertion\n"
-            f"        Use --lerobot-root for the local storage path.\n"
-            f"        Example: --lerobot-root /media/internal/nvme/jstranghoener/data"
+            f"        Use --lerobot-root for the local storage path."
         )
     return repo_id
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Keyboard Controller
+# Episode State Machine
 # ══════════════════════════════════════════════════════════════════════════════
 
-class EpisodeKeyboardController:
-    """
-    Non-blocking pynput keyboard controller for in-episode actions.
+class EpisodeState(enum.Enum):
+    """State machine for episode lifecycle."""
+    IDLE = "idle"           # Waiting for user to start recording
+    RECORDING = "recording" # Actively recording an episode
+    RESET = "reset"         # Post-episode reset phase (teleop still active)
 
-    Keybindings (mirrors UR5eInsertionConfig key_mapping):
-        →  Right Arrow  →  stop recording, save episode, end collection
-        ←  Left Arrow   →  discard episode, re-record same index
-        Space           →  mark episode as success, continue to next
+
+class EpisodeController:
+    """
+    Unified controller for episode lifecycle via keyboard AND foot pedal.
+
+    The foot pedal (a USB HID device that sends a configurable key) has
+    context-dependent behavior:
+
+        State       | Pedal / Enter        | ← Left Arrow    | → Right Arrow
+        ------------|----------------------|------------------|------------------
+        IDLE        | Start recording      | —                | Quit collection
+        RECORDING   | Mark success & stop  | Discard & retry  | Stop & save
+        RESET       | Start next recording | —                | Quit collection
+
+    This replaces the old EpisodeKeyboardController + blocking input() approach.
     """
 
-    def __init__(self) -> None:
-        self.stop_recording: bool = False
-        self.rerecord_episode: bool = False
-        self.mark_success: bool = False
+    def __init__(self, foot_pedal_key: str = "f10") -> None:
+        self._state = EpisodeState.IDLE
+        self._lock = Lock()
         self._listener: Optional[Any] = None
+
+        # ── Events (thread-safe, one-shot) ────────────────────────────────
+        self.start_requested = Event()     # IDLE/RESET → start recording
+        self.success_requested = Event()   # RECORDING → mark success
+        self.discard_requested = Event()   # RECORDING → discard & retry
+        self.stop_requested = Event()      # any state → save & quit
+
+        # ── Foot pedal key configuration ──────────────────────────────────
+        self._pedal_key = self._resolve_key(foot_pedal_key)
+        self._pedal_key_name = foot_pedal_key
+
+    # ── Key resolution ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_key(key_str: str) -> Any:
+        """Resolve a key string to a pynput Key or KeyCode."""
+        if not _PYNPUT_AVAILABLE:
+            return None
+        # Try special keys first (f1-f12, space, enter, etc.)
+        special = getattr(kb.Key, key_str.lower(), None)
+        if special is not None:
+            return special
+        # Single character → KeyCode
+        if len(key_str) == 1:
+            return kb.KeyCode.from_char(key_str)
+        return None
+
+    # ── State management ──────────────────────────────────────────────────
+
+    @property
+    def state(self) -> EpisodeState:
+        with self._lock:
+            return self._state
+
+    @state.setter
+    def state(self, new_state: EpisodeState) -> None:
+        with self._lock:
+            old = self._state
+            self._state = new_state
+        if old != new_state:
+            print(f"[STATE] {old.value} → {new_state.value}")
+
+    def reset_events(self) -> None:
+        """Clear all one-shot events (call when entering a new state)."""
+        self.start_requested.clear()
+        self.success_requested.clear()
+        self.discard_requested.clear()
+        # NOTE: stop_requested is intentionally NOT cleared
+
+    # ── Keyboard / pedal listener ─────────────────────────────────────────
 
     def start(self) -> None:
         if not _PYNPUT_AVAILABLE:
-            print("[KB] pynput not installed – keyboard episode controls disabled.")
+            print("[KB] pynput not installed – keyboard/pedal controls disabled.")
+            print("[KB] Falling back to blocking input() prompts.")
             return
+
         self._listener = kb.Listener(on_press=self._on_press)
         self._listener.daemon = True
         self._listener.start()
-        print("[KB] In-episode keyboard controls active:")
-        print("       →  Right Arrow  →  stop & save episode")
-        print("       ←  Left Arrow   →  discard & re-record")
-        print("       Space           →  mark success & continue")
+
+        print(f"[CONTROLS] Foot pedal key: '{self._pedal_key_name}'")
+        print(f"[CONTROLS] Key bindings (context-dependent):")
+        print(f"  IDLE/RESET:  Pedal/Enter → start recording")
+        print(f"  RECORDING:   Pedal       → mark SUCCESS & save")
+        print(f"  RECORDING:   ← Left      → DISCARD & retry")
+        print(f"  RECORDING:   → Right     → STOP collection & save")
+        print(f"  ANY:         Ctrl+C      → emergency stop")
 
     def _on_press(self, key: Any) -> None:
-        if key == kb.Key.right:
-            self.stop_recording = True
-        elif key == kb.Key.left:
-            self.rerecord_episode = True
-        elif key == kb.Key.space:
-            self.mark_success = True
+        state = self.state
 
-    def reset_episode(self) -> None:
-        """Reset per-episode flags. Call once before starting the inner loop."""
-        self.rerecord_episode = False
-        self.mark_success = False
-        # stop_recording intentionally NOT reset – once set it stops the run
+        # ── Foot pedal or Enter key ───────────────────────────────────────
+        is_pedal = (key == self._pedal_key)
+        is_enter = (key == kb.Key.enter)
+
+        if is_pedal or is_enter:
+            if state == EpisodeState.IDLE or state == EpisodeState.RESET:
+                self.start_requested.set()
+            elif state == EpisodeState.RECORDING:
+                self.success_requested.set()
+            return
+
+        # ── Arrow keys (recording-only) ──────────────────────────────────
+        if state == EpisodeState.RECORDING:
+            if key == kb.Key.left:
+                self.discard_requested.set()
+            elif key == kb.Key.right:
+                self.stop_requested.set()
+
+        # ── Right arrow in IDLE/RESET → quit ──────────────────────────────
+        if state in (EpisodeState.IDLE, EpisodeState.RESET):
+            if key == kb.Key.right:
+                self.stop_requested.set()
 
     def stop(self) -> None:
         if self._listener is not None:
@@ -128,6 +388,31 @@ class EpisodeKeyboardController:
             except Exception:
                 pass
             self._listener = None
+
+    # ── Blocking wait helpers (fallback when pynput unavailable) ──────────
+
+    def wait_for_start(self, timeout: float | None = None) -> bool:
+        """
+        Wait for user to request episode start.
+
+        Returns True if start was requested, False if stop was requested.
+        Uses pynput events if available, otherwise falls back to input().
+        """
+        if self._listener is not None:
+            # Non-blocking pynput mode: wait on events
+            while True:
+                if self.stop_requested.is_set():
+                    return False
+                if self.start_requested.wait(timeout=0.1):
+                    self.start_requested.clear()
+                    return True
+        else:
+            # Fallback: blocking input()
+            try:
+                input("  Press Enter to start recording (Ctrl+C to quit)... ")
+                return True
+            except (EOFError, KeyboardInterrupt):
+                return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -138,14 +423,13 @@ def _discard_episode(
     lerobot_recorder: LeRobotCorrectionRecorder,
     npz_recorder: Optional[CorrectionRecorder],
 ) -> None:
-    """Best-effort discard of the current in-progress episode buffers."""
     try:
         if hasattr(lerobot_recorder, "discard_episode"):
             lerobot_recorder.discard_episode()
         elif hasattr(lerobot_recorder, "clear_episode_buffer"):
             lerobot_recorder.clear_episode_buffer()
         else:
-            print("[WARN] Recorder has no discard/clear method; buffer may persist.")
+            print("[WARN] Recorder has no discard/clear method.")
     except Exception as exc:
         print(f"[WARN] Could not discard lerobot episode: {exc}")
 
@@ -158,7 +442,141 @@ def _discard_episode(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Helpers
+# Lightweight Phase A recording loop (RTDE + cameras only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_recording_loop_phase_a(
+    system: FACTRGravityCompensation,
+    ctrl: EpisodeController,
+    lerobot_recorder: LeRobotCorrectionRecorder,
+    camera_rig: Optional[MultiRealSenseRig],
+    args: argparse.Namespace,
+    ep: int,
+    n: int,
+) -> dict:
+    """Phase A recording: teleop owns Dynamixel I/O; this loop reads RTDE and cameras."""
+    dataset_fps = int(args.dataset_fps)
+    frame_dt = 1.0 / max(dataset_fps, 1)
+    max_duration = float(args.max_episode_duration)
+    ep_start = time.perf_counter()
+    ep_steps = 0
+    ep_overruns = 0
+    ep_recorded_frames = 0
+
+    while True:
+        frame_start = time.perf_counter()
+
+        if frame_start - ep_start > max_duration:
+            print(f"[REC] Time limit reached ({max_duration}s)")
+            break
+
+        if ctrl.stop_requested.is_set():
+            return {
+                "rerecord": False,
+                "success": False,
+                "running": False,
+                "steps": ep_steps,
+                "overruns": ep_overruns,
+                "frames": ep_recorded_frames,
+            }
+        if ctrl.discard_requested.is_set():
+            return {
+                "rerecord": True,
+                "success": False,
+                "running": True,
+                "steps": ep_steps,
+                "overruns": ep_overruns,
+                "frames": ep_recorded_frames,
+            }
+        if ctrl.success_requested.is_set():
+            return {
+                "rerecord": False,
+                "success": True,
+                "running": True,
+                "steps": ep_steps,
+                "overruns": ep_overruns,
+                "frames": ep_recorded_frames,
+            }
+
+        t_mono = time.monotonic()
+        q_follower = np.zeros(n, dtype=float)
+        dq_follower = np.zeros(n, dtype=float)
+        try:
+            q_follower_raw, dq_follower_raw = system.get_follower_arm_state()
+            q_follower = np.asarray(q_follower_raw[:n], dtype=float)
+            dq_follower = np.asarray(dq_follower_raw[:n], dtype=float)
+        except Exception:
+            pass
+
+        gripper_follower = 0.0
+        try:
+            fb = system.get_follower_gripper_feedback()
+            gripper_follower = float(fb.get("position", 0.0))
+        except Exception:
+            pass
+
+        action = getattr(system, "_teleop_last_action", None)
+        if action is None:
+            elapsed = time.perf_counter() - frame_start
+            if elapsed < frame_dt:
+                time.sleep(frame_dt - elapsed)
+            ep_steps += 1
+            continue
+        action = np.asarray(action, dtype=float).copy()
+
+        images = None
+        if camera_rig is not None:
+            images = camera_rig.get_images()
+            if images is None:
+                elapsed = time.perf_counter() - frame_start
+                if elapsed < frame_dt:
+                    time.sleep(frame_dt - elapsed)
+                ep_steps += 1
+                continue
+
+        lerobot_recorder.add_frame(
+            timestamp=t_mono,
+            q=q_follower,
+            dq=dq_follower,
+            gripper=gripper_follower,
+            action=action,
+            tau_ext=np.zeros(n, dtype=float),
+            wrench_ur5e=np.zeros(6, dtype=float),
+            q_ref=q_follower,
+            q_compliant=q_follower,
+            dq_compliant=dq_follower,
+            is_correction=False,
+            detector_votes=np.zeros(4, dtype=bool),
+            images=images,
+        )
+        ep_recorded_frames += 1
+        ep_steps += 1
+
+        if ep_recorded_frames % dataset_fps == 0:
+            elapsed_s = frame_start - ep_start
+            print(
+                f"  [ep {ep+1:03d} {elapsed_s:5.1f}s] "
+                f"frames={ep_recorded_frames}"
+            )
+
+        elapsed = time.perf_counter() - frame_start
+        if elapsed > frame_dt:
+            ep_overruns += 1
+        else:
+            time.sleep(frame_dt - elapsed)
+
+    return {
+        "rerecord": False,
+        "success": False,
+        "running": True,
+        "steps": ep_steps,
+        "overruns": ep_overruns,
+        "frames": ep_recorded_frames,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Helpers (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _resolve_leader_urdf(config_path: Path, leader_urdf: str) -> Path:
@@ -210,64 +628,6 @@ def _build_shi(
             vel_threshold=0.05,
         )
     )
-
-
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="CR-DAgger production data collection")
-    p.add_argument(
-        "--interventions",
-        action="store_true",
-        help="Enable CR-DAgger intervention/correction mode. If unset, records Phase A teleop data.",
-    )
-    p.add_argument("--config", type=str, default="configs/ur5e_gello_factr_hw_V3.yaml")
-    p.add_argument("--mass", type=float, default=1.0)
-    p.add_argument("--damping", type=float, default=5.0)
-    p.add_argument("--stiffness", type=float, default=20.0)
-    p.add_argument("--policy-type", choices=["dummy_sine", "dummy_hold"], default="dummy_hold")
-    p.add_argument("--amplitude", type=float, default=0.05)
-    p.add_argument("--frequency", type=float, default=0.15)
-    p.add_argument("--horizon", type=int, default=32)
-    p.add_argument("--action-dt", type=float, default=0.1)
-    p.add_argument("--min-votes", type=int, default=2)
-    p.add_argument("--obs-decimation", type=int, default=33)
-
-    # ── LeRobot dataset ───────────────────────────────────────────────────────
-    p.add_argument(
-        "--lerobot-repo",
-        type=str,
-        required=True,
-        help=(
-            "LeRobot repo_id in 'username/dataset_name' format. "
-            "This is used as the dataset identifier (HuggingFace-style). "
-            "Example: jstranghoener/cr_dagger_insertion"
-        ),
-    )
-    p.add_argument(
-        "--lerobot-root",
-        type=str,
-        default=None,
-        help=(
-            "Local root directory where the dataset is stored on disk. "
-            "Defaults to ~/.cache/lerobot/datasets/{repo_id}. "
-            "Example: /media/internal/nvme/jstranghoener/data"
-        ),
-    )
-    # ─────────────────────────────────────────────────────────────────────────
-
-    p.add_argument("--task-description", type=str, default="CR-DAgger correction episode")
-    p.add_argument("--log-dir", type=str, default="cr_dagger_data")
-    p.add_argument("--no-npz", action="store_true")
-    p.add_argument("--num-episodes", type=int, default=5)
-    p.add_argument("--max-episode-duration", type=float, default=30.0)
-    p.add_argument("--dataset-fps", type=int, default=30)
-    p.add_argument("--push-to-hub", action="store_true")
-    p.add_argument("--camera-names", nargs="*", default=None)
-    p.add_argument("--camera-device-ids", nargs="*", default=None)
-    p.add_argument("--camera-flips", nargs="*", default=None)
-    p.add_argument("--camera-warmup-s", type=float, default=2.0)
-    p.add_argument("--enable-wrench", action="store_true")
-    p.add_argument("--enable-wrench-feedback", action="store_true")
-    return p.parse_args()
 
 
 class MultiRealSenseRig:
@@ -360,7 +720,6 @@ def _resolve_camera_config(args: argparse.Namespace) -> tuple[list[str], list[st
 
 
 def _start_prepared_teleop(system: FACTRGravityCompensation) -> bool:
-    """Start follower mirroring if FACTR teleop was prepared during init."""
     if not system.teleop_enabled or not system.teleop_prepared:
         return False
 
@@ -382,20 +741,72 @@ def _start_prepared_teleop(system: FACTRGravityCompensation) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Argument parsing
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="CR-DAgger production data collection")
+    p.add_argument(
+        "--interventions",
+        action="store_true",
+        help="Enable CR-DAgger intervention/correction mode.",
+    )
+    p.add_argument("--config", type=str, default="configs/ur5e_gello_factr_hw_V3.yaml")
+    p.add_argument("--mass", type=float, default=1.0)
+    p.add_argument("--damping", type=float, default=5.0)
+    p.add_argument("--stiffness", type=float, default=20.0)
+    p.add_argument("--policy-type", choices=["dummy_sine", "dummy_hold"], default="dummy_hold")
+    p.add_argument("--amplitude", type=float, default=0.05)
+    p.add_argument("--frequency", type=float, default=0.15)
+    p.add_argument("--horizon", type=int, default=32)
+    p.add_argument("--action-dt", type=float, default=0.1)
+    p.add_argument("--min-votes", type=int, default=2)
+    p.add_argument("--obs-decimation", type=int, default=33)
+
+    # ── Foot pedal ────────────────────────────────────────────────────────
+    p.add_argument(
+        "--foot-pedal-key",
+        type=str,
+        default="f10",
+        help=(
+            "Key that the USB foot pedal sends. Examples: 'f10', 'b', 'space'. "
+            "Pedal starts/stops episodes depending on context. (default: f10)"
+        ),
+    )
+
+    # ── LeRobot dataset ───────────────────────────────────────────────────
+    p.add_argument("--lerobot-repo", type=str, required=True)
+    p.add_argument("--lerobot-root", type=str, default=None)
+
+    p.add_argument("--task-description", type=str, default="CR-DAgger correction episode")
+    p.add_argument("--log-dir", type=str, default="cr_dagger_data")
+    p.add_argument("--no-npz", action="store_true")
+    p.add_argument("--num-episodes", type=int, default=5)
+    p.add_argument("--max-episode-duration", type=float, default=30.0)
+    p.add_argument("--dataset-fps", type=int, default=30)
+    p.add_argument("--push-to-hub", action="store_true")
+    p.add_argument("--camera-names", nargs="*", default=None)
+    p.add_argument("--camera-device-ids", nargs="*", default=None)
+    p.add_argument("--camera-flips", nargs="*", default=None)
+    p.add_argument("--camera-warmup-s", type=float, default=2.0)
+    p.add_argument("--enable-wrench", action="store_true")
+    p.add_argument("--enable-wrench-feedback", action="store_true")
+    return p.parse_args()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> int:
     args = _parse_args()
 
-    # ── Validate repo_id early – fail fast before any hardware init ───────────
     try:
         repo_id = _validate_repo_id(args.lerobot_repo)
     except ValueError as e:
         print(e)
         return 1
 
-    # ── Resolve local dataset root ────────────────────────────────────────────
     if args.lerobot_root is not None:
         dataset_root = Path(args.lerobot_root) / repo_id
     else:
@@ -431,21 +842,24 @@ def main() -> int:
     traj_interp: TrajectoryInterpolator | None = None
     detector: FusedInterventionDetector | None = None
     admittance: JointSpaceAdmittanceController | None = None
-    kbd: Optional[EpisodeKeyboardController] = None
+    ctrl: Optional[EpisodeController] = None
+    sensor_reader: Optional[AsyncSensorReader] = None
     n = 6
     teleop_started = False
 
     def _sig(*_: object) -> None:
         nonlocal running
         running = False
+        if ctrl is not None:
+            ctrl.stop_requested.set()
 
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
 
     try:
-        # ── Keyboard setup ────────────────────────────────────────────────────
-        kbd = EpisodeKeyboardController()
-        kbd.start()
+        # ── Episode controller (keyboard + foot pedal) ────────────────────
+        ctrl = EpisodeController(foot_pedal_key=str(args.foot_pedal_key))
+        ctrl.start()
 
         mode_str = "CR-DAgger interventions" if args.interventions else "Phase A baseline recording"
         print(f"[MODE] {mode_str}")
@@ -455,12 +869,27 @@ def main() -> int:
         if system.driver is None:
             raise RuntimeError("Dynamixel driver is not available")
         if not system.teleop_enabled:
-            print("[WARN] teleop is disabled in config; follower motion and wrench feedback are unavailable.")
+            print("[WARN] teleop is disabled in config.")
         shi = _build_shi(system, config_path, n)
 
-        q0, _, _, _ = system.get_leader_joint_states()
+        # ── Initialize async sensor reader (solves bus contention + latency stacking) ──
+        sensor_reader = AsyncSensorReader(
+            system=system,
+            shi=shi,
+            n=n,
+            enable_wrench=args.enable_wrench or args.enable_wrench_feedback,
+        )
 
+        sensor_reader: Optional[AsyncSensorReader] = None
         if args.interventions:
+            sensor_reader = AsyncSensorReader(
+                system=system,
+                shi=shi,
+                n=n,
+                enable_wrench=args.enable_wrench or args.enable_wrench_feedback,
+            )
+
+            q0, _, _, _ = system.get_leader_joint_states()
             traj_buf = SharedTrajectoryBuffer(
                 name="cr_dagger_traj",
                 horizon=int(args.horizon),
@@ -496,23 +925,20 @@ def main() -> int:
             )
             camera_rig.start()
             print(f"[CAM] started {len(camera_names)} camera(s): {camera_names}")
-            print(f"[CAM] device ids: {camera_device_ids}")
             time.sleep(max(0.0, float(args.camera_warmup_s)))
 
         dataset_fps = int(args.dataset_fps)
         if dataset_fps <= 0:
             raise ValueError("dataset-fps must be > 0")
 
-        # ── LeRobot recorder: repo_id + explicit local root ───────────────────
         lerobot_recorder = LeRobotCorrectionRecorder(
             repo_id=repo_id,
-            root=dataset_root,
+            root=str(dataset_root),
             fps=dataset_fps,
             task_description=str(args.task_description),
             n_joints=n,
             camera_names=camera_names if camera_names else None,
         )
-        # ─────────────────────────────────────────────────────────────────────
 
         if args.interventions and not args.no_npz:
             npz_recorder = CorrectionRecorder(
@@ -575,34 +1001,52 @@ def main() -> int:
             f"record_every_n={record_every_n}"
         )
 
+        # ── Start teleop ONCE, keep it running across all episodes ────────
+        if system.teleop_enabled and not teleop_started:
+            teleop_started = _start_prepared_teleop(system)
+            if not teleop_started:
+                raise RuntimeError("teleop could not be started")
+
+        if args.interventions and sensor_reader is not None:
+            print("[SENSOR] Starting async sensor reader...")
+            sensor_reader.start()
+            time.sleep(0.5)  # Let reader stabilize
+            print(f"[SENSOR] Reader active at ~{sensor_reader.read_hz:.0f} Hz")
+
         total_overruns = 0
         total_steps = 0
-
-        # ── Episode loop (while instead of for → supports re-record) ─────────
         ep = 0
         num_episodes = int(args.num_episodes)
 
+        # ══════════════════════════════════════════════════════════════════
+        # EPISODE LOOP with State Machine
+        # ══════════════════════════════════════════════════════════════════
+
         while ep < num_episodes and running:
 
-            input(
-                f"\n{'=' * 40}\n"
-                f"Press Enter to start episode {ep + 1}/{num_episodes}...\n"
-                f"{'=' * 40}"
+            # ── IDLE STATE: Wait for user to start ────────────────────────
+            ctrl.state = EpisodeState.IDLE
+            ctrl.reset_events()
+
+            print(
+                f"\n{'=' * 50}\n"
+                f"  Episode {ep + 1}/{num_episodes} — READY\n"
+                f"  Press foot pedal or Enter to start recording.\n"
+                f"  Press → to end collection.\n"
+                f"{'=' * 50}"
             )
+
+            if not ctrl.wait_for_start():
+                # stop_requested was set
+                print("[CTRL] Collection stopped by user.")
+                break
+
             if not running:
                 break
 
-            # Reset per-episode keyboard flags AFTER the Enter prompt so any
-            # accidental key presses during the pause don't affect this episode.
-            if kbd is not None:
-                kbd.reset_episode()
-
-            if system.teleop_enabled and not teleop_started:
-                teleop_started = _start_prepared_teleop(system)
-                if not teleop_started:
-                    raise RuntimeError(
-                        "teleop is enabled but follower mirroring thread could not be started"
-                    )
+            # ── RECORDING STATE ───────────────────────────────────────────
+            ctrl.state = EpisodeState.RECORDING
+            ctrl.reset_events()
 
             if args.interventions:
                 assert traj_interp is not None
@@ -627,233 +1071,302 @@ def main() -> int:
             rerecord = False
             marked_success = False
 
-            # ── Inner control loop ──────────────────────────────────────────
-            while running:
-                now_perf = time.perf_counter()
-                measured_dt = max(now_perf - last_step_t, 1e-4)
-                last_step_t = now_perf
+            print(f"[REC] ● Recording episode {ep + 1}...")
 
-                # Time limit
-                if now_perf - ep_start > float(args.max_episode_duration):
-                    break
+            # ── Phase A (no interventions) vs Phase B (CR-DAgger interventions) ────────
+            if not args.interventions:
+                # ── PHASE A: RTDE + camera recording only ───────────────────────────
+                result = _run_recording_loop_phase_a(
+                    system=system,
+                    ctrl=ctrl,
+                    lerobot_recorder=lerobot_recorder,
+                    camera_rig=camera_rig,
+                    args=args,
+                    ep=ep,
+                    n=n,
+                )
+                rerecord = result["rerecord"]
+                marked_success = result["success"]
+                if not result["running"]:
+                    running = False
+                ep_steps = result["steps"]
+                ep_overruns = result["overruns"]
+                ep_recorded_frames = result["frames"]
+                corr_steps = 0
+                total_overruns += ep_overruns
+                total_steps += ep_steps
+            
+            # ── Inner control loop (Phase B only) ──────────────────────────
+            if args.interventions and running:
+                while running:
+                    now_perf = time.perf_counter()
+                    measured_dt = max(now_perf - last_step_t, 1e-4)
+                    last_step_t = now_perf
 
-                # ── Keyboard event handling ─────────────────────────────────
-                if kbd is not None:
-                    if kbd.stop_recording:
-                        print("\n[KB] STOP RECORDING – saving episode & ending run.")
+                    # Time limit
+                    if now_perf - ep_start > float(args.max_episode_duration):
+                        print(f"[REC] Time limit reached ({args.max_episode_duration}s)")
+                        break
+
+                    # ── Check controller events ───────────────────────────────
+                    if ctrl.stop_requested.is_set():
+                        print("\n[CTRL] STOP — saving episode & ending collection.")
                         running = False
                         break
-                    if kbd.rerecord_episode:
-                        print("\n[KB] RE-RECORD – discarding current episode.")
+                    if ctrl.discard_requested.is_set():
+                        print("\n[CTRL] DISCARD — will re-record this episode.")
                         rerecord = True
                         break
-                    if kbd.mark_success:
-                        print("\n[KB] Episode marked as SUCCESS – saving & continuing.")
+                    if ctrl.success_requested.is_set():
+                        print("\n[CTRL] ✓ SUCCESS — saving episode.")
                         marked_success = True
-                        kbd.mark_success = False
                         break
-                # ───────────────────────────────────────────────────────────
 
-                q, dq, grip, _ = system.get_leader_joint_states()
-                currents_all = system.driver.get_currents()
-                currents_arm = currents_all[:n] * system.joint_signs[:n]
-                tau_ext = shi.update(q, dq, currents_arm)
+                    # ── Sensor reads ──────────────────────────────────────────
+                    q, dq, grip, _ = system.get_leader_joint_states()
+                    currents_all = system.driver.get_currents()
+                    currents_arm = currents_all[:n] * system.joint_signs[:n]
+                    tau_ext = shi.update(q, dq, currents_arm)
 
-                q_follower = np.zeros(n)
-                dq_follower = np.zeros(n)
-                try:
-                    q_follower_raw, dq_follower_raw = system.get_follower_arm_state()
-                    q_follower = np.asarray(q_follower_raw[:n], dtype=float)
-                    dq_follower = np.asarray(dq_follower_raw[:n], dtype=float)
-                except Exception:
-                    pass
+                    q_follower = np.zeros(n)
+                    dq_follower = np.zeros(n)
+                    try:
+                        q_follower_raw, dq_follower_raw = system.get_follower_arm_state()
+                        q_follower = np.asarray(q_follower_raw[:n], dtype=float)
+                        dq_follower = np.asarray(dq_follower_raw[:n], dtype=float)
+                    except Exception:
+                        pass
 
-                wrench_ur5e = np.zeros(6)
-                tau_wrench_fb = None
-                if args.enable_wrench or args.enable_wrench_feedback:
-                    wrench_ur5e, tcp_joint_torques = system.get_follower_tcp_force()
-                    if args.enable_wrench_feedback:
-                        tau_wrench_fb = np.asarray(tcp_joint_torques[:n], dtype=float)
+                    # ── Follower gripper state ────────────────────────────────
+                    follower_gripper_pos = 0.0
+                    try:
+                        fb = system.get_follower_gripper_feedback()
+                        follower_gripper_pos = float(fb.get("position", 0.0))
+                    except Exception:
+                        pass
 
-                t_mono = time.monotonic()
-                if args.interventions:
-                    assert traj_interp is not None
-                    assert admittance is not None
-                    assert detector is not None
-                    q_ref, dq_ref, is_stale = traj_interp.get_reference(t_mono)
-                    _ = dq_ref
-                    q_c = admittance.step(
-                        q_ref=q_ref,
-                        tau_ext_human=tau_ext,
-                        dt=measured_dt,
-                        tau_wrench_fb=tau_wrench_fb,
-                    )
-                    adm_state = admittance.get_state()
+                    wrench_ur5e = np.zeros(6)
+                    tau_wrench_fb = None
+                    if args.enable_wrench or args.enable_wrench_feedback:
+                        wrench_ur5e, tcp_joint_torques = system.get_follower_tcp_force()
+                        if args.enable_wrench_feedback:
+                            tau_wrench_fb = np.asarray(tcp_joint_torques[:n], dtype=float)
 
-                    is_corr = detector.update(
-                        tau_ext=tau_ext,
-                        q_c=adm_state["q_c"],
-                        q_ref=q_ref,
-                        dq_c=adm_state["dq_c"],
-                        wrench=wrench_ur5e if args.enable_wrench else None,
-                    )
-                    diag = detector.get_diagnostics()
-                    if is_corr:
-                        corr_steps += 1
+                    t_mono = time.monotonic()
+                    action = getattr(system, "_teleop_last_action", None)
+                    if action is None:
+                        action = system._build_follower_action(q, grip)
+                    else:
+                        action = np.asarray(action, dtype=float).copy()
 
-                    target_hw = np.zeros(system.num_motors)
-                    target_hw[:n] = q_c * system.joint_signs[:n] + system.joint_offsets[:n]
-                    if system.num_motors > n:
-                        target_hw[-1] = system.leader_gripper_raw_rad
-                    system.driver.set_joints(target_hw.tolist())
-                else:
-                    is_stale = False
-                    q_ref = q_follower.copy()
-                    q_c = q_follower.copy()
-                    adm_state = {
-                        "q_c": q_follower.copy(),
-                        "dq_c": dq_follower.copy(),
-                    }
-                    is_corr = False
-                    diag = {
-                        "votes": {
-                            "torque": False,
-                            "delta": False,
-                            "energy": False,
-                            "wrench": False,
-                        }
-                    }
+                        expected_action_dim = n + 1  # 6 arm + 1 gripper
+                        if len(action) < expected_action_dim:
+                            action = np.concatenate([action, np.zeros(expected_action_dim - len(action))])
+                        elif len(action) > expected_action_dim:
+                            action = action[:expected_action_dim]
 
-                if npz_recorder is not None:
-                    npz_recorder.record(
-                        timestamp=t_mono,
-                        q_ref=q_ref,
-                        q_actual=q,
-                        dq_actual=dq,
-                        q_compliant=adm_state["q_c"],
-                        dq_compliant=adm_state["dq_c"],
-                        tau_ext_gello=tau_ext,
-                        q_follower=q_follower,
-                        wrench_ur5e=wrench_ur5e,
-                        is_correction=bool(is_corr),
-                        detector_diagnostics=diag,
-                    )
-
-                votes = diag.get("votes", {})
-                detector_votes = np.array(
-                    [
-                        bool(votes.get("torque", False)),
-                        bool(votes.get("delta_q", votes.get("delta", False))),
-                        bool(votes.get("energy", False)),
-                        bool(votes.get("wrench", False)),
-                    ],
-                    dtype=bool,
-                )
-
-                if ep_steps % record_every_n == 0:
-                    images_for_frame = None
-                    can_record_frame = True
-                    if camera_rig is not None:
-                        images_for_frame = camera_rig.get_images()
-                        if images_for_frame is None:
-                            can_record_frame = False
-
-                    if can_record_frame:
-                        obs_q = q if args.interventions else q_follower
-                        obs_dq = dq if args.interventions else dq_follower
-                        lerobot_recorder.add_frame(
-                            timestamp=t_mono,
-                            q=obs_q,
-                            dq=obs_dq,
-                            gripper=float(grip),
-                            tau_ext=tau_ext,
-                            wrench_ur5e=wrench_ur5e,
+                    if args.interventions:
+                        assert traj_interp is not None
+                        assert admittance is not None
+                        assert detector is not None
+                        q_ref, dq_ref, is_stale = traj_interp.get_reference(t_mono)
+                        _ = dq_ref
+                        q_c = admittance.step(
                             q_ref=q_ref,
+                            tau_ext_human=tau_ext,
+                            dt=measured_dt,
+                            tau_wrench_fb=tau_wrench_fb,
+                        )
+                        adm_state = admittance.get_state()
+
+                        is_corr = detector.update(
+                            tau_ext=tau_ext,
+                            q_c=adm_state["q_c"],
+                            q_ref=q_ref,
+                            dq_c=adm_state["dq_c"],
+                            wrench=wrench_ur5e if args.enable_wrench else None,
+                        )
+                        diag = detector.get_diagnostics()
+                        if is_corr:
+                            corr_steps += 1
+
+                        target_hw = np.zeros(system.num_motors)
+                        target_hw[:n] = q_c * system.joint_signs[:n] + system.joint_offsets[:n]
+                        if system.num_motors > n:
+                            target_hw[-1] = system.leader_gripper_raw_rad
+                        system.driver.set_joints(target_hw.tolist())
+                    else:
+                        is_stale = False
+                        q_ref = q_follower.copy()
+                        q_c = q_follower.copy()
+                        adm_state = {
+                            "q_c": q_follower.copy(),
+                            "dq_c": dq_follower.copy(),
+                        }
+                        is_corr = False
+                        diag = {
+                            "votes": {
+                                "torque": False,
+                                "delta": False,
+                                "energy": False,
+                                "wrench": False,
+                            }
+                        }
+
+                    if npz_recorder is not None:
+                        npz_recorder.record(
+                            timestamp=t_mono,
+                            q_ref=q_ref,
+                            q_actual=q,
+                            dq_actual=dq,
                             q_compliant=adm_state["q_c"],
                             dq_compliant=adm_state["dq_c"],
+                            tau_ext_gello=tau_ext,
+                            q_follower=q_follower,
+                            wrench_ur5e=wrench_ur5e,
                             is_correction=bool(is_corr),
-                            detector_votes=detector_votes,
-                            images=images_for_frame,
+                            detector_diagnostics=diag,
                         )
-                        ep_recorded_frames += 1
 
-                if args.interventions and obs_snap is not None:
-                    obs_write_counter += 1
-                    if obs_write_counter >= int(args.obs_decimation):
-                        obs_write_counter = 0
-                        obs_image = None
+                    votes = diag.get("votes", {})
+                    detector_votes = np.array(
+                        [
+                            bool(votes.get("torque", False)),
+                            bool(votes.get("delta_q", votes.get("delta", False))),
+                            bool(votes.get("energy", False)),
+                            bool(votes.get("wrench", False)),
+                        ],
+                        dtype=bool,
+                    )
+
+                    # ── Record dataset frame ────────────────────────────────
+                    if ep_steps % record_every_n == 0:
+                        images_for_frame = None
+                        can_record_frame = True
                         if camera_rig is not None:
-                            latest_images = camera_rig.get_images()
-                            if latest_images is not None and camera_names:
-                                obs_image = latest_images[camera_names[0]]
-                        obs_snap.write(
-                            timestamp=t_mono,
-                            q=q,
-                            dq=dq,
-                            grip=float(grip),
-                            tau_ext=tau_ext,
-                            wrench=wrench_ur5e,
-                            image=obs_image,
-                        )
+                            images_for_frame = camera_rig.get_images()
+                            if images_for_frame is None:
+                                can_record_frame = False
 
-                ep_steps += 1
-                if ep_steps % 330 == 0:
-                    if args.interventions and admittance is not None:
-                        print(
-                            f"[ep {ep:03d} {now_perf - ep_start:6.1f}s] "
-                            f"INT={'YES' if is_corr else 'no '} "
-                            f"|delta_q|={np.linalg.norm(admittance.get_delta_q()):.4f} "
-                            f"|tau|={np.linalg.norm(tau_ext):.3f} stale={is_stale}"
-                        )
-                    else:
-                        print(
-                            f"[ep {ep:03d} {now_perf - ep_start:6.1f}s] "
-                            f"PHASE_A |tau|={np.linalg.norm(tau_ext):.3f}"
-                        )
+                        if can_record_frame:
+                            if args.interventions:
+                                obs_q = q
+                                obs_dq = dq
+                                obs_gripper = float(grip)
+                            else:
+                                obs_q = q_follower
+                                obs_dq = dq_follower
+                                obs_gripper = follower_gripper_pos
 
-                loop_time = time.perf_counter() - now_perf
-                if loop_time > float(system.dt):
-                    ep_overruns += 1
-                sleep_s = max(0.0, float(system.dt) - loop_time)
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
+                            lerobot_recorder.add_frame(
+                                timestamp=t_mono,
+                                q=obs_q,
+                                dq=obs_dq,
+                                gripper=obs_gripper,
+                                action=action,
+                                tau_ext=tau_ext,
+                                wrench_ur5e=wrench_ur5e,
+                                q_ref=q_ref,
+                                q_compliant=adm_state["q_c"],
+                                dq_compliant=adm_state["dq_c"],
+                                is_correction=bool(is_corr),
+                                detector_votes=detector_votes,
+                                images=images_for_frame,
+                            )
+                            ep_recorded_frames += 1
 
-            # ── Post-episode handling ───────────────────────────────────────
+                    if args.interventions and obs_snap is not None:
+                        obs_write_counter += 1
+                        if obs_write_counter >= int(args.obs_decimation):
+                            obs_write_counter = 0
+                            obs_image = None
+                            if camera_rig is not None:
+                                latest_images = camera_rig.get_images()
+                                if latest_images is not None and camera_names:
+                                    obs_image = latest_images[camera_names[0]]
+                            obs_snap.write(
+                                timestamp=t_mono,
+                                q=q,
+                                dq=dq,
+                                grip=float(grip),
+                                tau_ext=tau_ext,
+                                wrench=wrench_ur5e,
+                                image=obs_image,
+                            )
+
+                    ep_steps += 1
+                    if ep_steps % 330 == 0:
+                        elapsed_s = now_perf - ep_start
+                        if args.interventions and admittance is not None:
+                            print(
+                                f"  [ep {ep+1:03d} {elapsed_s:5.1f}s] "
+                                f"INT={'YES' if is_corr else 'no '} "
+                                f"|Δq|={np.linalg.norm(admittance.get_delta_q()):.4f} "
+                                f"|τ|={np.linalg.norm(tau_ext):.3f}"
+                            )
+                        else:
+                            print(
+                                f"  [ep {ep+1:03d} {elapsed_s:5.1f}s] "
+                                f"|τ|={np.linalg.norm(tau_ext):.3f} "
+                                f"frames={ep_recorded_frames}"
+                            )
+
+                    loop_time = time.perf_counter() - now_perf
+                    if loop_time > float(system.dt):
+                        ep_overruns += 1
+                    sleep_s = max(0.0, float(system.dt) - loop_time)
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+
+            # ══════════════════════════════════════════════════════════════
+            # POST-EPISODE: Discard or Save, then RESET phase
+            # ══════════════════════════════════════════════════════════════
 
             if rerecord:
                 _discard_episode(lerobot_recorder, npz_recorder)
-                print(f"[KB] Episode {ep + 1} discarded – will re-record.\n")
+                print(f"[DISCARD] Episode {ep + 1} discarded — will re-record.\n")
+
+                # ── RESET STATE (even after discard) ──────────────────────
+                # Teleop stays active so user can reposition!
+                ctrl.state = EpisodeState.RESET
+                ctrl.reset_events()
+                print(
+                    "  [RESET] Teleop still active — reposition robot.\n"
+                    "  Press foot pedal or Enter when ready to re-record."
+                )
+                # Don't wait here; the IDLE wait at loop top handles it.
+                # But we DO stay here briefly so user sees the message.
                 if not running:
                     break
-                continue  # ep NOT incremented → same episode retried
+                continue  # ep NOT incremented
 
-            # Save episode
+            # ── Save episode ──────────────────────────────────────────────
             if ep_recorded_frames > 0:
                 ep_idx = lerobot_recorder.end_episode()
             else:
                 ep_idx = -1
-                print("[WARN] No dataset frames recorded in this episode; skipping save.")
+                print("[WARN] No frames recorded; skipping save.")
             if npz_recorder is not None:
                 npz_recorder.end_episode()
 
             duration_s = time.perf_counter() - ep_start
             end_reason = (
-                "SUCCESS (keyboard)"
+                "SUCCESS ✓"
                 if marked_success
-                else "STOP (keyboard)"
-                if kbd is not None and kbd.stop_recording
+                else "STOP (user)"
+                if not running
                 else "time limit"
             )
-            print(f"\nEpisode {ep_idx} complete ({end_reason}):")
-            print(f"  Steps:            {ep_steps}")
-            print(f"  Duration:         {duration_s:.1f}s")
-            print(f"  Dataset frames:   {ep_recorded_frames}")
+            print(f"\n  Episode {ep_idx} complete ({end_reason}):")
+            print(f"    Steps:            {ep_steps}")
+            print(f"    Duration:         {duration_s:.1f}s")
+            print(f"    Dataset frames:   {ep_recorded_frames}")
             print(
-                f"  Correction steps: {corr_steps} "
+                f"    Correction steps: {corr_steps} "
                 f"({100.0 * corr_steps / max(ep_steps, 1):.1f}%)"
             )
             print(
-                f"  Timing overruns:  {ep_overruns}/{ep_steps} "
+                f"    Timing overruns:  {ep_overruns}/{ep_steps} "
                 f"({100.0 * ep_overruns / max(ep_steps, 1):.1f}%)"
             )
 
@@ -861,7 +1374,18 @@ def main() -> int:
             total_overruns += ep_overruns
             ep += 1
 
-        # ── Finalize dataset ──────────────────────────────────────────────────
+            # ── RESET STATE: teleop active, user repositions ──────────────
+            if ep < num_episodes and running:
+                ctrl.state = EpisodeState.RESET
+                ctrl.reset_events()
+                print(
+                    f"\n  [RESET] Teleop still active — reposition for next episode.\n"
+                    f"  Press foot pedal or Enter when ready."
+                )
+                # The wait_for_start() at the top of the while loop handles
+                # the actual waiting. We just set the state here.
+
+        # ── Finalize dataset ──────────────────────────────────────────────
         local_path = lerobot_recorder.finalize()
         print(f"\nDataset finalized at: {local_path}")
         print(f"  repo_id   : {repo_id}")
@@ -886,11 +1410,17 @@ def main() -> int:
         traceback.print_exc()
         return 1
     finally:
-        if kbd is not None:
-            kbd.stop()
+        if ctrl is not None:
+            ctrl.stop()
 
         if system is not None:
             system.running = False
+
+        if sensor_reader is not None:
+            try:
+                sensor_reader.stop()
+            except Exception:
+                pass
 
         if stop_event is not None:
             stop_event.set()
