@@ -36,10 +36,14 @@ def check_dataset(repo_id: str, root: str | None = None) -> dict:
     Returns:
         Dictionary with validation results
     """
+    dataset_path = None
     if root is not None:
-        dataset_path = Path(root) / repo_id
-    else:
-        dataset_path = None
+        root_path = Path(root)
+        candidate_path = root_path / repo_id
+        if candidate_path.exists():
+            dataset_path = candidate_path
+        elif root_path.exists():
+            dataset_path = root_path
 
     print(f"\n{'='*70}")
     print(f"[DATASET CHECK] Loading: {repo_id}")
@@ -48,7 +52,7 @@ def check_dataset(repo_id: str, root: str | None = None) -> dict:
     print(f"{'='*70}\n")
 
     try:
-        ds = LeRobotDataset(repo_id=repo_id, root=root)
+        ds = LeRobotDataset(repo_id=repo_id, root=str(dataset_path) if dataset_path else root)
     except Exception as e:
         print(f"[ERROR] Failed to load dataset: {e}")
         return {"success": False, "error": str(e)}
@@ -65,14 +69,17 @@ def check_dataset(repo_id: str, root: str | None = None) -> dict:
     print(f"  FPS: {ds.fps}")
     duration_s = meta.total_frames / ds.fps if ds.fps > 0 else 0
     print(f"  Total duration: {duration_s:.1f}s ({meta.total_frames / ds.fps / 60:.1f}min)")
-    print(f"  Action dim: {meta.action_dim}")
-    print(f"  State dim: {meta.state_dim if hasattr(meta, 'state_dim') else 'N/A'}")
+    action_shape = ds.features.get("action", {}).get("shape")
+    state_shape = ds.features.get("observation.state", {}).get("shape")
+    print(f"  Action shape: {action_shape if action_shape is not None else 'N/A'}")
+    print(f"  State shape: {state_shape if state_shape is not None else 'N/A'}")
 
     results["episodes"] = meta.total_episodes
     results["frames"] = meta.total_frames
     results["fps"] = ds.fps
     results["duration_s"] = duration_s
-    results["action_dim"] = meta.action_dim
+    results["action_shape"] = action_shape
+    results["state_shape"] = state_shape
 
     # ──────────────────────────────────────────────────────────────────────
     # 2. FEATURE VALIDATION
@@ -85,9 +92,9 @@ def check_dataset(repo_id: str, root: str | None = None) -> dict:
         print(f"\n  Frame 0 shapes & types:")
         for key, val in frame.items():
             if torch.is_tensor(val):
-                print(f"    {key:20s}: shape={tuple(val.shape):20s} dtype={val.dtype}")
+                print(f"    {key:20s}: shape={tuple(val.shape)} dtype={val.dtype}")
             elif isinstance(val, np.ndarray):
-                print(f"    {key:20s}: shape={val.shape:20s} dtype={val.dtype}")
+                print(f"    {key:20s}: shape={val.shape} dtype={val.dtype}")
             else:
                 print(f"    {key:20s}: {type(val).__name__}")
 
