@@ -767,10 +767,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--foot-pedal-key",
         type=str,
-        default="f10",
+        default="b",
         help=(
             "Key that the USB foot pedal sends. Examples: 'f10', 'b', 'space'. "
-            "Pedal starts/stops episodes depending on context. (default: f10)"
+            "Pedal starts/stops episodes depending on context. (default: b)"
         ),
     )
 
