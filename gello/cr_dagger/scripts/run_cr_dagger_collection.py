@@ -282,7 +282,7 @@ class EpisodeController:
     This replaces the old EpisodeKeyboardController + blocking input() approach.
     """
 
-    def __init__(self, foot_pedal_key: str = "f10") -> None:
+    def __init__(self, foot_pedal_key: str = "b") -> None:
         self._state = EpisodeState.IDLE
         self._lock = Lock()
         self._listener: Optional[Any] = None
@@ -788,7 +788,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--camera-names", nargs="*", default=None)
     p.add_argument("--camera-device-ids", nargs="*", default=None)
     p.add_argument("--camera-flips", nargs="*", default=None)
-    p.add_argument("--camera-warmup-s", type=float, default=2.0)
+    p.add_argument("--camera-warmup-s", type=float, default=3.0)
     p.add_argument("--enable-wrench", action="store_true")
     p.add_argument("--enable-wrench-feedback", action="store_true")
     return p.parse_args()
@@ -937,6 +937,7 @@ def main() -> int:
             fps=dataset_fps,
             task_description=str(args.task_description),
             n_joints=n,
+            include_gripper_action=bool(args.interventions),
             camera_names=camera_names if camera_names else None,
         )
 

@@ -21,7 +21,7 @@ except ImportError:
     HAS_LEROBOT = False
 
 class LeRobotCorrectionRecorder:
-    DEFAULT_FEATURES = {
+    DEFAULT_OBSERVATION_FEATURES = {
         "observation.state": {
             "dtype": "float32",
             "shape": (13,),
@@ -56,16 +56,6 @@ class LeRobotCorrectionRecorder:
             "shape": (4,),
             "names": ["vote_torque", "vote_delta", "vote_energy", "vote_wrench"],
         },
-        "action": {
-            "dtype": "float32",
-            "shape": (7,),
-            "names": ["q_ref_0", "q_ref_1", "q_ref_2", "q_ref_3", "q_ref_4", "q_ref_5", "gripper_ref"],
-        },
-        "action.compliant": {
-            "dtype": "float32",
-            "shape": (7,),
-            "names": ["q_c_0", "q_c_1", "q_c_2", "q_c_3", "q_c_4", "q_c_5", "gripper_c"],
-        },
     }
 
     def __init__(
@@ -74,6 +64,7 @@ class LeRobotCorrectionRecorder:
         fps: int = 330,
         task_description: str = "CR-DAgger correction episode",
         n_joints: int = 6,
+        include_gripper_action: bool = True,
         camera_names: list[str] | None = None,
         camera_shapes: dict[str, tuple[int, int, int]] | None = None,
         latency_compensation_s: float = 0.008,
@@ -90,6 +81,7 @@ class LeRobotCorrectionRecorder:
         self.fps = fps
         self.task_description = task_description
         self.n_joints = n_joints
+        self.include_gripper_action = include_gripper_action
         self.latency_compensation_s = latency_compensation_s
         self.camera_names = camera_names or []
 
@@ -98,7 +90,24 @@ class LeRobotCorrectionRecorder:
             if cam not in self.camera_shapes:
                 self.camera_shapes[cam] = (480, 640, 3)
 
-        self.features = dict(self.DEFAULT_FEATURES)
+        self.features = dict(self.DEFAULT_OBSERVATION_FEATURES)
+        action_shape = (self.n_joints + 1,) if self.include_gripper_action else (self.n_joints,)
+        action_names = [f"q_ref_{i}" for i in range(self.n_joints)]
+        compliant_names = [f"q_c_{i}" for i in range(self.n_joints)]
+        if self.include_gripper_action:
+            action_names.append("gripper_ref")
+            compliant_names.append("gripper_c")
+
+        self.features["action"] = {
+            "dtype": "float32",
+            "shape": action_shape,
+            "names": action_names,
+        }
+        self.features["action.compliant"] = {
+            "dtype": "float32",
+            "shape": action_shape,
+            "names": compliant_names,
+        }
         for cam in self.camera_names:
             h, w, c = self.camera_shapes[cam]
             self.features[f"observation.images.{cam}"] = {
@@ -157,10 +166,30 @@ class LeRobotCorrectionRecorder:
 
         delta_q = self._compute_delta_q_compensated(q_compliant, timestamp)
 
-        action_arr = np.asarray(
-            action if action is not None else np.concatenate([q_ref[:self.n_joints], [gripper_ref]]),
-            dtype=np.float32,
-        )
+        if action is None:
+            if self.include_gripper_action:
+                action_source = np.concatenate([q_ref[:self.n_joints], [gripper_ref]])
+            else:
+                action_source = q_ref[:self.n_joints]
+        else:
+            action_source = action
+
+        action_arr = np.asarray(action_source, dtype=np.float32)
+        if action_arr.shape != self.features["action"]["shape"]:
+            raise ValueError(
+                f"action must have shape {self.features['action']['shape']}, got {action_arr.shape}"
+            )
+
+        if self.include_gripper_action:
+            compliant_source = np.concatenate([q_compliant[:self.n_joints], [gripper_compliant]])
+        else:
+            compliant_source = q_compliant[:self.n_joints]
+
+        compliant_arr = np.asarray(compliant_source, dtype=np.float32)
+        if compliant_arr.shape != self.features["action.compliant"]["shape"]:
+            raise ValueError(
+                f"action.compliant must have shape {self.features['action.compliant']['shape']}, got {compliant_arr.shape}"
+            )
 
         detector_votes_arr = np.asarray(
             detector_votes if detector_votes is not None else [False, False, False, False],
@@ -191,10 +220,7 @@ class LeRobotCorrectionRecorder:
                 dtype=torch.bool,
             ),
             "action": torch.tensor(action_arr, dtype=torch.float32),
-            "action.compliant": torch.tensor(
-                np.concatenate([q_compliant[:self.n_joints], [gripper_compliant]]),
-                dtype=torch.float32,
-            ),
+            "action.compliant": torch.tensor(compliant_arr, dtype=torch.float32),
             "task": self.task_description,
         }
 
