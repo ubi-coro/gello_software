@@ -996,10 +996,10 @@ def main() -> int:
             print(f"[POLICY] started pid={policy_proc.pid}")
 
         control_hz = max(1.0, 1.0 / float(system.dt))
-        record_every_n = max(1, int(round(control_hz / float(dataset_fps))))
+        record_interval = 1.0 / float(dataset_fps)  # Time-based recording
         print(
             f"[DATASET] control_hz={control_hz:.1f}, dataset_fps={dataset_fps}, "
-            f"record_every_n={record_every_n}"
+            f"record_interval={record_interval:.6f}s"
         )
 
         # ── Start teleop ONCE, keep it running across all episodes ────────
@@ -1064,6 +1064,7 @@ def main() -> int:
 
             ep_start = time.perf_counter()
             last_step_t = time.perf_counter()
+            last_record_t = time.perf_counter()  # Track last recording time
             obs_write_counter = 0
             ep_steps = 0
             ep_overruns = 0
@@ -1240,8 +1241,10 @@ def main() -> int:
                         dtype=bool,
                     )
 
-                    # ── Record dataset frame ────────────────────────────────
-                    if ep_steps % record_every_n == 0:
+                    # ── Record dataset frame (time-based, not step-based) ────
+                    now_record_check = time.perf_counter()
+                    if (now_record_check - last_record_t) >= record_interval:
+                        last_record_t = now_record_check
                         images_for_frame = None
                         can_record_frame = True
                         if camera_rig is not None:
@@ -1303,7 +1306,8 @@ def main() -> int:
                                 f"  [ep {ep+1:03d} {elapsed_s:5.1f}s] "
                                 f"INT={'YES' if is_corr else 'no '} "
                                 f"|Δq|={np.linalg.norm(admittance.get_delta_q()):.4f} "
-                                f"|τ|={np.linalg.norm(tau_ext):.3f}"
+                                f"|τ|={np.linalg.norm(tau_ext):.3f} "
+                                f"frames={ep_recorded_frames}"
                             )
                         else:
                             print(
