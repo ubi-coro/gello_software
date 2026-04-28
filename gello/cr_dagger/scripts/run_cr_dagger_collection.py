@@ -397,15 +397,21 @@ def main() -> int:
 
     # ── Resolve local dataset root ────────────────────────────────────────────
     if args.lerobot_root is not None:
-        lerobot_root = Path(args.lerobot_root)
-        lerobot_root.mkdir(parents=True, exist_ok=True)
+        dataset_root = Path(args.lerobot_root) / repo_id
     else:
-        # LeRobot default: ~/.cache/lerobot/datasets/{repo_id}
-        lerobot_root = Path.home() / ".cache" / "lerobot" / "datasets" / repo_id
-        lerobot_root.mkdir(parents=True, exist_ok=True)
+        dataset_root = Path.home() / ".cache" / "lerobot" / "datasets" / repo_id
+
+    dataset_root.parent.mkdir(parents=True, exist_ok=True)
+
+    if dataset_root.exists():
+        raise FileExistsError(
+            f"\n[ERROR] Dataset root already exists: {dataset_root}\n"
+            f"        Please choose a different --lerobot-repo or --lerobot-root to avoid overwriting existing data."
+            f"        rm -rf {dataset_root} to delete the existing dataset (be careful with this command!)"
+        )
 
     print(f"[DATASET] repo_id  : {repo_id}")
-    print(f"[DATASET] local root: {lerobot_root}")
+    print(f"[DATASET] local root: {dataset_root}")
 
     config_path = Path(args.config)
     if not config_path.is_absolute():
@@ -500,7 +506,7 @@ def main() -> int:
         # ── LeRobot recorder: repo_id + explicit local root ───────────────────
         lerobot_recorder = LeRobotCorrectionRecorder(
             repo_id=repo_id,
-            root=lerobot_root,
+            root=dataset_root,
             fps=dataset_fps,
             task_description=str(args.task_description),
             n_joints=n,
@@ -859,7 +865,7 @@ def main() -> int:
         local_path = lerobot_recorder.finalize()
         print(f"\nDataset finalized at: {local_path}")
         print(f"  repo_id   : {repo_id}")
-        print(f"  local root: {lerobot_root}")
+        print(f"  local root: {dataset_root}")
         print(f"Total episodes recorded: {ep}/{num_episodes} requested")
         print(
             f"Total timing overruns: {total_overruns}/{total_steps} "
