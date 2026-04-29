@@ -777,6 +777,11 @@ def _parse_args() -> argparse.Namespace:
     # ── LeRobot dataset ───────────────────────────────────────────────────
     p.add_argument("--lerobot-repo", type=str, required=True)
     p.add_argument("--lerobot-root", type=str, default=None)
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume recording into an existing LeRobot dataset root.",
+    )
 
     p.add_argument("--task-description", type=str, default="CR-DAgger correction episode")
     p.add_argument("--log-dir", type=str, default="cr_dagger_data")
@@ -815,10 +820,19 @@ def main() -> int:
     dataset_root.parent.mkdir(parents=True, exist_ok=True)
 
     if dataset_root.exists():
-        raise FileExistsError(
-            f"\n[ERROR] Dataset root already exists: {dataset_root}\n"
-            f"        Please choose a different --lerobot-repo or --lerobot-root to avoid overwriting existing data."
-            f"        rm -rf {dataset_root} to delete the existing dataset (be careful with this command!)"
+        if args.resume:
+            print(f"[DATASET] Resuming existing dataset root: {dataset_root}")
+        else:
+            raise FileExistsError(
+                f"\n[ERROR] Dataset root already exists: {dataset_root}\n"
+                f"        Use --resume to append episodes to this dataset, or choose a different"
+                f"        --lerobot-repo/--lerobot-root to avoid overwriting existing data."
+                f"        rm -rf {dataset_root} to delete the existing dataset (be careful with this command!)"
+            )
+    elif args.resume:
+        print(
+            f"[WARN] --resume was requested, but dataset root does not exist: {dataset_root}. "
+            f"Creating a new dataset."
         )
 
     print(f"[DATASET] repo_id  : {repo_id}")
@@ -934,6 +948,7 @@ def main() -> int:
         lerobot_recorder = LeRobotCorrectionRecorder(
             repo_id=repo_id,
             root=str(dataset_root),
+            resume=bool(args.resume),
             fps=dataset_fps,
             task_description=str(args.task_description),
             n_joints=n,

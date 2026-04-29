@@ -70,6 +70,7 @@ class LeRobotCorrectionRecorder:
         latency_compensation_s: float = 0.008,
         q_ref_history_length: int = 100,
         root: str | None = None,
+        resume: bool = False,
     ):
         if not HAS_LEROBOT:
             raise ImportError(
@@ -129,12 +130,25 @@ class LeRobotCorrectionRecorder:
         self._frame_count: int = 0
         self._episode_count: int = 0
 
-        self.dataset = LeRobotDataset.create(
-            repo_id=self.repo_id,
-            fps=self.fps,
-            features=self.features,
-            root=Path(root) if root else None,
-        )
+        dataset_root = Path(root) if root else None
+        if resume:
+            resume_fn = getattr(LeRobotDataset, "resume", None)
+            if resume_fn is None:
+                raise RuntimeError(
+                    "LeRobotDataset.resume is not available in this lerobot version. "
+                    "Please upgrade lerobot or run without --resume."
+                )
+            try:
+                self.dataset = resume_fn(self.repo_id, root=dataset_root)
+            except TypeError:
+                self.dataset = resume_fn(repo_id=self.repo_id, root=dataset_root)
+        else:
+            self.dataset = LeRobotDataset.create(
+                repo_id=self.repo_id,
+                fps=self.fps,
+                features=self.features,
+                root=dataset_root,
+            )
 
     def start_episode(self, task_description: str | None = None) -> None:
         self._q_ref_history.clear()

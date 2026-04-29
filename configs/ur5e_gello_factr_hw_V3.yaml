@@ -61,7 +61,7 @@ controller:
     max_torque: 1.5   # Safety limit per joint (Nm)
   gravity_comp:
     enable: True
-    gain: 0.2
+    gain: 0.15
     gain_per_joint: [1.0, 0.8, 0.8, 2.0, 2.0, 1.0]
     velocity_damping: 0.02
   null_space_regulation:
