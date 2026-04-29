@@ -27,10 +27,6 @@ from gello.bilat_4ch.gello_ur5e_observer_shi import (
     MotorParams,
     MotorType,
 )
-from gello.cr_dagger.core.admittance_controller import (
-    AdmittanceParams,
-    JointSpaceAdmittanceController,
-)
 from gello.cr_dagger.core.correction_recorder import CorrectionRecorder
 from gello.cr_dagger.core.intervention_detector import (
     FusedDetectorParams,
@@ -546,8 +542,8 @@ def _run_recording_loop_phase_a(
             q_compliant=q_follower,
             dq_compliant=dq_follower,
             is_correction=False,
-            detector_votes=np.zeros(4, dtype=bool),
             images=images,
+            detector_votes=np.zeros(4, dtype=np.float32),
         )
         ep_recorded_frames += 1
         ep_steps += 1
@@ -855,7 +851,6 @@ def main() -> int:
     camera_rig: MultiRealSenseRig | None = None
     traj_interp: TrajectoryInterpolator | None = None
     detector: FusedInterventionDetector | None = None
-    admittance: JointSpaceAdmittanceController | None = None
     ctrl: Optional[EpisodeController] = None
     sensor_reader: Optional[AsyncSensorReader] = None
     n = 6
@@ -969,22 +964,10 @@ def main() -> int:
             q_now, _, _, _ = system.get_leader_joint_states()
             system.driver.set_torque_mode(False)
             time.sleep(0.05)
-            system.driver.set_operating_mode(3)
+            system.driver.set_operating_mode(0)
             time.sleep(0.05)
             system.driver.set_torque_mode(True)
             time.sleep(0.05)
-
-            admittance = JointSpaceAdmittanceController(
-                params=AdmittanceParams(
-                    mass=float(args.mass),
-                    damping=float(args.damping),
-                    stiffness=float(args.stiffness),
-                ),
-                n_joints=n,
-                q_init=q_now.copy(),
-                q_min=system.arm_joint_limits_min,
-                q_max=system.arm_joint_limits_max,
-            )
 
             stop_event = mp.Event()
             policy_config = {
@@ -1066,11 +1049,9 @@ def main() -> int:
 
             if args.interventions:
                 assert traj_interp is not None
-                assert admittance is not None
                 assert detector is not None
                 t_mono = time.monotonic()
                 q_ref_now, _, _ = traj_interp.get_reference(t_mono)
-                admittance.reset(q_ref_now)
                 detector.reset()
 
             lerobot_recorder.start_episode(task_description=str(args.task_description))
@@ -1140,7 +1121,7 @@ def main() -> int:
                         break
 
                     # ── Sensor reads ──────────────────────────────────────────
-                    q, dq, grip, _ = system.get_leader_joint_states()
+                    q, dq, grip, grip_vel = system.get_leader_joint_states()
                     currents_all = system.driver.get_currents()
                     currents_arm = currents_all[:n] * system.joint_signs[:n]
                     tau_ext = shi.update(q, dq, currents_arm)
@@ -1162,6 +1143,10 @@ def main() -> int:
                     except Exception:
                         pass
 
+                    images_for_frame = None
+                    if camera_rig is not None:
+                        images_for_frame = camera_rig.get_images()
+
                     wrench_ur5e = np.zeros(6)
                     tau_wrench_fb = None
                     if args.enable_wrench or args.enable_wrench_feedback:
@@ -1170,74 +1155,90 @@ def main() -> int:
                             tau_wrench_fb = np.asarray(tcp_joint_torques[:n], dtype=float)
 
                     t_mono = time.monotonic()
-                    action = getattr(system, "_teleop_last_action", None)
-                    if action is None:
-                        action = system._build_follower_action(q, grip)
-                    else:
-                        action = np.asarray(action, dtype=float).copy()
-
-                        expected_action_dim = n + 1  # 6 arm + 1 gripper
-                        if len(action) < expected_action_dim:
-                            action = np.concatenate([action, np.zeros(expected_action_dim - len(action))])
-                        elif len(action) > expected_action_dim:
-                            action = action[:expected_action_dim]
+                    q_ref = q_follower.copy()
+                    q_c = q_follower.copy()
+                    dq_c = dq_follower.copy()
+                    is_stale = False
+                    is_corr = False
+                    diag = {
+                        "votes": {
+                            "torque": False,
+                            "delta": False,
+                            "energy": False,
+                            "wrench": False,
+                        }
+                    }
 
                     if args.interventions:
                         assert traj_interp is not None
-                        assert admittance is not None
                         assert detector is not None
+
                         q_ref, dq_ref, is_stale = traj_interp.get_reference(t_mono)
                         _ = dq_ref
-                        q_c = admittance.step(
-                            q_ref=q_ref,
-                            tau_ext_human=tau_ext,
-                            dt=measured_dt,
-                            tau_wrench_fb=tau_wrench_fb,
+
+                        system.control_loop_step_with_policy(
+                            q_ref_policy=q_ref,
+                            leader_state=(q, dq, grip, grip_vel),
                         )
-                        adm_state = admittance.get_state()
+
+                        policy_action = system._build_follower_action(q_ref, grip)
+                        compliant_action = getattr(system, "_teleop_last_action", None)
+                        if compliant_action is None:
+                            compliant_action = system._build_follower_action(q, grip)
+                        else:
+                            compliant_action = np.asarray(compliant_action, dtype=float).copy()
+
+                        expected_action_dim = n + 1
+                        if len(compliant_action) < expected_action_dim:
+                            compliant_action = np.concatenate(
+                                [
+                                    compliant_action,
+                                    np.zeros(expected_action_dim - len(compliant_action)),
+                                ]
+                            )
+                        elif len(compliant_action) > expected_action_dim:
+                            compliant_action = compliant_action[:expected_action_dim]
 
                         is_corr = detector.update(
                             tau_ext=tau_ext,
-                            q_c=adm_state["q_c"],
+                            q_c=q,
                             q_ref=q_ref,
-                            dq_c=adm_state["dq_c"],
+                            dq_c=dq,
                             wrench=wrench_ur5e if args.enable_wrench else None,
                         )
                         diag = detector.get_diagnostics()
                         if is_corr:
                             corr_steps += 1
 
-                        target_hw = np.zeros(system.num_motors)
-                        target_hw[:n] = q_c * system.joint_signs[:n] + system.joint_offsets[:n]
-                        if system.num_motors > n:
-                            target_hw[-1] = system.leader_gripper_raw_rad
-                        system.driver.set_joints(target_hw.tolist())
+                        action = compliant_action.copy()
+                        q_c = compliant_action[:n].copy()
+                        dq_c = np.zeros(n, dtype=float)
                     else:
-                        is_stale = False
-                        q_ref = q_follower.copy()
-                        q_c = q_follower.copy()
-                        adm_state = {
-                            "q_c": q_follower.copy(),
-                            "dq_c": dq_follower.copy(),
-                        }
-                        is_corr = False
-                        diag = {
-                            "votes": {
-                                "torque": False,
-                                "delta": False,
-                                "energy": False,
-                                "wrench": False,
-                            }
-                        }
+                        policy_action = q_follower.copy()
+                        action = system._build_follower_action(q, grip)
+
+                    if not args.interventions:
+                        compliant_action = action.copy()
+                    action = np.asarray(action, dtype=float).copy()
+
+                    expected_action_dim = n + 1
+                    if len(action) < expected_action_dim:
+                        action = np.concatenate([action, np.zeros(expected_action_dim - len(action))])
+                    elif len(action) > expected_action_dim:
+                        action = action[:expected_action_dim]
+
+                    if args.interventions:
+                        if images_for_frame is not None and len(images_for_frame) == 0:
+                            images_for_frame = None
 
                     if npz_recorder is not None:
                         npz_recorder.record(
                             timestamp=t_mono,
-                            q_ref=q_ref,
+                            q_ref=policy_action[:n],
                             q_actual=q,
                             dq_actual=dq,
-                            q_compliant=adm_state["q_c"],
-                            dq_compliant=adm_state["dq_c"],
+                            q_compliant=q_c,
+                            dq_compliant=dq_c,
                             tau_ext_gello=tau_ext,
                             q_follower=q_follower,
                             wrench_ur5e=wrench_ur5e,
@@ -1248,47 +1249,61 @@ def main() -> int:
                     votes = diag.get("votes", {})
                     detector_votes = np.array(
                         [
-                            bool(votes.get("torque", False)),
-                            bool(votes.get("delta_q", votes.get("delta", False))),
-                            bool(votes.get("energy", False)),
-                            bool(votes.get("wrench", False)),
+                            float(bool(votes.get("torque", False))),
+                            float(bool(votes.get("delta_q", votes.get("delta", False)))),
+                            float(bool(votes.get("energy", False))),
+                            float(bool(votes.get("wrench", False))),
                         ],
-                        dtype=bool,
+                        dtype=np.float32,
                     )
 
                     # ── Record dataset frame (time-based, not step-based) ────
                     now_record_check = time.perf_counter()
                     if (now_record_check - last_record_t) >= record_interval:
                         last_record_t = now_record_check
-                        images_for_frame = None
                         can_record_frame = True
-                        if camera_rig is not None:
-                            images_for_frame = camera_rig.get_images()
-                            if images_for_frame is None:
-                                can_record_frame = False
+                        if camera_rig is not None and images_for_frame is None:
+                            can_record_frame = False
 
                         if can_record_frame:
                             if args.interventions:
-                                obs_q = q
-                                obs_dq = dq
-                                obs_gripper = float(grip)
+                                obs_q = q_follower
+                                obs_dq = dq_follower
+                                obs_gripper = follower_gripper_pos
                             else:
                                 obs_q = q_follower
                                 obs_dq = dq_follower
                                 obs_gripper = follower_gripper_pos
+
+                            if args.interventions:
+                                policy_action_frame = policy_action.copy()
+                                actual_action_frame = action.copy()
+                                q_compliant_frame = compliant_action.copy()
+                                dq_compliant_frame = dq_c.copy()
+                                gripper_ref = float(policy_action_frame[-1]) if len(policy_action_frame) > n else 0.0
+                                gripper_compliant = float(q_compliant_frame[-1]) if len(q_compliant_frame) > n else 0.0
+                            else:
+                                policy_action_frame = action.copy()
+                                actual_action_frame = action.copy()
+                                q_compliant_frame = action.copy()
+                                dq_compliant_frame = dq_follower.copy()
+                                gripper_ref = float(obs_gripper)
+                                gripper_compliant = float(obs_gripper)
 
                             lerobot_recorder.add_frame(
                                 timestamp=t_mono,
                                 q=obs_q,
                                 dq=obs_dq,
                                 gripper=obs_gripper,
-                                action=action,
+                                action=actual_action_frame,
                                 tau_ext=tau_ext,
                                 wrench_ur5e=wrench_ur5e,
-                                q_ref=q_ref,
-                                q_compliant=adm_state["q_c"],
-                                dq_compliant=adm_state["dq_c"],
-                                is_correction=bool(is_corr),
+                                q_ref=policy_action_frame,
+                                q_compliant=q_compliant_frame,
+                                dq_compliant=dq_compliant_frame,
+                                gripper_ref=gripper_ref,
+                                gripper_compliant=gripper_compliant,
+                                is_correction=float(bool(is_corr)),
                                 detector_votes=detector_votes,
                                 images=images_for_frame,
                             )
@@ -1305,9 +1320,9 @@ def main() -> int:
                                     obs_image = latest_images[camera_names[0]]
                             obs_snap.write(
                                 timestamp=t_mono,
-                                q=q,
-                                dq=dq,
-                                grip=float(grip),
+                                q=q_follower,
+                                dq=dq_follower,
+                                grip=float(follower_gripper_pos),
                                 tau_ext=tau_ext,
                                 wrench=wrench_ur5e,
                                 image=obs_image,
@@ -1316,11 +1331,11 @@ def main() -> int:
                     ep_steps += 1
                     if ep_steps % 330 == 0:
                         elapsed_s = now_perf - ep_start
-                        if args.interventions and admittance is not None:
+                        if args.interventions:
                             print(
                                 f"  [ep {ep+1:03d} {elapsed_s:5.1f}s] "
                                 f"INT={'YES' if is_corr else 'no '} "
-                                f"|Δq|={np.linalg.norm(admittance.get_delta_q()):.4f} "
+                                f"|Δq|={np.linalg.norm(q_c - policy_action[:n]):.4f} "
                                 f"|τ|={np.linalg.norm(tau_ext):.3f} "
                                 f"frames={ep_recorded_frames}"
                             )
