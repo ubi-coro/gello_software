@@ -124,7 +124,9 @@ def check_dataset(repo_id: str, root: str | None = None) -> dict:
             print(f"    Max:   {action_max.numpy()}")
             print(f"    Range: {action_range.numpy()}")
 
-            # Check for constant actions (all zeros or stuck)
+            # ---------------------------------------------------------
+            # 1. Varianz-Check (Eingefrorene Sensoren)
+            # ---------------------------------------------------------
             is_stuck = (action_std < 1e-5).all()
             if is_stuck:
                 print(f"\n  ⚠️  WARNING: Action appears STUCK (all std < 1e-5)")
@@ -133,6 +135,45 @@ def check_dataset(repo_id: str, root: str | None = None) -> dict:
                 print(f"\n  ✓ Action varies correctly")
                 results["action_status"] = "varying"
 
+            # ---------------------------------------------------------
+            # 2. Physikalischer Plausibilitäts-Check (Grenzwerte)
+            # ---------------------------------------------------------
+            # Angenommen, die Aktionen sind Gelenkwinkel in Radiant.
+            # Typische Limits liegen oft bei +/- Pi (3.14159) oder etwas mehr.
+            # Passe diese Werte an das Datenblatt deines spezifischen Roboters an!
+            JOINT_LIMIT_LOWER = -3.15
+            JOINT_LIMIT_UPPER = 3.15
+
+            # Prüfe, ob irgendein Wert in den Samples außerhalb der Grenzen liegt
+            out_of_bounds = (actions < JOINT_LIMIT_LOWER) | (actions > JOINT_LIMIT_UPPER)
+
+            if out_of_bounds.any():
+                print(
+                    f"  ⚠️  WARNING: Actions exceed physical joint limits [{JOINT_LIMIT_LOWER}, {JOINT_LIMIT_UPPER}]!")
+                results["action_physical_valid"] = False
+            else:
+                print(f"  ✓ Actions remain within defined physical limits.")
+                results["action_physical_valid"] = True
+
+            # ---------------------------------------------------------
+            # 3. Geschwindigkeit/Sprung-Check (Delta zwischen Frames)
+            # ---------------------------------------------------------
+            # Ein Roboter kann nicht von jetzt auf gleich von 0 auf 2 Radiant springen.
+            # Wir berechnen die Differenz zwischen aufeinanderfolgenden Frames.
+            action_deltas = torch.abs(actions[1:] - actions[:-1])
+            max_delta = action_deltas.max().item()
+
+            # Maximal erlaubter Sprung pro Frame (Abhängig von FPS und Motorstärke)
+            # Bei 30 FPS ist ein Sprung von > 0.5 Radiant pro Frame physikalisch oft unmöglich
+            MAX_ALLOWED_DELTA = 0.5
+
+            print(f"    Max jump between frames: {max_delta:.4f}")
+            if max_delta > MAX_ALLOWED_DELTA:
+                print(f"  ⚠️  WARNING: Action jump too high ({max_delta:.4f}). Possible physical discontinuity!")
+            else:
+                print(f"  ✓ Action continuity looks physically plausible.")
+
+            # Werte speichern
             results["action_mean"] = action_mean.numpy().tolist()
             results["action_std"] = action_std.numpy().tolist()
             results["action_range"] = action_range.numpy().tolist()
