@@ -868,6 +868,11 @@ class FACTRGravityCompensation:
         self.gripper_feedback_gain = gripper_feedback_cfg.get("gain", 1.0)
         self.gripper_feedback_damping = gripper_feedback_cfg.get("damping", 0.1)
         self._follower_gripper_feedback: Dict[str, Any] = {}  # Cache for follower gripper state
+
+        policy_impedance_cfg = self.config["controller"].get("policy_impedance", {})
+        self.policy_impedance_kp = float(policy_impedance_cfg.get("kp", 5.0))
+        self.policy_impedance_kd = float(policy_impedance_cfg.get("kd", 0.5))
+        self._policy_q_ref: Optional[npt.NDArray[np.float64]] = None
         
         # EMA filter state for gripper feedback
         self._last_gripper_torque_feedback = 0.0
@@ -2020,6 +2025,61 @@ class FACTRGravityCompensation:
             arm_gripper_torque = np.append(arm_torque, gripper_torque)
 
         self.driver.set_torque((arm_gripper_torque * self.torque_signs).tolist())
+
+    def control_loop_step_with_policy(
+        self,
+        q_ref_policy: npt.NDArray[np.float64],
+        leader_state: tuple[
+            npt.NDArray[np.float64],
+            npt.NDArray[np.float64],
+            float,
+            float,
+        ] | None = None,
+    ) -> None:
+        """Apply a soft policy-imposed impedance on the GELLO leader.
+
+        The policy provides a leader-frame q_ref. The controller keeps the leader
+        compliant around that reference while still adding gravity compensation and
+        joint-limit safety torques.
+        """
+        if leader_state is None:
+            leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel = (
+                self.get_leader_joint_states()
+            )
+        else:
+            leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel = leader_state
+
+        q_ref_policy = np.asarray(q_ref_policy, dtype=float)
+        if q_ref_policy.shape[0] < self.num_arm_joints:
+            raise ValueError(
+                f"q_ref_policy must have at least {self.num_arm_joints} arm joints, got {q_ref_policy.shape}"
+            )
+
+        torque_arm = np.zeros(self.num_arm_joints)
+
+        tau_limit, torque_gripper = self.joint_limit_barrier(
+            leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel
+        )
+        torque_arm += tau_limit
+
+        if self.enable_gravity_comp:
+            tau_gravity = self.gravity_compensation(leader_arm_pos, leader_arm_vel)
+            torque_arm += tau_gravity
+
+            tau_friction = self.friction_compensation(leader_arm_vel)
+            torque_arm += tau_friction
+
+            if self.gravity_comp_velocity_damping != 0.0:
+                torque_arm += -self.gravity_comp_velocity_damping * leader_arm_vel
+
+        tau_policy = (
+            self.policy_impedance_kp * (q_ref_policy[: self.num_arm_joints] - leader_arm_pos)
+            - self.policy_impedance_kd * leader_arm_vel
+        )
+        torque_arm += tau_policy
+
+        self._policy_q_ref = q_ref_policy[: self.num_arm_joints].copy()
+        self.set_leader_joint_torque(torque_arm, float(torque_gripper))
 
     def joint_limit_barrier(
         self,

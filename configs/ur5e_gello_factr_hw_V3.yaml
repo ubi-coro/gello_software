@@ -78,6 +78,9 @@ controller:
   joint_limit_barrier:
     kp: 0.0 #1.0
     kd: 0.0 #0.01
+  policy_impedance:
+    kp: 5.0    # Weich genug für Korrekturen
+    kd: 0.5 
 
   gripper_feedback:
     enable: False

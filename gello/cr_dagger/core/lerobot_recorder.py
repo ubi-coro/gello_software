@@ -46,13 +46,13 @@ class LeRobotCorrectionRecorder:
             "shape": (6,),
             "names": ["dq_0", "dq_1", "dq_2", "dq_3", "dq_4", "dq_5"],
         },
-        "observation.is_correction": {
-            "dtype": "bool",
+            "observation.is_correction": {
+                "dtype": "float32",
             "shape": (1,),
             "names": ["is_correction"],
         },
         "observation.detector_votes": {
-            "dtype": "bool",
+            "dtype": "float32",
             "shape": (4,),
             "names": ["vote_torque", "vote_delta", "vote_energy", "vote_wrench"],
         },
@@ -206,11 +206,13 @@ class LeRobotCorrectionRecorder:
             )
 
         detector_votes_arr = np.asarray(
-            detector_votes if detector_votes is not None else [False, False, False, False],
-            dtype=bool,
+            detector_votes if detector_votes is not None else [0.0, 0.0, 0.0, 0.0],
+            dtype=np.float32,
         )
         if detector_votes_arr.shape != (4,):
             raise ValueError(f"detector_votes must have shape (4,), got {detector_votes_arr.shape}")
+
+        is_correction_arr = np.asarray([float(is_correction)], dtype=np.float32)
 
         frame = {
             "observation.state": torch.tensor(
@@ -227,11 +229,12 @@ class LeRobotCorrectionRecorder:
                 delta_q[:self.n_joints], dtype=torch.float32,
             ),
             "observation.is_correction": torch.tensor(
-                [is_correction], dtype=torch.bool,
+                is_correction_arr,
+                dtype=torch.float32,
             ),
             "observation.detector_votes": torch.tensor(
                 detector_votes_arr,
-                dtype=torch.bool,
+                dtype=torch.float32,
             ),
             "action": torch.tensor(action_arr, dtype=torch.float32),
             "action.compliant": torch.tensor(compliant_arr, dtype=torch.float32),
