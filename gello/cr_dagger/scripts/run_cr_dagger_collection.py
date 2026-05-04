@@ -49,6 +49,8 @@ if str(REPO_ROOT) not in sys.path:
 # High-frequency sensor reader (decouples I/O from recording logic)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# TODO: Deprecated — superseded by the unified Phase B loop. Keep for
+# now for debugging, but consider removing this class entirely.
 class SensorSnapshot:
     """Immutable snapshot of all sensor data at one timestep."""
     __slots__ = (
@@ -76,6 +78,8 @@ class SensorSnapshot:
         self.tau_ext: np.ndarray = np.zeros(n)
 
 
+# TODO: Deprecated — superseded by the unified Phase B loop. Keep for
+# now for debugging, but consider removing this class entirely.
 class AsyncSensorReader:
     """
     Reads all sensors in a dedicated thread at maximum rate.
@@ -157,6 +161,9 @@ class AsyncSensorReader:
         shi = self._shi
         n = self._n
         dt_target = float(system.dt)
+        driver = system.driver
+        if driver is None:
+            return
 
         while not self._stop.is_set():
             t0 = time.perf_counter()
@@ -167,9 +174,9 @@ class AsyncSensorReader:
 
             # ── Dynamixel: combined position + velocity + current read ────
             try:
-                if hasattr(system.driver, "get_positions_velocities_and_currents"):
+                if hasattr(driver, "get_positions_velocities_and_currents"):
                     # Optimized: single bulk read
-                    pos, vel, cur = system.driver.get_positions_velocities_and_currents()
+                    pos, vel, cur = driver.get_positions_velocities_and_currents()
                     q_raw = np.asarray(pos[:n], dtype=float)
                     dq_raw = np.asarray(vel[:n], dtype=float)
                     snap.q_leader = (q_raw - system.joint_offsets[:n]) * system.joint_signs[:n]
@@ -185,7 +192,7 @@ class AsyncSensorReader:
                     snap.grip_leader = grip
                     snap.leader_gripper_raw_rad = system.leader_gripper_raw_rad
 
-                    cur_all = system.driver.get_currents()
+                    cur_all = driver.get_currents()
                     snap.currents_arm = np.asarray(cur_all[:n], dtype=float) * system.joint_signs[:n]
             except Exception:
                 # On read failure, keep previous snapshot
@@ -571,6 +578,195 @@ def _run_recording_loop_phase_a(
     }
 
 
+def _run_recording_loop_phase_b(
+    ctrl: EpisodeController,
+    lerobot_recorder: LeRobotCorrectionRecorder,
+    camera_rig: Optional[MultiRealSenseRig],
+    state_cache: dict[str, Any],
+    args: argparse.Namespace,
+    ep: int,
+    n: int,
+    obs_snap: SharedObservationSnapshot | None = None,
+    npz_recorder: CorrectionRecorder | None = None,
+) -> dict:
+    """Phase B recording: read only from shared cache and cameras."""
+    dataset_fps = int(args.dataset_fps)
+    frame_dt = 1.0 / max(dataset_fps, 1)
+    max_duration = float(args.max_episode_duration)
+    ep_start = time.perf_counter()
+    ep_recorded_frames = 0
+    ep_overruns = 0
+    corr_steps = 0
+    cache_lock = state_cache["lock"]
+
+    while True:
+        frame_start = time.perf_counter()
+
+        if frame_start - ep_start > max_duration:
+            print(f"[REC] Time limit reached ({max_duration}s)")
+            break
+
+        if ctrl.stop_requested.is_set():
+            return {
+                "rerecord": False,
+                "success": False,
+                "running": False,
+                "steps": ep_recorded_frames,
+                "overruns": ep_overruns,
+                "frames": ep_recorded_frames,
+                "corr_steps": corr_steps,
+            }
+        if ctrl.discard_requested.is_set():
+            return {
+                "rerecord": True,
+                "success": False,
+                "running": True,
+                "steps": ep_recorded_frames,
+                "overruns": ep_overruns,
+                "frames": ep_recorded_frames,
+                "corr_steps": corr_steps,
+            }
+        if ctrl.success_requested.is_set():
+            return {
+                "rerecord": False,
+                "success": True,
+                "running": True,
+                "steps": ep_recorded_frames,
+                "overruns": ep_overruns,
+                "frames": ep_recorded_frames,
+                "corr_steps": corr_steps,
+            }
+
+        t_mono = time.monotonic()
+        with cache_lock:
+            if not state_cache.get("updated", False):
+                time.sleep(0.001)
+                continue
+
+            # Staleness check: ensure the unified loop updated recently.
+            cache_t = float(state_cache.get("t_mono", 0.0))
+            if t_mono - cache_t > 0.1:
+                print("[WARN] Unified loop stale (no updates in >100ms) — skipping frame")
+                time.sleep(0.01)
+                continue
+
+            q_follower = state_cache.get("q_follower", np.zeros(n)).copy()
+            dq_follower = state_cache.get("dq_follower", np.zeros(n)).copy()
+            q_leader = state_cache.get("q_leader", np.zeros(n)).copy()
+            dq_leader = state_cache.get("dq_leader", np.zeros(n)).copy()
+            tau_ext = state_cache.get("tau_ext", np.zeros(n)).copy()
+            wrench_ur5e = state_cache.get("wrench_ur5e", np.zeros(6)).copy()
+            gripper_follower = float(state_cache.get("gripper_follower", 0.0))
+            is_corr = bool(state_cache.get("is_correction", False))
+            diag = state_cache.get("detector_diag", {})
+            policy_action = state_cache.get("policy_action", np.zeros(n + 1)).copy()
+            compliant_action = state_cache.get("compliant_action", np.zeros(n + 1)).copy()
+
+            # Reset the updated flag to detect future updates and stale state.
+            try:
+                state_cache["updated"] = False
+            except Exception:
+                pass
+
+        if is_corr:
+            corr_steps += 1
+
+        images = None
+        if camera_rig is not None:
+            images = camera_rig.get_images()
+            if images is None:
+                elapsed = time.perf_counter() - frame_start
+                if elapsed < frame_dt:
+                    time.sleep(frame_dt - elapsed)
+                continue
+
+        obs_image = None
+        if images is not None:
+            obs_image = next(iter(images.values())) if len(images) > 0 else None
+
+        if obs_snap is not None:
+            obs_snap.write(
+                timestamp=t_mono,
+                q=q_follower,
+                dq=dq_follower,
+                grip=gripper_follower,
+                tau_ext=tau_ext,
+                wrench=wrench_ur5e,
+                image=obs_image,
+            )
+
+        if npz_recorder is not None:
+            npz_recorder.record(
+                timestamp=t_mono,
+                q_ref=policy_action[:n],
+                q_actual=q_leader,
+                dq_actual=dq_leader,
+                q_compliant=compliant_action[:n],
+                dq_compliant=np.zeros(n),
+                tau_ext_gello=tau_ext,
+                q_follower=q_follower,
+                wrench_ur5e=wrench_ur5e,
+                is_correction=bool(is_corr),
+                detector_diagnostics=diag,
+            )
+
+        votes = diag.get("votes", {})
+        detector_votes = np.array(
+            [
+                float(bool(votes.get("torque", False))),
+                float(bool(votes.get("delta_q", votes.get("delta", False)))),
+                float(bool(votes.get("energy", False))),
+                float(bool(votes.get("wrench", False))),
+            ],
+            dtype=np.float32,
+        )
+
+        lerobot_recorder.add_frame(
+            timestamp=t_mono,
+            q=q_follower,
+            dq=dq_follower,
+            gripper=gripper_follower,
+            action=compliant_action,
+            tau_ext=tau_ext,
+            wrench_ur5e=wrench_ur5e,
+            q_ref=policy_action,
+            q_compliant=compliant_action[:n],
+            dq_compliant=np.zeros(n),
+            gripper_ref=float(policy_action[-1]) if len(policy_action) > n else 0.0,
+            gripper_compliant=float(compliant_action[-1]) if len(compliant_action) > n else 0.0,
+            is_correction=bool(is_corr),
+            detector_votes=detector_votes,
+            images=images,
+        )
+        ep_recorded_frames += 1
+
+        if ep_recorded_frames % dataset_fps == 0:
+            elapsed_s = frame_start - ep_start
+            delta_norm = np.linalg.norm(compliant_action[:n] - policy_action[:n])
+            print(
+                f"  [ep {ep+1:03d} {elapsed_s:5.1f}s] "
+                f"INT={'YES' if is_corr else 'no '} "
+                f"|Δ|={delta_norm:.4f} "
+                f"frames={ep_recorded_frames}"
+            )
+
+        elapsed = time.perf_counter() - frame_start
+        if elapsed > frame_dt:
+            ep_overruns += 1
+        else:
+            time.sleep(frame_dt - elapsed)
+
+    return {
+        "rerecord": False,
+        "success": False,
+        "running": True,
+        "steps": ep_recorded_frames,
+        "overruns": ep_overruns,
+        "frames": ep_recorded_frames,
+        "corr_steps": corr_steps,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Helpers (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -853,6 +1049,9 @@ def main() -> int:
     detector: FusedInterventionDetector | None = None
     ctrl: Optional[EpisodeController] = None
     sensor_reader: Optional[AsyncSensorReader] = None
+    unified_stop: Event | None = None
+    unified_thread: Thread | None = None
+    state_cache: dict[str, Any] | None = None
     n = 6
     teleop_started = False
 
@@ -881,23 +1080,7 @@ def main() -> int:
             print("[WARN] teleop is disabled in config.")
         shi = _build_shi(system, config_path, n)
 
-        # ── Initialize async sensor reader (solves bus contention + latency stacking) ──
-        sensor_reader = AsyncSensorReader(
-            system=system,
-            shi=shi,
-            n=n,
-            enable_wrench=args.enable_wrench or args.enable_wrench_feedback,
-        )
-
-        sensor_reader: Optional[AsyncSensorReader] = None
         if args.interventions:
-            sensor_reader = AsyncSensorReader(
-                system=system,
-                shi=shi,
-                n=n,
-                enable_wrench=args.enable_wrench or args.enable_wrench_feedback,
-            )
-
             q0, _, _, _ = system.get_leader_joint_states()
             traj_buf = SharedTrajectoryBuffer(
                 name="cr_dagger_traj",
@@ -924,6 +1107,29 @@ def main() -> int:
                 n_joints=n,
                 dt=float(system.dt),
             )
+            state_cache = {
+                "lock": Lock(),
+                "updated": False,
+                "t_mono": 0.0,
+                "q_leader": np.zeros(n),
+                "dq_leader": np.zeros(n),
+                "grip": 0.0,
+                "grip_raw": 0.0,
+                "grip_vel": 0.0,
+                "tau_ext": np.zeros(n),
+                "q_ref": np.zeros(n),
+                "dq_ref": np.zeros(n),
+                "is_stale": False,
+                "is_correction": False,
+                "detector_diag": {},
+                "policy_action": np.zeros(n + 1),
+                "compliant_action": np.zeros(n + 1),
+                "q_follower": np.zeros(n),
+                "dq_follower": np.zeros(n),
+                "gripper_follower": 0.0,
+                "wrench_ur5e": np.zeros(6),
+                "tcp_joint_torques": np.zeros(n),
+            }
 
         camera_names, camera_device_ids, camera_flips = _resolve_camera_config(args)
         if camera_names:
@@ -940,6 +1146,20 @@ def main() -> int:
         if dataset_fps <= 0:
             raise ValueError("dataset-fps must be > 0")
 
+        # Determine whether the follower robot actually exposes a gripper.
+        has_gripper = False
+        try:
+            if getattr(system, "_direct_follower_robot", None) is not None:
+                has_gripper = bool(getattr(system._direct_follower_robot, "_use_gripper", False))
+            elif getattr(system, "teleop_client", None) is not None:
+                try:
+                    follower_dofs = system.teleop_client.num_dofs()
+                    has_gripper = follower_dofs > n
+                except Exception:
+                    has_gripper = False
+        except Exception:
+            has_gripper = False
+
         lerobot_recorder = LeRobotCorrectionRecorder(
             repo_id=repo_id,
             root=str(dataset_root),
@@ -947,7 +1167,7 @@ def main() -> int:
             fps=dataset_fps,
             task_description=str(args.task_description),
             n_joints=n,
-            include_gripper_action=bool(args.interventions),
+            include_gripper_action=(bool(args.interventions) and has_gripper),
             camera_names=camera_names if camera_names else None,
         )
 
@@ -1000,17 +1220,33 @@ def main() -> int:
             f"record_interval={record_interval:.6f}s"
         )
 
-        # ── Start teleop ONCE, keep it running across all episodes ────────
-        if system.teleop_enabled and not teleop_started:
+        if args.interventions:
+            if hasattr(system.driver, "stop_reading"):
+                system.driver.stop_reading()
+
+            if state_cache is None:
+                raise RuntimeError("Phase B state cache was not initialized")
+
+            unified_stop = Event()
+            unified_thread = Thread(
+                target=system._phase_b_unified_loop,
+                args=(
+                    traj_interp,
+                    shi,
+                    detector,
+                    state_cache,
+                    unified_stop,
+                    bool(args.enable_wrench or args.enable_wrench_feedback),
+                ),
+                daemon=True,
+                name="phase-b-unified",
+            )
+            unified_thread.start()
+            print("[PHASE B] Unified control thread started")
+        elif system.teleop_enabled and not teleop_started:
             teleop_started = _start_prepared_teleop(system)
             if not teleop_started:
                 raise RuntimeError("teleop could not be started")
-
-        if args.interventions and sensor_reader is not None:
-            print("[SENSOR] Starting async sensor reader...")
-            sensor_reader.start()
-            time.sleep(0.5)  # Let reader stabilize
-            print(f"[SENSOR] Reader active at ~{sensor_reader.read_hz:.0f} Hz")
 
         total_overruns = 0
         total_steps = 0
@@ -1059,9 +1295,6 @@ def main() -> int:
                 npz_recorder.start_episode(f"episode_{ep:04d}")
 
             ep_start = time.perf_counter()
-            last_step_t = time.perf_counter()
-            last_record_t = time.perf_counter()  # Track last recording time
-            obs_write_counter = 0
             ep_steps = 0
             ep_overruns = 0
             corr_steps = 0
@@ -1071,9 +1304,7 @@ def main() -> int:
 
             print(f"[REC] ● Recording episode {ep + 1}...")
 
-            # ── Phase A (no interventions) vs Phase B (CR-DAgger interventions) ────────
             if not args.interventions:
-                # ── PHASE A: RTDE + camera recording only ───────────────────────────
                 result = _run_recording_loop_phase_a(
                     system=system,
                     ctrl=ctrl,
@@ -1083,275 +1314,29 @@ def main() -> int:
                     ep=ep,
                     n=n,
                 )
-                rerecord = result["rerecord"]
-                marked_success = result["success"]
-                if not result["running"]:
-                    running = False
-                ep_steps = result["steps"]
-                ep_overruns = result["overruns"]
-                ep_recorded_frames = result["frames"]
-                corr_steps = 0
-                total_overruns += ep_overruns
-                total_steps += ep_steps
-            
-            # ── Inner control loop (Phase B only) ──────────────────────────
-            if args.interventions and running:
-                while running:
-                    now_perf = time.perf_counter()
-                    measured_dt = max(now_perf - last_step_t, 1e-4)
-                    last_step_t = now_perf
+            else:
+                result = _run_recording_loop_phase_b(
+                    ctrl=ctrl,
+                    lerobot_recorder=lerobot_recorder,
+                    camera_rig=camera_rig,
+                    state_cache=state_cache if state_cache is not None else {"lock": Lock(), "updated": False},
+                    args=args,
+                    ep=ep,
+                    n=n,
+                    obs_snap=obs_snap,
+                    npz_recorder=npz_recorder,
+                )
 
-                    # Time limit
-                    if now_perf - ep_start > float(args.max_episode_duration):
-                        print(f"[REC] Time limit reached ({args.max_episode_duration}s)")
-                        break
-
-                    # ── Check controller events ───────────────────────────────
-                    if ctrl.stop_requested.is_set():
-                        print("\n[CTRL] STOP — saving episode & ending collection.")
-                        running = False
-                        break
-                    if ctrl.discard_requested.is_set():
-                        print("\n[CTRL] DISCARD — will re-record this episode.")
-                        rerecord = True
-                        break
-                    if ctrl.success_requested.is_set():
-                        print("\n[CTRL] ✓ SUCCESS — saving episode.")
-                        marked_success = True
-                        break
-
-                    # ── Sensor reads ──────────────────────────────────────────
-                    q, dq, grip, grip_vel = system.get_leader_joint_states()
-                    currents_all = system.driver.get_currents()
-                    currents_arm = currents_all[:n] * system.joint_signs[:n]
-                    tau_ext = shi.update(q, dq, currents_arm)
-
-                    q_follower = np.zeros(n)
-                    dq_follower = np.zeros(n)
-                    try:
-                        q_follower_raw, dq_follower_raw = system.get_follower_arm_state()
-                        q_follower = np.asarray(q_follower_raw[:n], dtype=float)
-                        dq_follower = np.asarray(dq_follower_raw[:n], dtype=float)
-                    except Exception:
-                        pass
-
-                    # ── Follower gripper state ────────────────────────────────
-                    follower_gripper_pos = 0.0
-                    try:
-                        fb = system.get_follower_gripper_feedback()
-                        follower_gripper_pos = float(fb.get("position", 0.0))
-                    except Exception:
-                        pass
-
-                    images_for_frame = None
-                    if camera_rig is not None:
-                        images_for_frame = camera_rig.get_images()
-
-                    wrench_ur5e = np.zeros(6)
-                    tau_wrench_fb = None
-                    if args.enable_wrench or args.enable_wrench_feedback:
-                        wrench_ur5e, tcp_joint_torques = system.get_follower_tcp_force()
-                        if args.enable_wrench_feedback:
-                            tau_wrench_fb = np.asarray(tcp_joint_torques[:n], dtype=float)
-
-                    t_mono = time.monotonic()
-                    q_ref = q_follower.copy()
-                    q_c = q_follower.copy()
-                    dq_c = dq_follower.copy()
-                    is_stale = False
-                    is_corr = False
-                    diag = {
-                        "votes": {
-                            "torque": False,
-                            "delta": False,
-                            "energy": False,
-                            "wrench": False,
-                        }
-                    }
-
-                    if args.interventions:
-                        assert traj_interp is not None
-                        assert detector is not None
-
-                        q_ref, dq_ref, is_stale = traj_interp.get_reference(t_mono)
-                        _ = dq_ref
-
-                        system.control_loop_step_with_policy(
-                            q_ref_policy=q_ref,
-                            leader_state=(q, dq, grip, grip_vel),
-                        )
-
-                        policy_action = system._build_follower_action(q_ref, grip)
-                        compliant_action = getattr(system, "_teleop_last_action", None)
-                        if compliant_action is None:
-                            compliant_action = system._build_follower_action(q, grip)
-                        else:
-                            compliant_action = np.asarray(compliant_action, dtype=float).copy()
-
-                        expected_action_dim = n + 1
-                        if len(compliant_action) < expected_action_dim:
-                            compliant_action = np.concatenate(
-                                [
-                                    compliant_action,
-                                    np.zeros(expected_action_dim - len(compliant_action)),
-                                ]
-                            )
-                        elif len(compliant_action) > expected_action_dim:
-                            compliant_action = compliant_action[:expected_action_dim]
-
-                        is_corr = detector.update(
-                            tau_ext=tau_ext,
-                            q_c=q,
-                            q_ref=q_ref,
-                            dq_c=dq,
-                            wrench=wrench_ur5e if args.enable_wrench else None,
-                        )
-                        diag = detector.get_diagnostics()
-                        if is_corr:
-                            corr_steps += 1
-
-                        action = compliant_action.copy()
-                        q_c = compliant_action[:n].copy()
-                        dq_c = np.zeros(n, dtype=float)
-                    else:
-                        policy_action = q_follower.copy()
-                        action = system._build_follower_action(q, grip)
-
-                    if not args.interventions:
-                        compliant_action = action.copy()
-                    action = np.asarray(action, dtype=float).copy()
-
-                    expected_action_dim = n + 1
-                    if len(action) < expected_action_dim:
-                        action = np.concatenate([action, np.zeros(expected_action_dim - len(action))])
-                    elif len(action) > expected_action_dim:
-                        action = action[:expected_action_dim]
-
-                    if args.interventions:
-                        if images_for_frame is not None and len(images_for_frame) == 0:
-                            images_for_frame = None
-
-                    if npz_recorder is not None:
-                        npz_recorder.record(
-                            timestamp=t_mono,
-                            q_ref=policy_action[:n],
-                            q_actual=q,
-                            dq_actual=dq,
-                            q_compliant=q_c,
-                            dq_compliant=dq_c,
-                            tau_ext_gello=tau_ext,
-                            q_follower=q_follower,
-                            wrench_ur5e=wrench_ur5e,
-                            is_correction=bool(is_corr),
-                            detector_diagnostics=diag,
-                        )
-
-                    votes = diag.get("votes", {})
-                    detector_votes = np.array(
-                        [
-                            float(bool(votes.get("torque", False))),
-                            float(bool(votes.get("delta_q", votes.get("delta", False)))),
-                            float(bool(votes.get("energy", False))),
-                            float(bool(votes.get("wrench", False))),
-                        ],
-                        dtype=np.float32,
-                    )
-
-                    # ── Record dataset frame (time-based, not step-based) ────
-                    now_record_check = time.perf_counter()
-                    if (now_record_check - last_record_t) >= record_interval:
-                        last_record_t = now_record_check
-                        can_record_frame = True
-                        if camera_rig is not None and images_for_frame is None:
-                            can_record_frame = False
-
-                        if can_record_frame:
-                            if args.interventions:
-                                obs_q = q_follower
-                                obs_dq = dq_follower
-                                obs_gripper = follower_gripper_pos
-                            else:
-                                obs_q = q_follower
-                                obs_dq = dq_follower
-                                obs_gripper = follower_gripper_pos
-
-                            if args.interventions:
-                                policy_action_frame = policy_action.copy()
-                                actual_action_frame = action.copy()
-                                q_compliant_frame = compliant_action.copy()
-                                dq_compliant_frame = dq_c.copy()
-                                gripper_ref = float(policy_action_frame[-1]) if len(policy_action_frame) > n else 0.0
-                                gripper_compliant = float(q_compliant_frame[-1]) if len(q_compliant_frame) > n else 0.0
-                            else:
-                                policy_action_frame = action.copy()
-                                actual_action_frame = action.copy()
-                                q_compliant_frame = action.copy()
-                                dq_compliant_frame = dq_follower.copy()
-                                gripper_ref = float(obs_gripper)
-                                gripper_compliant = float(obs_gripper)
-
-                            lerobot_recorder.add_frame(
-                                timestamp=t_mono,
-                                q=obs_q,
-                                dq=obs_dq,
-                                gripper=obs_gripper,
-                                action=actual_action_frame,
-                                tau_ext=tau_ext,
-                                wrench_ur5e=wrench_ur5e,
-                                q_ref=policy_action_frame,
-                                q_compliant=q_compliant_frame,
-                                dq_compliant=dq_compliant_frame,
-                                gripper_ref=gripper_ref,
-                                gripper_compliant=gripper_compliant,
-                                is_correction=float(bool(is_corr)),
-                                detector_votes=detector_votes,
-                                images=images_for_frame,
-                            )
-                            ep_recorded_frames += 1
-
-                    if args.interventions and obs_snap is not None:
-                        obs_write_counter += 1
-                        if obs_write_counter >= int(args.obs_decimation):
-                            obs_write_counter = 0
-                            obs_image = None
-                            if camera_rig is not None:
-                                latest_images = camera_rig.get_images()
-                                if latest_images is not None and camera_names:
-                                    obs_image = latest_images[camera_names[0]]
-                            obs_snap.write(
-                                timestamp=t_mono,
-                                q=q_follower,
-                                dq=dq_follower,
-                                grip=float(follower_gripper_pos),
-                                tau_ext=tau_ext,
-                                wrench=wrench_ur5e,
-                                image=obs_image,
-                            )
-
-                    ep_steps += 1
-                    if ep_steps % 330 == 0:
-                        elapsed_s = now_perf - ep_start
-                        if args.interventions:
-                            print(
-                                f"  [ep {ep+1:03d} {elapsed_s:5.1f}s] "
-                                f"INT={'YES' if is_corr else 'no '} "
-                                f"|Δq|={np.linalg.norm(q_c - policy_action[:n]):.4f} "
-                                f"|τ|={np.linalg.norm(tau_ext):.3f} "
-                                f"frames={ep_recorded_frames}"
-                            )
-                        else:
-                            print(
-                                f"  [ep {ep+1:03d} {elapsed_s:5.1f}s] "
-                                f"|τ|={np.linalg.norm(tau_ext):.3f} "
-                                f"frames={ep_recorded_frames}"
-                            )
-
-                    loop_time = time.perf_counter() - now_perf
-                    if loop_time > float(system.dt):
-                        ep_overruns += 1
-                    sleep_s = max(0.0, float(system.dt) - loop_time)
-                    if sleep_s > 0:
-                        time.sleep(sleep_s)
+            rerecord = result["rerecord"]
+            marked_success = result["success"]
+            if not result["running"]:
+                running = False
+            ep_steps = result["steps"]
+            ep_overruns = result["overruns"]
+            ep_recorded_frames = result["frames"]
+            corr_steps = result.get("corr_steps", 0)
+            total_overruns += ep_overruns
+            total_steps += ep_steps
 
             # ══════════════════════════════════════════════════════════════
             # POST-EPISODE: Discard or Save, then RESET phase
@@ -1405,8 +1390,6 @@ def main() -> int:
                 f"({100.0 * ep_overruns / max(ep_steps, 1):.1f}%)"
             )
 
-            total_steps += ep_steps
-            total_overruns += ep_overruns
             ep += 1
 
             # ── RESET STATE: teleop active, user repositions ──────────────
@@ -1450,6 +1433,14 @@ def main() -> int:
 
         if system is not None:
             system.running = False
+
+        if unified_stop is not None:
+            unified_stop.set()
+        if unified_thread is not None:
+            try:
+                unified_thread.join(timeout=1.0)
+            except Exception:
+                pass
 
         if sensor_reader is not None:
             try:

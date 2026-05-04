@@ -25,7 +25,7 @@ import yaml
 import matplotlib
 import matplotlib.pyplot as plt
 from collections import deque
-from threading import Thread
+from threading import Event, Thread
 from dataclasses import dataclass, field
 from typing import Dict, List, Deque
 import csv
@@ -1879,6 +1879,201 @@ class FACTRGravityCompensation:
         except Exception as e:
             print(f"Warning: stopJ failed: {e}")
 
+    def _phase_b_unified_loop(
+        self,
+        traj_interp: Any,
+        shi: Any,
+        detector: Any,
+        state_cache: dict[str, Any],
+        stop_event: Event,
+        enable_wrench: bool = False,
+    ) -> None:
+        """Unified Phase B loop that owns leader Dynamixel reads and torque writes."""
+        assert self.driver is not None
+        assert self._direct_follower_robot is not None
+
+        follower = self._direct_follower_robot
+        n = self.num_arm_joints
+        impedance_cfg = self.config.get("teleop", {}).get("impedance", {})
+        kp_follower = float(impedance_cfg.get("kp", 150.0))
+        kd_follower = float(impedance_cfg.get("kd", 12.0))
+        rate_hz = 500.0
+        rate_dt = 1.0 / rate_hz
+        cache_lock = state_cache["lock"]
+        has_gripper = bool(
+            hasattr(follower, "gripper")
+            and hasattr(follower, "_use_gripper")
+            and follower._use_gripper
+        )
+
+        self._gripper_cmd_lock = threading.Lock()
+        self._latest_gripper_pos = None
+
+        if has_gripper:
+            def gripper_worker() -> None:
+                while not stop_event.is_set():
+                    pos = None
+                    with self._gripper_cmd_lock:
+                        if self._latest_gripper_pos is not None:
+                            pos = self._latest_gripper_pos
+                            self._latest_gripper_pos = None
+                    if pos is not None:
+                        try:
+                            follower.gripper.move(pos, 255, 10)
+                        except Exception:
+                            pass
+                    time.sleep(1.0 / 30.0)
+
+            threading.Thread(
+                target=gripper_worker,
+                daemon=True,
+                name="phase-b-gripper-worker",
+            ).start()
+
+        loop_count = 0
+        overrun_count = 0
+        start_time = time.perf_counter()
+
+        print(f"[PHASE B] Unified loop started at {rate_hz:.0f}Hz")
+        print(
+            f"  Policy impedance: Kp={self.policy_impedance_kp}, "
+            f"Kd={self.policy_impedance_kd}"
+        )
+        print(f"  Follower impedance: Kp={kp_follower}, Kd={kd_follower}")
+
+        while not stop_event.is_set():
+            t0 = time.perf_counter()
+            t_mono = time.monotonic()
+
+            try:
+                pos_raw, vel_raw, cur_raw = self.driver.get_positions_velocities_and_currents()
+                q_leader = (
+                    np.asarray(pos_raw[:n], dtype=float) - self.joint_offsets[:n]
+                ) * self.joint_signs[:n]
+                dq_leader = np.asarray(vel_raw[:n], dtype=float) * self.joint_signs[:n]
+                currents_arm = np.asarray(cur_raw[:n], dtype=float) * self.joint_signs[:n]
+
+                if len(pos_raw) > n:
+                    grip_raw = float(pos_raw[-1])
+                    grip = (grip_raw - float(self.joint_offsets[-1])) * float(self.joint_signs[-1])
+                    self.leader_gripper_raw_rad = grip_raw
+                else:
+                    grip_raw = 0.0
+                    grip = 0.0
+
+                if len(vel_raw) > n:
+                    grip_vel = float(vel_raw[-1]) * float(self.joint_signs[-1])
+                else:
+                    grip_vel = 0.0
+
+                tau_ext = shi.update(q_leader, dq_leader, currents_arm)
+
+                q_ref, dq_ref, is_stale = traj_interp.get_reference(t_mono)
+                q_ref = np.asarray(q_ref, dtype=float)
+                dq_ref = np.asarray(dq_ref, dtype=float) if dq_ref is not None else np.zeros(n)
+                dq_ref_n = dq_ref[:n] if dq_ref.shape[0] >= n else np.zeros(n)
+
+                wrench_ur5e = np.zeros(6, dtype=float)
+                tcp_joint_torques = np.zeros(n, dtype=float)
+                if enable_wrench:
+                    try:
+                        wrench_ur5e, tcp_joint_torques = self.get_follower_tcp_force()
+                    except Exception:
+                        wrench_ur5e = np.zeros(6, dtype=float)
+                        tcp_joint_torques = np.zeros(n, dtype=float)
+
+                is_corr = detector.update(
+                    tau_ext=tau_ext,
+                    q_c=q_leader,
+                    q_ref=q_ref,
+                    dq_c=dq_leader,
+                    wrench=wrench_ur5e if enable_wrench else None,
+                )
+
+                self.control_loop_step_with_policy(
+                    q_ref_policy=q_ref,
+                    dq_ref_policy=dq_ref_n,
+                    leader_state=(q_leader, dq_leader, float(grip), float(grip_vel)),
+                )
+
+                target_joints = self._build_follower_action(q_leader, float(grip))
+                self._teleop_last_action = target_joints.copy()
+
+                follower.command_joint_state_impedance(
+                    target_joints=target_joints[:6],
+                    target_velocities=None,
+                    kp=kp_follower,
+                    kd=kd_follower,
+                )
+
+                if has_gripper and len(target_joints) > 6:
+                    with self._gripper_cmd_lock:
+                        self._latest_gripper_pos = int(np.clip(target_joints[-1] * 255, 0, 255))
+
+                q_follower = np.zeros(n, dtype=float)
+                dq_follower = np.zeros(n, dtype=float)
+                follower_gripper = 0.0
+                try:
+                    q_follower, dq_follower = self.get_follower_arm_state()
+                    q_follower = np.asarray(q_follower[:n], dtype=float)
+                    dq_follower = np.asarray(dq_follower[:n], dtype=float)
+                except Exception:
+                    pass
+
+                try:
+                    gripper_fb = self.get_follower_gripper_feedback()
+                    follower_gripper = float(gripper_fb.get("position", 0.0))
+                except Exception:
+                    pass
+
+                policy_action = self._build_follower_action(q_ref, float(grip))
+
+                with cache_lock:
+                    state_cache["t_mono"] = t_mono
+                    state_cache["q_leader"] = q_leader.copy()
+                    state_cache["dq_leader"] = dq_leader.copy()
+                    state_cache["grip"] = float(grip)
+                    state_cache["grip_raw"] = float(grip_raw)
+                    state_cache["grip_vel"] = float(grip_vel)
+                    state_cache["tau_ext"] = tau_ext.copy()
+                    state_cache["q_ref"] = q_ref[:n].copy()
+                    state_cache["dq_ref"] = dq_ref_n.copy()
+                    state_cache["is_stale"] = bool(is_stale)
+                    state_cache["is_correction"] = bool(is_corr)
+                    state_cache["detector_diag"] = detector.get_diagnostics()
+                    state_cache["policy_action"] = policy_action.copy()
+                    state_cache["compliant_action"] = target_joints.copy()
+                    state_cache["q_follower"] = q_follower.copy()
+                    state_cache["dq_follower"] = dq_follower.copy()
+                    state_cache["gripper_follower"] = float(follower_gripper)
+                    state_cache["wrench_ur5e"] = wrench_ur5e.copy()
+                    state_cache["tcp_joint_torques"] = tcp_joint_torques.copy()
+                    state_cache["updated"] = True
+
+                loop_count += 1
+
+            except Exception as e:
+                if loop_count % 500 == 0:
+                    print(f"[PHASE B] Loop error: {e}")
+
+            elapsed = time.perf_counter() - t0
+            sleep_s = rate_dt - elapsed
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            else:
+                overrun_count += 1
+
+        try:
+            follower.robot.stopJ(2.0)
+        except Exception:
+            pass
+
+        total_time = time.perf_counter() - start_time
+        actual_hz = loop_count / max(total_time, 1e-6)
+        print("\n[PHASE B] Unified loop stopped:")
+        print(f"  Loops: {loop_count}, Time: {total_time:.1f}s, Rate: {actual_hz:.1f}Hz")
+        print(f"  Overruns: {overrun_count} ({100 * overrun_count / max(loop_count, 1):.1f}%)")
+
     def _get_dynamixel_offsets(self, verbose: bool = True) -> None:
         """Calibrate Dynamixel servos to match expected joint positions.
         
@@ -2029,6 +2224,7 @@ class FACTRGravityCompensation:
     def control_loop_step_with_policy(
         self,
         q_ref_policy: npt.NDArray[np.float64],
+        dq_ref_policy: Optional[npt.NDArray[np.float64]] = None,
         leader_state: tuple[
             npt.NDArray[np.float64],
             npt.NDArray[np.float64],
@@ -2038,9 +2234,9 @@ class FACTRGravityCompensation:
     ) -> None:
         """Apply a soft policy-imposed impedance on the GELLO leader.
 
-        The policy provides a leader-frame q_ref. The controller keeps the leader
-        compliant around that reference while still adding gravity compensation and
-        joint-limit safety torques.
+        The policy provides leader-frame position and velocity references. The
+        controller keeps the leader compliant around that reference while still
+        adding gravity compensation and joint-limit safety torques.
         """
         if leader_state is None:
             leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel = (
@@ -2054,6 +2250,11 @@ class FACTRGravityCompensation:
             raise ValueError(
                 f"q_ref_policy must have at least {self.num_arm_joints} arm joints, got {q_ref_policy.shape}"
             )
+
+        if dq_ref_policy is not None:
+            dq_ref = np.asarray(dq_ref_policy, dtype=float)[: self.num_arm_joints]
+        else:
+            dq_ref = np.zeros(self.num_arm_joints)
 
         torque_arm = np.zeros(self.num_arm_joints)
 
@@ -2074,7 +2275,7 @@ class FACTRGravityCompensation:
 
         tau_policy = (
             self.policy_impedance_kp * (q_ref_policy[: self.num_arm_joints] - leader_arm_pos)
-            - self.policy_impedance_kd * leader_arm_vel
+            + self.policy_impedance_kd * (dq_ref - leader_arm_vel)
         )
         torque_arm += tau_policy
 

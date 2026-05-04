@@ -369,77 +369,9 @@ class DynamixelDriver(DynamixelDriverProtocol):
         - Atomic state update via reference swap
 
         """
-        # Pre-allocate arrays outside loop
-        raw_positions = np.zeros(self._num_joints, dtype=np.int32)
-        raw_velocities = np.zeros(self._num_joints, dtype=np.int32)
-        raw_currents = np.zeros(self._num_joints, dtype=np.int32)
-        
         while not self._stop_thread.is_set():
-            read_start = time.time()
-            
-            # === USB I/O under lock (minimize lock duration) ===
-            with self._lock:
-                dxl_comm_result = self._groupSyncRead.txRxPacket()
-            
-            if dxl_comm_result != COMM_SUCCESS:
-                self._read_errors += 1
-                # Only sleep on error to avoid busy-spin on persistent failures
-                time.sleep(0.001)
-                continue
-            
-            # === Parse results OUTSIDE lock (getData is thread-safe for reading) ===
             try:
-                for i, dxl_id in enumerate(self._ids):
-                    # Current (2 Bytes bei Adresse 126, signed 16-bit)
-                    current_raw = self._groupSyncRead.getData(
-                        dxl_id, ADDR_PRESENT_CURRENT, LEN_PRESENT_CURRENT
-                    )
-                    if current_raw > 0x7FFF:
-                        current_raw -= 0x10000
-                    raw_currents[i] = current_raw
-                    # Velocity (4 bytes)
-                    velocity = self._groupSyncRead.getData(
-                        dxl_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY
-                    )
-                    # Two's complement for signed 32-bit
-                    if velocity > 0x7FFFFFFF:
-                        velocity -= 0x100000000
-                    raw_velocities[i] = velocity
-                    
-                    # Position (4 bytes)
-                    position = self._groupSyncRead.getData(
-                        dxl_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION
-                    )
-                    if position > 0x7FFFFFFF:
-                        position -= 0x100000000
-                    raw_positions[i] = position
-                
-                # Convert to physical units
-                positions_rad = raw_positions.astype(np.float64) / 2048.0 * np.pi
-                # Velocity unit: 0.229 rev/min -> rad/s
-                velocities_rad_s = raw_velocities.astype(np.float64) * 0.229 * 2.0 * np.pi / 60.0
-                # convert current
-                current_mA = raw_currents.astype(np.float64) * self.current_conversions
-                
-                # Apply Exponential Moving Average (EMA) filter to velocities
-                if self._filtered_velocities is None:
-                    self._filtered_velocities = velocities_rad_s.copy()
-                else:
-                    self._filtered_velocities = (
-                        self._velocity_filter_alpha * velocities_rad_s +
-                        (1.0 - self._velocity_filter_alpha) * self._filtered_velocities
-                    )
-
-                # Atomic state update (Python GIL guarantees reference assignment is atomic)
-                self._latest_state = JointState(
-                    positions=positions_rad,
-                    velocities=self._filtered_velocities.copy(),
-                    currents=current_mA,
-                    timestamp=time.time()
-                )
-                
-                self._read_count += 1
-                self._last_read_duration_ms = (time.time() - read_start) * 1000.0
+                self._read_group_sync_state()
                 
                 # Yield to other threads (writer) to avoid lock starvation
                 time.sleep(0.0005)
@@ -449,9 +381,105 @@ class DynamixelDriver(DynamixelDriverProtocol):
                 print(f"Read parse error: {e}")
                 time.sleep(0.001)
 
+    def _read_group_sync_state(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read the combined current/velocity/position block and update cache."""
+        if self._is_fake:
+            assert self._fake_joint_angles is not None
+            assert self._fake_velocities is not None
+            assert self._fake_currents is not None
+            return (
+                self._fake_joint_angles.copy(),
+                self._fake_velocities.copy(),
+                self._fake_currents.copy(),
+            )
+
+        read_start = time.time()
+        raw_positions = np.zeros(self._num_joints, dtype=np.int32)
+        raw_velocities = np.zeros(self._num_joints, dtype=np.int32)
+        raw_currents = np.zeros(self._num_joints, dtype=np.int32)
+
+        with self._lock:
+            dxl_comm_result = self._groupSyncRead.txRxPacket()
+
+        if dxl_comm_result != COMM_SUCCESS:
+            raise RuntimeError("Failed to read combined Dynamixel state")
+
+        for i, dxl_id in enumerate(self._ids):
+            current_raw = self._groupSyncRead.getData(
+                dxl_id, ADDR_PRESENT_CURRENT, LEN_PRESENT_CURRENT
+            )
+            if current_raw > 0x7FFF:
+                current_raw -= 0x10000
+            raw_currents[i] = current_raw
+
+            velocity = self._groupSyncRead.getData(
+                dxl_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY
+            )
+            if velocity > 0x7FFFFFFF:
+                velocity -= 0x100000000
+            raw_velocities[i] = velocity
+
+            position = self._groupSyncRead.getData(
+                dxl_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION
+            )
+            if position > 0x7FFFFFFF:
+                position -= 0x100000000
+            raw_positions[i] = position
+
+        positions_rad = raw_positions.astype(np.float64) / 2048.0 * np.pi
+        velocities_rad_s = raw_velocities.astype(np.float64) * 0.229 * 2.0 * np.pi / 60.0
+        current_mA = raw_currents.astype(np.float64) * self.current_conversions
+
+        if self._filtered_velocities is None:
+            filtered_velocities = velocities_rad_s.copy()
+        else:
+            filtered_velocities = (
+                self._velocity_filter_alpha * velocities_rad_s
+                + (1.0 - self._velocity_filter_alpha) * self._filtered_velocities
+            )
+
+        self._filtered_velocities = filtered_velocities
+        self._latest_state = JointState(
+            positions=positions_rad,
+            velocities=filtered_velocities.copy(),
+            currents=current_mA,
+            timestamp=time.time(),
+        )
+        self._read_count += 1
+        self._last_read_duration_ms = (time.time() - read_start) * 1000.0
+
+        return positions_rad, filtered_velocities, current_mA
+
+    def stop_reading(self) -> None:
+        """Stop the background reading thread without closing the driver."""
+        self._stop_thread.set()
+        if hasattr(self, "_reading_thread") and self._reading_thread.is_alive():
+            self._reading_thread.join(timeout=2.0)
+
+    def get_positions_velocities_and_currents(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Get combined joint positions, velocities, and currents."""
+        if self._is_fake:
+            assert self._fake_joint_angles is not None
+            assert self._fake_velocities is not None
+            assert self._fake_currents is not None
+            return (
+                self._fake_joint_angles.copy(),
+                self._fake_velocities.copy(),
+                self._fake_currents.copy(),
+            )
+
+        try:
+            return self._read_group_sync_state()
+        except Exception:
+            positions, velocities = self.get_positions_and_velocities()
+            currents = self.get_currents()
+            return positions, velocities, currents
+
     def get_positions_and_velocities(self) -> Tuple[np.ndarray, np.ndarray]:
         """Get joint positions (rad) and velocities (rad/s) - lock-free read."""
         if self._is_fake:
+            assert self._fake_joint_angles is not None
+            assert self._fake_velocities is not None
             return self._fake_joint_angles.copy(), self._fake_velocities.copy()
         
         # Wait for first state (only on startup)
@@ -474,6 +502,7 @@ class DynamixelDriver(DynamixelDriverProtocol):
     def get_currents(self) -> np.ndarray:
         """Get motor currents in mA (physical units) - lock-free read."""
         if self._is_fake:
+            assert self._fake_currents is not None
             return self._fake_currents.copy()
 
         timeout = 5.0
