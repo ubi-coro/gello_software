@@ -873,6 +873,20 @@ class FACTRGravityCompensation:
         self.policy_impedance_kp = float(policy_impedance_cfg.get("kp", 5.0))
         self.policy_impedance_kd = float(policy_impedance_cfg.get("kd", 0.5))
         self._policy_q_ref: Optional[npt.NDArray[np.float64]] = None
+
+        teleop_cfg = self.config.get("teleop", {})
+        if isinstance(teleop_cfg, dict):
+            four_cfg = teleop_cfg.setdefault("four_channel", {})
+            if isinstance(four_cfg, dict):
+                four_cfg.setdefault("enable", False)
+                four_cfg.setdefault("K_virtual", 40.0)
+                four_cfg.setdefault("correction_gain", 1.0)
+                four_cfg.setdefault("force_feedback_gain", 0.3)
+                four_cfg.setdefault("velocity_gate_threshold", 1.5)
+                four_cfg.setdefault("deadband_tau", 0.15)
+                four_cfg.setdefault("mirror_source", "cmd")
+                four_cfg.setdefault("yamane_K_obs", 50.0)
+                four_cfg.setdefault("yamane_filter_fc", 5.0)
         
         # EMA filter state for gripper feedback
         self._last_gripper_torque_feedback = 0.0
@@ -1993,6 +2007,7 @@ class FACTRGravityCompensation:
                 self.control_loop_step_with_policy(
                     q_ref_policy=q_ref,
                     dq_ref_policy=dq_ref_n,
+                    compensation_mode="velocity_ff",
                     leader_state=(q_leader, dq_leader, float(grip), float(grip_vel)),
                 )
 
@@ -2071,6 +2086,354 @@ class FACTRGravityCompensation:
         total_time = time.perf_counter() - start_time
         actual_hz = loop_count / max(total_time, 1e-6)
         print("\n[PHASE B] Unified loop stopped:")
+        print(f"  Loops: {loop_count}, Time: {total_time:.1f}s, Rate: {actual_hz:.1f}Hz")
+        print(f"  Overruns: {overrun_count} ({100 * overrun_count / max(loop_count, 1):.1f}%)")
+
+    def _phase_b_4channel_loop(
+        self,
+        traj_interp: Any,
+        detector: Any,
+        state_cache: dict[str, Any],
+        stop_event: Event,
+        enable_wrench: bool = True,
+    ) -> None:
+        """Phase B 4-channel dual-impedance loop with Yamane observer."""
+        from gello.cr_dagger.core.yamane_observer import GeneralizedMomentumObserver
+
+        assert self.driver is not None
+        assert self._direct_follower_robot is not None
+
+        follower = self._direct_follower_robot
+        n = self.num_arm_joints
+
+        impedance_cfg = self.config.get("teleop", {}).get("impedance", {})
+        kp_ur5e = float(impedance_cfg.get("kp", 150.0))
+        kd_ur5e = float(impedance_cfg.get("kd", 12.0))
+
+        four_ch_cfg = self.config.get("teleop", {}).get("four_channel", {})
+        K_virtual = float(four_ch_cfg.get("K_virtual", 40.0))
+        correction_gain = float(four_ch_cfg.get("correction_gain", 1.0))
+        force_feedback_gain = float(four_ch_cfg.get("force_feedback_gain", 0.3))
+        velocity_gate_threshold = float(four_ch_cfg.get("velocity_gate_threshold", 1.5))
+        deadband_tau = float(four_ch_cfg.get("deadband_tau", 0.15))
+        mirror_source = str(four_ch_cfg.get("mirror_source", "cmd")).lower()
+        yamane_K_obs = float(four_ch_cfg.get("yamane_K_obs", 50.0))
+        yamane_filter_fc = float(four_ch_cfg.get("yamane_filter_fc", 5.0))
+
+        kp_mirror = float(self.policy_impedance_kp)
+        kd_mirror = float(self.policy_impedance_kd)
+
+        rate_hz = 500.0
+        rate_dt = 1.0 / rate_hz
+        cache_lock = state_cache["lock"]
+
+        yamane = GeneralizedMomentumObserver(
+            pin_model=self.pin_model,
+            num_arm_joints=n,
+            K_obs=yamane_K_obs,
+            dt=rate_dt,
+            filter_fc=yamane_filter_fc,
+        )
+
+        has_gripper = bool(
+            hasattr(follower, "gripper")
+            and hasattr(follower, "_use_gripper")
+            and follower._use_gripper
+        )
+        self._gripper_cmd_lock = threading.Lock()
+        self._latest_gripper_pos = None
+
+        if has_gripper:
+            def gripper_worker() -> None:
+                while not stop_event.is_set():
+                    pos = None
+                    with self._gripper_cmd_lock:
+                        if self._latest_gripper_pos is not None:
+                            pos = self._latest_gripper_pos
+                            self._latest_gripper_pos = None
+                    if pos is not None:
+                        try:
+                            follower.gripper.move(pos, 255, 10)
+                        except Exception:
+                            pass
+                    time.sleep(1.0 / 30.0)
+
+            threading.Thread(
+                target=gripper_worker,
+                daemon=True,
+                name="phase-b-4ch-gripper",
+            ).start()
+
+        q_mirror_target = np.zeros(n, dtype=float)
+        dq_mirror_target = np.zeros(n, dtype=float)
+        delta_follower = np.zeros(n, dtype=float)
+
+        loop_count = 0
+        overrun_count = 0
+        start_time = time.perf_counter()
+
+        print(f"\n[4-CHANNEL] Started at {rate_hz:.0f}Hz")
+        print(f"  UR5e:    Kp={kp_ur5e}, Kd={kd_ur5e}")
+        print(f"  Mirror:  Kp={kp_mirror}, Kd={kd_mirror}")
+        print(f"  Yamane:  K_obs={yamane_K_obs}, filter_fc={yamane_filter_fc}Hz")
+        print(f"  4-Ch:    K_virtual={K_virtual}, gain={correction_gain}")
+        print(f"  Mirror source: '{mirror_source}'")
+        print(f"  Force FB gain: {force_feedback_gain}")
+
+        initialized = False
+
+        while not stop_event.is_set():
+            t0 = time.perf_counter()
+            t_mono = time.monotonic()
+
+            try:
+                if hasattr(self.driver, "get_positions_velocities_and_currents"):
+                    pos_raw, vel_raw, _ = self.driver.get_positions_velocities_and_currents()
+                else:
+                    pos_raw, vel_raw = self.driver.get_positions_and_velocities()
+
+                q_leader = (
+                    np.asarray(pos_raw[:n], dtype=float) - self.joint_offsets[:n]
+                ) * self.joint_signs[:n]
+                dq_leader = np.asarray(vel_raw[:n], dtype=float) * self.joint_signs[:n]
+
+                if len(pos_raw) > n:
+                    grip_raw = float(pos_raw[-1])
+                    grip = (grip_raw - float(self.joint_offsets[-1])) * float(self.joint_signs[-1])
+                    self.leader_gripper_raw_rad = grip_raw
+                else:
+                    grip_raw = 0.0
+                    grip = 0.0
+
+                if len(vel_raw) > n:
+                    grip_vel = float(vel_raw[-1]) * float(self.joint_signs[-1])
+                else:
+                    grip_vel = 0.0
+
+                self.gripper_pos = float(grip)
+                self._last_gripper_vel = float(grip_vel)
+
+                if not initialized:
+                    yamane.reset(q_leader, dq_leader)
+                    q_mirror_target = q_leader.copy()
+                    dq_mirror_target = np.zeros(n, dtype=float)
+                    initialized = True
+
+                q_ref_leader, dq_ref_leader, is_stale = traj_interp.get_reference(t_mono)
+                q_ref_leader = np.asarray(q_ref_leader[:n], dtype=float)
+                dq_ref_leader = (
+                    np.asarray(dq_ref_leader[:n], dtype=float)
+                    if dq_ref_leader is not None
+                    else np.zeros(n, dtype=float)
+                )
+
+                q_ref_follower = self._build_follower_action(q_ref_leader, float(grip))[:n]
+                if self.map_signs is not None and self.map_index is not None:
+                    dq_ref_follower = self.map_signs * dq_ref_leader[self.map_index]
+                else:
+                    dq_ref_follower = dq_ref_leader[:n]
+
+                if mirror_source == "cmd":
+                    delta_leader = np.zeros(n, dtype=float)
+                    if self.map_signs is not None and self.map_index is not None:
+                        lim = min(len(self.map_index), len(self.map_signs), n)
+                        for i in range(lim):
+                            leader_idx = int(self.map_index[i])
+                            sign = float(self.map_signs[i])
+                            if leader_idx < n and abs(sign) > 1e-6:
+                                delta_leader[leader_idx] = delta_follower[i] / sign
+                    q_mirror_target = q_ref_leader + delta_leader
+                    dq_mirror_target = dq_ref_leader.copy()
+                elif mirror_source == "actual":
+                    try:
+                        q_ur5e, dq_ur5e = self.get_follower_arm_state()
+                        q_mirror_target = np.zeros(n, dtype=float)
+                        dq_mirror_target = np.zeros(n, dtype=float)
+                        if (
+                            self.map_index is not None
+                            and self.map_signs is not None
+                            and self.map_offsets is not None
+                        ):
+                            lim = min(len(self.map_index), n)
+                            for i in range(lim):
+                                leader_idx = int(self.map_index[i])
+                                sign = float(self.map_signs[i])
+                                if leader_idx < n and abs(sign) > 1e-6:
+                                    q_mirror_target[leader_idx] = (
+                                        q_ur5e[i] - self.map_offsets[i]
+                                    ) / sign
+                                    dq_mirror_target[leader_idx] = dq_ur5e[i] / sign
+                    except Exception:
+                        pass
+                else:
+                    q_mirror_target = q_ref_leader.copy()
+                    dq_mirror_target = dq_ref_leader.copy()
+
+                tau_force_feedback = np.zeros(n, dtype=float)
+                wrench_ur5e = np.zeros(6, dtype=float)
+                if enable_wrench and force_feedback_gain > 0.0:
+                    try:
+                        wrench_ur5e, tcp_jt = self.get_follower_tcp_force()
+                        if self.map_index is not None and self.map_signs is not None:
+                            lim = min(len(self.map_index), n)
+                            for i in range(lim):
+                                leader_idx = int(self.map_index[i])
+                                sign = float(self.map_signs[i])
+                                if leader_idx < n and abs(sign) > 1e-6:
+                                    tau_force_feedback[leader_idx] = (
+                                        force_feedback_gain * tcp_jt[i] / sign
+                                    )
+                    except Exception:
+                        pass
+
+                tau_gravity = self.gravity_compensation(q_leader, dq_leader)
+                tau_friction = self.friction_compensation(dq_leader)
+                tau_limit, torque_gripper = self.joint_limit_barrier(
+                    q_leader, dq_leader, float(grip), float(grip_vel)
+                )
+                tau_damping = np.zeros(n, dtype=float)
+                if self.gravity_comp_velocity_damping != 0.0:
+                    tau_damping = -self.gravity_comp_velocity_damping * dq_leader
+
+                tau_mirror = (
+                    kp_mirror * (q_mirror_target - q_leader)
+                    + kd_mirror * (dq_mirror_target - dq_leader)
+                )
+
+                tau_cmd_total = (
+                    tau_gravity
+                    + tau_friction
+                    + tau_limit
+                    + tau_damping
+                    + tau_mirror
+                    + tau_force_feedback
+                )
+
+                self.set_leader_joint_torque(tau_cmd_total, float(torque_gripper))
+
+                tau_ext_human = yamane.update(
+                    q=q_leader,
+                    dq=dq_leader,
+                    tau_cmd=tau_cmd_total,
+                )
+
+                tau_ext_db = np.where(
+                    np.abs(tau_ext_human) > deadband_tau,
+                    tau_ext_human - np.sign(tau_ext_human) * deadband_tau,
+                    0.0,
+                )
+
+                if velocity_gate_threshold > 1e-6:
+                    speed = float(np.linalg.norm(dq_leader))
+                    v_gate = 1.0 / np.sqrt(1.0 + (speed / velocity_gate_threshold) ** 2)
+                else:
+                    v_gate = 1.0
+                tau_ext_gated = tau_ext_db * v_gate
+
+                k_virtual_safe = K_virtual if abs(K_virtual) > 1e-6 else 1.0
+                delta_leader_new = tau_ext_gated / k_virtual_safe
+
+                if self.map_signs is not None and self.map_index is not None:
+                    delta_follower = self.map_signs * delta_leader_new[self.map_index] * correction_gain
+                else:
+                    delta_follower = delta_leader_new * correction_gain
+
+                q_cmd_ur5e = q_ref_follower + delta_follower
+
+                follower.command_joint_state_impedance(
+                    target_joints=q_cmd_ur5e,
+                    target_velocities=dq_ref_follower,
+                    kp=kp_ur5e,
+                    kd=kd_ur5e,
+                )
+
+                if has_gripper:
+                    gripper_action = self._build_follower_action(q_leader, float(grip))
+                    if len(gripper_action) > 6:
+                        with self._gripper_cmd_lock:
+                            self._latest_gripper_pos = int(
+                                np.clip(gripper_action[-1] * 255, 0, 255)
+                            )
+
+                q_follower = np.zeros(n, dtype=float)
+                dq_follower = np.zeros(n, dtype=float)
+                follower_gripper = 0.0
+                try:
+                    q_follower, dq_follower = self.get_follower_arm_state()
+                    q_follower = np.asarray(q_follower[:n], dtype=float)
+                    dq_follower = np.asarray(dq_follower[:n], dtype=float)
+                except Exception:
+                    pass
+                try:
+                    gripper_fb = self.get_follower_gripper_feedback()
+                    follower_gripper = float(gripper_fb.get("position", 0.0))
+                except Exception:
+                    pass
+
+                is_corr = detector.update(
+                    tau_ext=tau_ext_human,
+                    q_c=q_leader,
+                    q_ref=q_ref_leader,
+                    dq_c=dq_leader,
+                    wrench=wrench_ur5e if enable_wrench else None,
+                )
+
+                with cache_lock:
+                    state_cache["t_mono"] = t_mono
+                    state_cache["q_leader"] = q_leader.copy()
+                    state_cache["dq_leader"] = dq_leader.copy()
+                    state_cache["grip"] = float(grip)
+                    state_cache["grip_raw"] = float(grip_raw)
+                    state_cache["grip_vel"] = float(grip_vel)
+                    state_cache["tau_ext"] = tau_ext_human.copy()
+                    state_cache["q_ref"] = q_ref_leader.copy()
+                    state_cache["dq_ref"] = dq_ref_leader.copy()
+                    state_cache["is_stale"] = bool(is_stale)
+                    state_cache["is_correction"] = bool(is_corr)
+                    state_cache["detector_diag"] = detector.get_diagnostics()
+                    state_cache["policy_action"] = np.concatenate(
+                        [q_ref_follower, np.array([float(grip)], dtype=float)]
+                    )
+                    state_cache["compliant_action"] = np.concatenate(
+                        [q_cmd_ur5e, np.array([float(grip)], dtype=float)]
+                    )
+                    state_cache["q_follower"] = q_follower.copy()
+                    state_cache["dq_follower"] = dq_follower.copy()
+                    state_cache["gripper_follower"] = float(follower_gripper)
+                    state_cache["wrench_ur5e"] = wrench_ur5e.copy()
+                    state_cache["delta_human"] = delta_follower.copy()
+                    state_cache["q_cmd_ur5e"] = q_cmd_ur5e.copy()
+                    state_cache["epsilon_ur5e"] = (q_follower - q_cmd_ur5e).copy()
+                    state_cache["tau_ext_gated"] = tau_ext_gated.copy()
+                    state_cache["tau_force_feedback"] = tau_force_feedback.copy()
+                    state_cache["q_mirror_target"] = q_mirror_target.copy()
+                    state_cache["tau_cmd_gello"] = tau_cmd_total.copy()
+                    state_cache["tau_mirror"] = tau_mirror.copy()
+                    state_cache["velocity_gate"] = float(v_gate)
+                    state_cache["mirror_source"] = mirror_source
+                    state_cache["updated"] = True
+
+                loop_count += 1
+
+            except Exception as e:
+                if loop_count % 500 == 0:
+                    print(f"[4-CH] Loop error: {e}")
+
+            elapsed = time.perf_counter() - t0
+            sleep_s = rate_dt - elapsed
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            else:
+                overrun_count += 1
+
+        try:
+            follower.robot.stopJ(2.0)
+        except Exception:
+            pass
+
+        total_time = time.perf_counter() - start_time
+        actual_hz = loop_count / max(total_time, 1e-6)
+        print("\n[4-CHANNEL] Loop stopped:")
         print(f"  Loops: {loop_count}, Time: {total_time:.1f}s, Rate: {actual_hz:.1f}Hz")
         print(f"  Overruns: {overrun_count} ({100 * overrun_count / max(loop_count, 1):.1f}%)")
 
@@ -2225,13 +2588,15 @@ class FACTRGravityCompensation:
         self,
         q_ref_policy: npt.NDArray[np.float64],
         dq_ref_policy: Optional[npt.NDArray[np.float64]] = None,
+        ddq_ref_policy: Optional[npt.NDArray[np.float64]] = None,
+        compensation_mode: str = "none",
         leader_state: tuple[
             npt.NDArray[np.float64],
             npt.NDArray[np.float64],
             float,
             float,
         ] | None = None,
-    ) -> None:
+    ) -> npt.NDArray[np.float64]:
         """Apply a soft policy-imposed impedance on the GELLO leader.
 
         The policy provides leader-frame position and velocity references. The
@@ -2246,24 +2611,30 @@ class FACTRGravityCompensation:
             leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel = leader_state
 
         q_ref_policy = np.asarray(q_ref_policy, dtype=float)
-        if q_ref_policy.shape[0] < self.num_arm_joints:
+        n = self.num_arm_joints
+        if q_ref_policy.shape[0] < n:
             raise ValueError(
-                f"q_ref_policy must have at least {self.num_arm_joints} arm joints, got {q_ref_policy.shape}"
+                f"q_ref_policy must have at least {n} arm joints, got {q_ref_policy.shape}"
             )
 
+        q_ref = q_ref_policy[:n]
         if dq_ref_policy is not None:
-            dq_ref = np.asarray(dq_ref_policy, dtype=float)[: self.num_arm_joints]
+            dq_ref = np.asarray(dq_ref_policy, dtype=float)[:n]
         else:
-            dq_ref = np.zeros(self.num_arm_joints)
+            dq_ref = np.zeros(n)
+        if ddq_ref_policy is not None:
+            ddq_ref = np.asarray(ddq_ref_policy, dtype=float)[:n]
+        else:
+            ddq_ref = np.zeros(n)
 
-        torque_arm = np.zeros(self.num_arm_joints)
+        torque_arm = np.zeros(n)
 
         tau_limit, torque_gripper = self.joint_limit_barrier(
             leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel
         )
         torque_arm += tau_limit
 
-        if self.enable_gravity_comp:
+        if self.enable_gravity_comp and compensation_mode != "computed_torque":
             tau_gravity = self.gravity_compensation(leader_arm_pos, leader_arm_vel)
             torque_arm += tau_gravity
 
@@ -2273,14 +2644,54 @@ class FACTRGravityCompensation:
             if self.gravity_comp_velocity_damping != 0.0:
                 torque_arm += -self.gravity_comp_velocity_damping * leader_arm_vel
 
-        tau_policy = (
-            self.policy_impedance_kp * (q_ref_policy[: self.num_arm_joints] - leader_arm_pos)
-            + self.policy_impedance_kd * (dq_ref - leader_arm_vel)
-        )
+        kp = float(self.policy_impedance_kp)
+        kd = float(self.policy_impedance_kd)
+
+        if compensation_mode == "none":
+            tau_policy = kp * (q_ref - leader_arm_pos) - kd * leader_arm_vel
+        elif compensation_mode == "velocity_ff":
+            tau_policy = kp * (q_ref - leader_arm_pos) + kd * (dq_ref - leader_arm_vel)
+        elif compensation_mode == "feedforward":
+            if abs(kp) < 1e-6:
+                raise ValueError("policy_impedance_kp must be non-zero for feedforward")
+            pin_nq = int(getattr(self, "_pin_nq", len(leader_arm_pos)))
+            q_full = np.zeros((pin_nq,), dtype=float)
+            q_full[:n] = leader_arm_pos[:n]
+            if pin_nq == n + 1:
+                q_full[n] = float(self.gripper_pos)
+            pin.crba(self.pin_model, self.pin_data, q_full)  # type: ignore[attr-defined]
+            m_diag = np.diag(self.pin_data.M)[:n]
+            q_ref_comp = q_ref + (m_diag / kp) * ddq_ref + (kd / kp) * dq_ref
+            tau_policy = kp * (q_ref_comp - leader_arm_pos) + kd * (dq_ref - leader_arm_vel)
+        elif compensation_mode == "computed_torque":
+            pin_nq = int(getattr(self, "_pin_nq", n))
+            pin_nv = int(getattr(self, "_pin_nv", n))
+            q_full_ref = np.zeros((pin_nq,), dtype=float)
+            v_ref = np.zeros((pin_nv,), dtype=float)
+            a_ref = np.zeros((pin_nv,), dtype=float)
+            q_full_ref[:n] = q_ref
+            v_ref[:n] = dq_ref
+            a_ref[:n] = ddq_ref
+            if pin_nq == n + 1:
+                q_full_ref[n] = float(self.gripper_pos)
+            if pin_nv == n + 1:
+                v_ref[n] = float(self._last_gripper_vel)
+            tau_id = pin.rnea(  # type: ignore[attr-defined]
+                self.pin_model,
+                self.pin_data,
+                q_full_ref,
+                v_ref,
+                a_ref,
+            )
+            tau_policy = tau_id[:n] + kp * (q_ref - leader_arm_pos) + kd * (dq_ref - leader_arm_vel)
+            tau_policy += self.friction_compensation(dq_ref)
+        else:
+            raise ValueError(f"Unknown compensation_mode: {compensation_mode}")
         torque_arm += tau_policy
 
-        self._policy_q_ref = q_ref_policy[: self.num_arm_joints].copy()
+        self._policy_q_ref = q_ref.copy()
         self.set_leader_joint_torque(torque_arm, float(torque_gripper))
+        return torque_arm
 
     def joint_limit_barrier(
         self,

@@ -943,6 +943,17 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable CR-DAgger intervention/correction mode.",
     )
+    p.add_argument(
+        "--four-channel",
+        action="store_true",
+        help="Use 4-channel dual-impedance loop instead of standard Phase B.",
+    )
+    p.add_argument(
+        "--mirror-source",
+        choices=["cmd", "actual", "policy"],
+        default=None,
+        help="Override 4-channel mirror source (default: config).",
+    )
     p.add_argument("--config", type=str, default="configs/ur5e_gello_factr_hw_V3.yaml")
     p.add_argument("--mass", type=float, default=1.0)
     p.add_argument("--damping", type=float, default=5.0)
@@ -1129,6 +1140,16 @@ def main() -> int:
                 "gripper_follower": 0.0,
                 "wrench_ur5e": np.zeros(6),
                 "tcp_joint_torques": np.zeros(n),
+                "delta_human": np.zeros(n),
+                "q_cmd_ur5e": np.zeros(n),
+                "epsilon_ur5e": np.zeros(n),
+                "tau_ext_gated": np.zeros(n),
+                "tau_force_feedback": np.zeros(n),
+                "q_mirror_target": np.zeros(n),
+                "tau_cmd_gello": np.zeros(n),
+                "tau_mirror": np.zeros(n),
+                "velocity_gate": 1.0,
+                "mirror_source": "cmd",
             }
 
         camera_names, camera_device_ids, camera_flips = _resolve_camera_config(args)
@@ -1196,6 +1217,12 @@ def main() -> int:
                 "frequency": [float(args.frequency)] * n,
                 "q_hold": q_now.tolist(),
             }
+            if getattr(system, "map_index", None) is not None:
+                policy_config["map_index"] = np.asarray(system.map_index, dtype=int).tolist()
+            if getattr(system, "map_signs", None) is not None:
+                policy_config["map_signs"] = np.asarray(system.map_signs, dtype=float).tolist()
+            if getattr(system, "map_offsets", None) is not None:
+                policy_config["map_offsets"] = np.asarray(system.map_offsets, dtype=float).tolist()
             policy_proc = mp.Process(
                 target=policy_worker,
                 args=(
@@ -1228,21 +1255,44 @@ def main() -> int:
                 raise RuntimeError("Phase B state cache was not initialized")
 
             unified_stop = Event()
-            unified_thread = Thread(
-                target=system._phase_b_unified_loop,
-                args=(
-                    traj_interp,
-                    shi,
-                    detector,
-                    state_cache,
-                    unified_stop,
-                    bool(args.enable_wrench or args.enable_wrench_feedback),
-                ),
-                daemon=True,
-                name="phase-b-unified",
+            use_4ch = bool(args.four_channel) or bool(
+                system.config.get("teleop", {}).get("four_channel", {}).get("enable", False)
             )
+            if use_4ch:
+                if args.mirror_source:
+                    four_ch_cfg = system.config.setdefault("teleop", {}).setdefault("four_channel", {})
+                    four_ch_cfg["mirror_source"] = str(args.mirror_source)
+                unified_thread = Thread(
+                    target=system._phase_b_4channel_loop,
+                    args=(
+                        traj_interp,
+                        detector,
+                        state_cache,
+                        unified_stop,
+                        bool(args.enable_wrench or args.enable_wrench_feedback),
+                    ),
+                    daemon=True,
+                    name="phase-b-4channel",
+                )
+            else:
+                unified_thread = Thread(
+                    target=system._phase_b_unified_loop,
+                    args=(
+                        traj_interp,
+                        shi,
+                        detector,
+                        state_cache,
+                        unified_stop,
+                        bool(args.enable_wrench or args.enable_wrench_feedback),
+                    ),
+                    daemon=True,
+                    name="phase-b-unified",
+                )
             unified_thread.start()
-            print("[PHASE B] Unified control thread started")
+            if use_4ch:
+                print("[PHASE B] 4-channel control thread started")
+            else:
+                print("[PHASE B] Unified control thread started")
         elif system.teleop_enabled and not teleop_started:
             teleop_started = _start_prepared_teleop(system)
             if not teleop_started:

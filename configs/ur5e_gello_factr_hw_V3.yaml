@@ -102,6 +102,17 @@ teleop:
     kd: 12.0                # Velocity damping (Nm*s/rad)
     use_leader_velocity: false  # Use leader velocity in feedforward
 
+  four_channel:
+    enable: false
+    K_virtual: 40.0
+    correction_gain: 1.0
+    force_feedback_gain: 0.3
+    velocity_gate_threshold: 1.5
+    deadband_tau: 0.15
+    mirror_source: "cmd"
+    yamane_K_obs: 50.0
+    yamane_filter_fc: 5.0
+
   robot:
     _target_: gello.robots.ur5e.URRobot
     robot_ip: "172.22.22.2"
