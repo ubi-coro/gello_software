@@ -121,7 +121,7 @@ def _start_prepared_teleop(system: FACTRGravityCompensation) -> bool:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Epsilon tracking test (Phase B style)")
-    p.add_argument("--config", type=str, default="configs/ur5e_gello_factr_hw_V3.yaml")
+    p.add_argument("--config", type=str, default="configs/ur5e_gello_factr_hw_V3_PhaseB.yaml")
     p.add_argument("--duration", type=float, default=30.0, help="0 means run until Ctrl+C")
     p.add_argument("--settle-time", type=float, default=2.0)
     p.add_argument("--max-duration", type=float, default=120.0)

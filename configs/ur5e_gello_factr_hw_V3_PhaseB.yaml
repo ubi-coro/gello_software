@@ -1,0 +1,148 @@
+name: grav_comp_hw
+
+dynamixel:
+  # USB port name given by the command: ls /dev/serial/by-id/
+  dynamixel_port: /dev/ttyDXL_gello
+  baudrate: 4000000
+  # Servo types
+  servo_types: [
+    "XC330_T288_T", "XM430_W350_T", "XM430_W350_T",
+    "XC330_T288_T", "XC330_T288_T", "XC330_T288_T", "XC330_T288_T"
+  ]
+  # Servo joint directions to match that of the leader arm
+  joint_signs: [1, 1, 1, 1, 1, 1, 1]
+  torque_signs: [1, 1, 1, 1, 1, 1, 1]
+
+arm_teleop:
+  # URDF used for creating leader arm dynamics model to compute gravity compensation
+  leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V6/robot.urdf"
+  num_arm_joints: 6
+  arm_joint_limits_max: [6.28318, 3.14159, 7.0, 4.53786, 6.28318, 2.0]
+  arm_joint_limits_min: [3.14159, -1.571, 3.4, 0.0, 3.14159, -1.0]
+  arm_joint_limits_safety_margin: 0.1
+  initialization:
+    # These are your start positions (URDF coordinates) - offsets will be auto-calculated
+    # Target decoded leader pose matching UR reference posture [0, -90, +90, -90, -90, +180] deg
+    calibration_joint_pos: [ 4.53786, 3.14159, 1.57, 0.0, 1.57, 0.0 ]
+    initial_match_joint_pos: [ 4.53786, 3.14159, 1.57, 0.0, 1.57, 0.0 ]
+    # Optional persistent leader offsets (raw -> decoded): q = sign * (raw - offset)
+    # Measured with scripts/gello_get_offset.py (median over multiple runs)
+    joint_offsets: [-4.0544, 0.0, 0.134, 0.0, 0.0, 3.1416]
+    # If true, use joint_offsets above instead of running per-start offset search.
+    use_precomputed_offsets: true
+    # Per-boot turn-index disambiguation on top of permanent offsets (recommended for reproducibility).
+    # Disable to fall back to previous behavior that applies precomputed offsets as-is.
+    turn_disambiguation:
+      enable: true
+    # Set true to block until user manually moves to initial_match_joint_pos
+    enforce_initial_match: false
+    # Warn if calibrated pose differs from calibration_joint_pos by more than this (in rad)
+    # With the improved calibration resolution, this can be much tighter now
+    calibration_sanity_threshold: 0.3  # ~17° (relaxed slightly for manual alignment)
+
+gripper_teleop:
+  # The maximum range (in rad) of the leader gripper trigger
+  actuation_range: 0.8
+
+controller:
+  frequency: 300
+  torque_feedback:
+    enable: true
+    gain: -3.0
+    damping: 0.01
+    motor_scalar: 94.5652173913
+  force_position_feedback:
+    # Force-Position feedback: τ = Kp*(q_follower - q_leader) + Kd*(dq_follower - dq_leader)
+    # This is an alternative to scaled torque_feedback (FACTR style)
+    # Only one should be enabled at a time
+    enable: False
+    kp: 2.0          # Position error stiffness (Nm/rad)
+    kd: 0.01           # Velocity error damping (Nm*s/rad)
+    max_torque: 1.5   # Safety limit per joint (Nm)
+  gravity_comp:
+    enable: True
+    gain: 0.75
+    gain_per_joint: [1.0, 0.8, 1.0, 2.0, 2.0, 1.0]
+    velocity_damping: 0.02
+  null_space_regulation:
+    null_space_joint_target: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    kp: 0.0
+    kd: 0.0
+  static_friction_comp:
+    enable_speed: 0.02 #0.08  # rad/s threshold for dither-based compensation
+    gain: 0.1 # 0.01
+    # Per-joint feedforward friction (estimated from physical behavior recording)
+    friction_feedforward: [0.0, 0.01, 0.015, 0.01, 0.01, 0.005] # [0.0, 0.002, 0.008, 0.002, 0.002, 0.001] # [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    viscous_friction: [0.003, 0.02, 0.001, 0.0, 0.0, 0.0]
+    velocity_deadband: [0.005, 0.01, 0.01, 0.01, 0.01, 0.01]
+  joint_limit_barrier:
+    kp: 0.0 #1.0
+    kd: 0.0 #0.01
+  policy_impedance:
+    kp: 5.0    # Weich genug für Korrekturen
+    kd: 0.5 
+
+  gripper_feedback:
+    enable: False
+    gain: 0.05 # Force-feedback strength for gripper
+    damping: 0.01   # Velocity damping for gripper feedback
+    vel_deadband: 0.02
+    current_deadband: 2
+    max_torque: 0.2
+
+teleop:
+  enable: true
+  use_direct_rtde: true
+  hz: 250
+  wait_for_server_timeout_s: 5.0
+
+  impedance:
+    enable: True           # Use impedance instead of position control
+    kp: 150.0               # Position stiffness (Nm/rad)
+    kd: 12.0                # Velocity damping (Nm*s/rad)
+    use_leader_velocity: false  # Use leader velocity in feedforward
+
+  four_channel:
+    enable: false
+    K_virtual: 40.0
+    correction_gain: 1.0
+    force_feedback_gain: 0.3
+    velocity_gate_threshold: 1.5
+    deadband_tau: 0.15
+    mirror_source: "cmd"
+    yamane_K_obs: 50.0
+    yamane_filter_fc: 5.0
+
+  robot:
+    _target_: gello.robots.ur5e.URRobot
+    robot_ip: "172.22.22.2"
+    no_gripper: true # "true" disables the gripper, but you also need to comment out "gripper_config" below to avoid errors
+    # Torque Filter Configuration (for get_joint_torques_jacobian_calcualted)
+    filter_type: "one_euro"
+    filter_min_cutoff: 1.5  # Lower = more stable when still (anti-jitter)
+    filter_beta: 0.05      # Higher = less lag when moving
+  mapping:
+    # Map leader joints to follower joints
+    index_map: [0, 1, 2, 3, 4, 5]
+    # Signs to align sim/hardware with leader frames
+    signs: [1, 1, -1, 1, 1, 1]
+    # Additional offsets (radians) applied to follower after signs
+    offsets: [-4.5378, -4.7124, 3.1416, -1.5708, -3.1416, 3.1416]
+    # Alignment mode at startup:
+    # - legacy_auto_align: old behavior (offsets = follower - mapped leader)
+    # - turn_disambiguate: preserve configured offsets and only correct by integer 2pi turns
+    alignment_mode: turn_disambiguate
+    # Keep integer-turn correction active even if auto_align is false.
+    turn_disambiguate_offsets: true
+    # Build follower targets with nearest-turn continuity to avoid command jumps.
+    turn_safe_targets: true
+    # For reproducible cross-session mapping keep this false.
+    # Set true + alignment_mode=legacy_auto_align to restore previous startup auto_align behavior.
+    auto_align: false
+  # Explicit gripper config for teleop normalization: [id, open_deg, close_deg]
+  #gripper_config: [7, 197, 155] 
+
+
+logging:
+  enable: false
+  log_dir: "logs"
