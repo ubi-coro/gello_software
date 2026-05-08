@@ -123,6 +123,29 @@ def policy_worker(
             horizon=horizon,
             action_dt=action_dt,
         )
+    elif policy_type == "dummy_taskspace":
+        import pinocchio as pin
+
+        from gello.cr_dagger.policy.dummy_policy import DummyTaskSpacePolicy
+
+        urdf_path = str(policy_config.get("urdf_path", ""))
+        if not urdf_path:
+            raise ValueError("dummy_taskspace requires 'urdf_path' in policy_config")
+
+        pin_model = pin.buildModelFromUrdf(urdf_path)
+        pin_data = pin_model.createData()
+        center = np.array(policy_config.get("center", [0.0] * n_joints))
+        policy = DummyTaskSpacePolicy(
+            pin_model=pin_model,
+            pin_data=pin_data,
+            q_home=center,
+            motion_type=str(policy_config.get("motion_type", "circle")),
+            amplitude=float(policy_config.get("amplitude", 0.08)),
+            frequency=float(policy_config.get("frequency", 0.3)),
+            horizon=horizon,
+            action_dt=action_dt,
+            axis=str(policy_config.get("axis", "xy")),
+        )
     else:
         raise ValueError(f"Unknown policy_type: {policy_type}")
 

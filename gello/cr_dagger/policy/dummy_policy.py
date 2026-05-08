@@ -140,3 +140,119 @@ class DummyMultiJointSinePolicy:
             t_k = float(t_now + k * self.action_dt)
             traj[k] = self.center + self.amplitudes * np.sin(2.0 * np.pi * self.frequencies * t_k)
         return traj
+
+
+class DummyTaskSpacePolicy:
+    """Generate correlated joint references from task-space primitives via IK."""
+
+    def __init__(
+        self,
+        pin_model: object,
+        pin_data: object,
+        q_home: np.ndarray,
+        motion_type: str = "line",
+        amplitude: float = 0.08,
+        frequency: float = 0.3,
+        horizon: int = 32,
+        action_dt: float = 0.1,
+        axis: str = "xy",
+    ):
+        import pinocchio as pin
+
+        self.pin_model = pin_model
+        self.pin_data = pin_data
+        self.q_home = np.asarray(q_home, dtype=float)
+        self.motion_type = str(motion_type)
+        self.amplitude = float(amplitude)
+        self.frequency = float(frequency)
+        self.horizon = int(horizon)
+        self.action_dt = float(action_dt)
+        self.axis = str(axis)
+
+        self._n = int(self.q_home.shape[0])
+        if self.pin_model.nq < self._n:
+            raise ValueError(f"Pinocchio model nq={self.pin_model.nq} is smaller than n_joints={self._n}")
+
+        self._ee_frame_id = int(self.pin_model.nframes - 1)
+
+        q_full = np.zeros(self.pin_model.nq, dtype=float)
+        q_full[: self._n] = self.q_home
+        pin.forwardKinematics(self.pin_model, self.pin_data, q_full)
+        pin.updateFramePlacements(self.pin_model, self.pin_data)
+        home_pose = self.pin_data.oMf[self._ee_frame_id].copy()
+        self._home_pos = home_pose.translation.copy()
+
+        self._q_prev = self.q_home.copy()
+
+    def _task_space_offset(self, t: float) -> np.ndarray:
+        omega = 2.0 * np.pi * self.frequency
+        amp = self.amplitude
+
+        if self.motion_type == "line":
+            dx = amp * np.sin(omega * t)
+            dy = 0.0
+        elif self.motion_type == "circle":
+            dx = amp * np.cos(omega * t) - amp
+            dy = amp * np.sin(omega * t)
+        elif self.motion_type == "figure8":
+            dx = amp * np.sin(omega * t)
+            dy = 0.5 * amp * np.sin(2.0 * omega * t)
+        else:
+            dx = 0.0
+            dy = 0.0
+
+        offset = np.zeros(3, dtype=float)
+        if self.axis == "xy":
+            offset[0], offset[1] = dx, dy
+        elif self.axis == "xz":
+            offset[0], offset[2] = dx, dy
+        elif self.axis == "yz":
+            offset[1], offset[2] = dx, dy
+        else:
+            offset[0], offset[1] = dx, dy
+        return offset
+
+    def _ik_solve(self, target_pos: np.ndarray, q_init: np.ndarray) -> np.ndarray:
+        import pinocchio as pin
+
+        q = np.asarray(q_init, dtype=float).copy()
+        q_full = np.zeros(self.pin_model.nq, dtype=float)
+
+        for _ in range(8):
+            q_full[: self._n] = q
+            pin.forwardKinematics(self.pin_model, self.pin_data, q_full)
+            pin.updateFramePlacements(self.pin_model, self.pin_data)
+
+            current_pos = self.pin_data.oMf[self._ee_frame_id].translation
+            pos_error = target_pos - current_pos
+            if np.linalg.norm(pos_error) < 1e-5:
+                break
+
+            jacobian = pin.computeFrameJacobian(
+                self.pin_model,
+                self.pin_data,
+                q_full,
+                self._ee_frame_id,
+                pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+            )
+            j_pos = jacobian[:3, : self._n]
+            damping = 1e-4
+            jj_t = j_pos @ j_pos.T + damping * np.eye(3)
+            dq = j_pos.T @ np.linalg.solve(jj_t, pos_error)
+            q = q + 0.8 * dq
+
+        return q
+
+    def predict(self, t_now: float) -> np.ndarray:
+        traj = np.zeros((self.horizon, self._n), dtype=float)
+        q_seed = self._q_prev.copy()
+
+        for k in range(self.horizon):
+            t_k = float(t_now + k * self.action_dt)
+            target_pos = self._home_pos + self._task_space_offset(t_k)
+            q_seed = self._ik_solve(target_pos, q_seed)
+            traj[k] = q_seed
+            if k == 0:
+                self._q_prev = q_seed.copy()
+
+        return traj

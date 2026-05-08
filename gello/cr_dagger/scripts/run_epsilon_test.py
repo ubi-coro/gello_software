@@ -127,7 +127,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-duration", type=float, default=120.0)
 
     p.add_argument("--target", choices=["leader", "follower"], default="leader")
-    p.add_argument("--test-mode", choices=["static_hold", "sine", "chirp", "ramp", "multi_joint"], default="sine")
+    p.add_argument(
+        "--test-mode",
+        choices=["static_hold", "sine", "chirp", "ramp", "multi_joint", "taskspace"],
+        default="sine",
+    )
 
     p.add_argument(
         "--four-channel",
@@ -162,6 +166,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--multi-amplitudes", type=str, default=None)
     p.add_argument("--multi-frequencies", type=str, default=None)
 
+    p.add_argument("--taskspace-motion", choices=["line", "circle", "figure8"], default="circle")
+    p.add_argument("--taskspace-amplitude", type=float, default=0.08, help="meters")
+    p.add_argument("--taskspace-axis", choices=["xy", "xz", "yz"], default="xy")
+
     p.add_argument("--horizon", type=int, default=32)
     p.add_argument("--action-dt", type=float, default=0.1)
 
@@ -176,6 +184,8 @@ def _build_policy(
     args: argparse.Namespace,
     n: int,
     q0: np.ndarray,
+    config_path: Path,
+    system_config: dict[str, Any],
 ) -> tuple[str, dict[str, Any]]:
     if args.test_mode == "static_hold":
         return "dummy_hold", {"q_hold": q0.tolist()}
@@ -222,6 +232,18 @@ def _build_policy(
             "center": q0.tolist(),
             "amplitudes": amplitudes.tolist(),
             "frequencies": frequencies.tolist(),
+        }
+
+    if args.test_mode == "taskspace":
+        leader_urdf = str(system_config["arm_teleop"]["leader_urdf"])
+        urdf_path = _resolve_leader_urdf(config_path, leader_urdf)
+        return "dummy_taskspace", {
+            "center": q0.tolist(),
+            "urdf_path": str(urdf_path),
+            "motion_type": str(args.taskspace_motion),
+            "amplitude": float(args.taskspace_amplitude),
+            "frequency": float(args.frequency),
+            "axis": str(args.taskspace_axis),
         }
 
     raise ValueError(f"Unknown test_mode: {args.test_mode}")
@@ -814,7 +836,7 @@ def main() -> int:
             fallback_q=q0.copy(),
         )
 
-        policy_type, policy_config = _build_policy(args, n, q0)
+        policy_type, policy_config = _build_policy(args, n, q0, config_path, system.config)
 
         stop_event = mp.Event()
         policy_proc = mp.Process(
@@ -868,7 +890,7 @@ def main() -> int:
 
         out_dir = Path(args.log_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = int(time.time())
+        timestamp = int(time.monotonic())
         fname = f"epsilon_{target_label}_{args.test_mode}_{timestamp}.npz"
         out_path = out_dir / fname
         metadata = {
@@ -885,6 +907,16 @@ def main() -> int:
             "horizon": int(args.horizon),
             "config": str(config_path),
         }
+        if args.test_mode == "taskspace":
+            metadata.update(
+                {
+                    "taskspace_motion": str(args.taskspace_motion),
+                    "taskspace_amplitude": float(args.taskspace_amplitude),
+                    "taskspace_axis": str(args.taskspace_axis),
+                    "frequency": float(args.frequency),
+                    "urdf_path": str(policy_config.get("urdf_path", "")),
+                }
+            )
         recorder.save(out_path, metadata=metadata)
         print(f"Saved: {out_path}")
         if recorder.dropped_samples:
