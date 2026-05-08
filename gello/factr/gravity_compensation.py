@@ -873,6 +873,44 @@ class FACTRGravityCompensation:
         self.policy_impedance_kp = float(policy_impedance_cfg.get("kp", 5.0))
         self.policy_impedance_kd = float(policy_impedance_cfg.get("kd", 0.5))
         self._policy_q_ref: Optional[npt.NDArray[np.float64]] = None
+        self._dq_filt = np.zeros(self.num_arm_joints, dtype=float)
+        self._tau_cmd_prev = np.zeros(self.num_arm_joints, dtype=float)
+        self._tau_bias = np.zeros(self.num_arm_joints, dtype=float)
+        self._impedance_initialized = False
+
+        def _policy_joint_array(key: str, default: list[float]) -> np.ndarray:
+            value = policy_impedance_cfg.get(key, default)
+            if np.isscalar(value):
+                arr = np.full(self.num_arm_joints, float(value), dtype=float)
+            else:
+                arr = np.asarray(value, dtype=float).reshape(-1)
+                if arr.size == 0:
+                    arr = np.asarray(default, dtype=float).reshape(-1)
+                if arr.size < self.num_arm_joints:
+                    pad_value = float(arr[-1])
+                    arr = np.pad(
+                        arr,
+                        (0, self.num_arm_joints - arr.size),
+                        mode="constant",
+                        constant_values=pad_value,
+                    )
+            return arr[: self.num_arm_joints].astype(float, copy=True)
+
+        self._vel_filter_alpha = float(policy_impedance_cfg.get("vel_filter_alpha", 0.15))
+        self._vel_filter_alpha = float(np.clip(self._vel_filter_alpha, 0.0, 1.0))
+        self._tau_slew_rate = _policy_joint_array(
+            "tau_slew_rate",
+            [0.5, 1.0, 1.0, 0.3, 0.3, 0.2],
+        )
+        self._tau_max_pd = _policy_joint_array(
+            "tau_max_pd",
+            [1.2, 2.0, 2.0, 0.8, 0.8, 0.5],
+        )
+        self._bias_alpha = float(policy_impedance_cfg.get("bias_alpha", 0.001))
+        self._bias_max = _policy_joint_array(
+            "bias_max",
+            [0.05, 0.10, 0.10, 0.03, 0.03, 0.02],
+        )
 
         teleop_cfg = self.config.get("teleop", {})
         if isinstance(teleop_cfg, dict):
@@ -2597,12 +2635,7 @@ class FACTRGravityCompensation:
             float,
         ] | None = None,
     ) -> npt.NDArray[np.float64]:
-        """Apply a soft policy-imposed impedance on the GELLO leader.
-
-        The policy provides leader-frame position and velocity references. The
-        controller keeps the leader compliant around that reference while still
-        adding gravity compensation and joint-limit safety torques.
-        """
+        """Apply trajectory-controller-style Phase-B impedance on the GELLO leader."""
         if leader_state is None:
             leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel = (
                 self.get_leader_joint_states()
@@ -2617,6 +2650,8 @@ class FACTRGravityCompensation:
                 f"q_ref_policy must have at least {n} arm joints, got {q_ref_policy.shape}"
             )
 
+        q = np.asarray(leader_arm_pos, dtype=float)[:n]
+        dq_raw = np.asarray(leader_arm_vel, dtype=float)[:n]
         q_ref = q_ref_policy[:n]
         if dq_ref_policy is not None:
             dq_ref = np.asarray(dq_ref_policy, dtype=float)[:n]
@@ -2627,58 +2662,55 @@ class FACTRGravityCompensation:
         else:
             ddq_ref = np.zeros(n)
 
-        torque_arm = np.zeros(n)
+        if not self._impedance_initialized:
+            self._dq_filt = dq_raw.copy()
+            self._tau_cmd_prev = np.zeros(n, dtype=float)
+            self._tau_bias = np.zeros(n, dtype=float)
+            self._impedance_initialized = True
 
-        tau_limit, torque_gripper = self.joint_limit_barrier(
-            leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel
-        )
-        torque_arm += tau_limit
+        alpha = float(self._vel_filter_alpha)
+        self._dq_filt = alpha * dq_raw + (1.0 - alpha) * self._dq_filt
+        dq_filt = self._dq_filt
+
+        tau_ff = np.zeros(n, dtype=float)
 
         if self.enable_gravity_comp and compensation_mode != "computed_torque":
-            tau_gravity = self.gravity_compensation(leader_arm_pos, leader_arm_vel)
-            torque_arm += tau_gravity
+            tau_gravity = self.gravity_compensation(q, dq_filt)
 
-            tau_friction = self.friction_compensation(leader_arm_vel)
-            torque_arm += tau_friction
+            tau_friction = np.zeros(n, dtype=float)
+            for i in range(n):
+                vel = dq_filt[i]
+                if abs(vel) > self.friction_velocity_deadband[i]:
+                    tau_friction[i] += self.friction_feedforward[i] * np.sign(vel)
+                    tau_friction[i] += self.viscous_friction[i] * vel
 
+            tau_damping = np.zeros(n, dtype=float)
             if self.gravity_comp_velocity_damping != 0.0:
-                torque_arm += -self.gravity_comp_velocity_damping * leader_arm_vel
+                tau_damping = -self.gravity_comp_velocity_damping * dq_filt
+
+            tau_ff = tau_gravity + tau_friction + tau_damping
 
         kp = float(self.policy_impedance_kp)
         kd = float(self.policy_impedance_kd)
 
-        _POSITION_DEADBAND = 0.012
+        pos_error = q_ref - q
 
         if compensation_mode == "none":
-            pos_error = q_ref - leader_arm_pos
-            pos_error_db = np.where(
-                np.abs(pos_error) > _POSITION_DEADBAND,
-                pos_error- np.sign(pos_error) * _POSITION_DEADBAND,
-                0.0,
-            )
-            # tau_policy = kp * (q_ref - leader_arm_pos) - kd * leader_arm_vel
-            tau_policy = kp * pos_error_db - kd * leader_arm_vel
+            tau_policy = kp * pos_error - kd * dq_filt
         elif compensation_mode == "velocity_ff":
-            pos_error = q_ref - leader_arm_pos
-            pos_error_db = np.where(
-                np.abs(pos_error) > _POSITION_DEADBAND,
-                pos_error- np.sign(pos_error) * _POSITION_DEADBAND,
-                0.0,
-            )
-            # tau_policy = kp * (q_ref - leader_arm_pos) + kd * (dq_ref - leader_arm_vel)
-            tau_policy = kp * pos_error_db + kd * (dq_ref - leader_arm_vel)
+            tau_policy = kp * pos_error + kd * (dq_ref - dq_filt)
         elif compensation_mode == "feedforward":
             if abs(kp) < 1e-6:
                 raise ValueError("policy_impedance_kp must be non-zero for feedforward")
-            pin_nq = int(getattr(self, "_pin_nq", len(leader_arm_pos)))
+            pin_nq = int(getattr(self, "_pin_nq", len(q)))
             q_full = np.zeros((pin_nq,), dtype=float)
-            q_full[:n] = leader_arm_pos[:n]
+            q_full[:n] = q[:n]
             if pin_nq == n + 1:
                 q_full[n] = float(self.gripper_pos)
             pin.crba(self.pin_model, self.pin_data, q_full)  # type: ignore[attr-defined]
             m_diag = np.diag(self.pin_data.M)[:n]
             q_ref_comp = q_ref + (m_diag / kp) * ddq_ref + (kd / kp) * dq_ref
-            tau_policy = kp * (q_ref_comp - leader_arm_pos) + kd * (dq_ref - leader_arm_vel)
+            tau_policy = kp * (q_ref_comp - q) + kd * (dq_ref - dq_filt)
         elif compensation_mode == "computed_torque":
             pin_nq = int(getattr(self, "_pin_nq", n))
             pin_nv = int(getattr(self, "_pin_nv", n))
@@ -2699,11 +2731,41 @@ class FACTRGravityCompensation:
                 v_ref,
                 a_ref,
             )
-            tau_policy = tau_id[:n] + kp * (q_ref - leader_arm_pos) + kd * (dq_ref - leader_arm_vel)
-            tau_policy += self.friction_compensation(dq_ref)
+            tau_friction = np.zeros(n, dtype=float)
+            for i in range(n):
+                vel = dq_filt[i]
+                if abs(vel) > self.friction_velocity_deadband[i]:
+                    tau_friction[i] += self.friction_feedforward[i] * np.sign(vel)
+                    tau_friction[i] += self.viscous_friction[i] * vel
+            tau_damping = np.zeros(n, dtype=float)
+            if self.gravity_comp_velocity_damping != 0.0:
+                tau_damping = -self.gravity_comp_velocity_damping * dq_filt
+            tau_ff = tau_id[:n] + tau_friction + tau_damping
+            tau_policy = kp * pos_error + kd * (dq_ref - dq_filt)
         else:
             raise ValueError(f"Unknown compensation_mode: {compensation_mode}")
-        torque_arm += tau_policy
+
+        if np.max(np.abs(dq_filt)) < 0.1:
+            self._tau_bias += self._bias_alpha * pos_error
+            self._tau_bias = np.clip(self._tau_bias, -self._bias_max, self._bias_max)
+        tau_policy += self._tau_bias
+        tau_policy = np.clip(tau_policy, -self._tau_max_pd, self._tau_max_pd)
+
+        torque_arm = tau_ff + tau_policy
+
+        tau_limit, torque_gripper = self.joint_limit_barrier(
+            q, dq_filt, float(leader_gripper_pos), float(leader_gripper_vel)
+        )
+        torque_arm += tau_limit
+
+        tau_slew_max_step = self._tau_slew_rate * float(self.dt)
+        delta_tau = np.clip(
+            torque_arm - self._tau_cmd_prev,
+            -tau_slew_max_step,
+            tau_slew_max_step,
+        )
+        torque_arm = self._tau_cmd_prev + delta_tau
+        self._tau_cmd_prev = torque_arm.copy()
 
         self._policy_q_ref = q_ref.copy()
         self.set_leader_joint_torque(torque_arm, float(torque_gripper))

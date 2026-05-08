@@ -81,6 +81,11 @@ controller:
   policy_impedance:
     kp: 5.0    # Weich genug für Korrekturen
     kd: 0.5 
+    vel_filter_alpha: 0.15
+    tau_slew_rate: [0.5, 1.0, 1.0, 0.3, 0.3, 0.2]
+    tau_max_pd: [1.2, 2.0, 2.0, 0.8, 0.8, 0.5]
+    bias_alpha: 0.001
+    bias_max: [0.05, 0.10, 0.10, 0.03, 0.03, 0.02]
 
   gripper_feedback:
     enable: False
