@@ -27,7 +27,7 @@ arm_teleop:
     initial_match_joint_pos: [ 4.53786, 3.14159, 1.57, 0.0, 1.57, 0.0 ]
     # Optional persistent leader offsets (raw -> decoded): q = sign * (raw - offset)
     # Measured with scripts/gello_get_offset.py (median over multiple runs)
-    joint_offsets: [-4.0544, 0.0, 0.134, 0.0, 0.0, 3.1416]
+    joint_offsets: [-0.0593, 0.0, 0.134, 0.0, 0.0, 3.1416]
     # If true, use joint_offsets above instead of running per-start offset search.
     use_precomputed_offsets: true
     # Per-boot turn-index disambiguation on top of permanent offsets (recommended for reproducibility).
@@ -69,10 +69,10 @@ controller:
     kp: 0.0
     kd: 0.0
   static_friction_comp:
-    enable_speed: 0.02 #0.08  # rad/s threshold for dither-based compensation
-    gain: 0.1 # 0.01
+    enable_speed: 0.0 #0.08  # rad/s threshold for dither-based compensation
+    gain: 0.0 # 0.01
     # Per-joint feedforward friction (estimated from physical behavior recording)
-    friction_feedforward: [0.0, 0.01, 0.015, 0.01, 0.01, 0.005] # [0.0, 0.002, 0.008, 0.002, 0.002, 0.001] # [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    friction_feedforward: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0] # [0.0, 0.01, 0.015, 0.01, 0.01, 0.005] # [0.0, 0.002, 0.008, 0.002, 0.002, 0.001] #
     viscous_friction: [0.003, 0.02, 0.001, 0.0, 0.0, 0.0]
     velocity_deadband: [0.005, 0.01, 0.01, 0.01, 0.01, 0.01]
   joint_limit_barrier:
@@ -91,7 +91,7 @@ controller:
     max_torque: 0.2
 
 teleop:
-  enable: true
+  enable: false
   use_direct_rtde: true
   hz: 250
   wait_for_server_timeout_s: 5.0

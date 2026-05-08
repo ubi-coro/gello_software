@@ -2647,10 +2647,26 @@ class FACTRGravityCompensation:
         kp = float(self.policy_impedance_kp)
         kd = float(self.policy_impedance_kd)
 
+        _POSITION_DEADBAND = 0.012
+
         if compensation_mode == "none":
-            tau_policy = kp * (q_ref - leader_arm_pos) - kd * leader_arm_vel
+            pos_error = q_ref - leader_arm_pos
+            pos_error_db = np.where(
+                np.abs(pos_error) > _POSITION_DEADBAND,
+                pos_error- np.sign(pos_error) * _POSITION_DEADBAND,
+                0.0,
+            )
+            # tau_policy = kp * (q_ref - leader_arm_pos) - kd * leader_arm_vel
+            tau_policy = kp * pos_error_db - kd * leader_arm_vel
         elif compensation_mode == "velocity_ff":
-            tau_policy = kp * (q_ref - leader_arm_pos) + kd * (dq_ref - leader_arm_vel)
+            pos_error = q_ref - leader_arm_pos
+            pos_error_db = np.where(
+                np.abs(pos_error) > _POSITION_DEADBAND,
+                pos_error- np.sign(pos_error) * _POSITION_DEADBAND,
+                0.0,
+            )
+            # tau_policy = kp * (q_ref - leader_arm_pos) + kd * (dq_ref - leader_arm_vel)
+            tau_policy = kp * pos_error_db + kd * (dq_ref - leader_arm_vel)
         elif compensation_mode == "feedforward":
             if abs(kp) < 1e-6:
                 raise ValueError("policy_impedance_kp must be non-zero for feedforward")
