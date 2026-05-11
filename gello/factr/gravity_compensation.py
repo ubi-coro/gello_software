@@ -2771,6 +2771,41 @@ class FACTRGravityCompensation:
         self.set_leader_joint_torque(torque_arm, float(torque_gripper))
         return torque_arm
 
+    def separate_contact_torque_components(
+        self,
+        tau_model: npt.NDArray[np.float64],
+        tau_ext_shi: Optional[npt.NDArray[np.float64]] = None,
+        tau_meas: Optional[npt.NDArray[np.float64]] = None,
+    ) -> Dict[str, npt.NDArray[np.float64]]:
+        """Return explicit model/measured/residual torque components.
+
+        ``tau_model`` is the expected actuator-side torque from the active
+        controller and model. ``tau_meas`` should be the current-derived motor
+        output torque when available. If only Shi's external estimate is
+        available, the measured torque is reconstructed as model + estimate.
+        The residual is the only component that should be treated as a contact
+        hypothesis by higher-level CR-DAgger logic.
+        """
+        n = self.num_arm_joints
+        model = np.asarray(tau_model, dtype=float)[:n]
+        if tau_ext_shi is None:
+            shi = np.zeros(n, dtype=float)
+        else:
+            shi = np.asarray(tau_ext_shi, dtype=float)[:n]
+
+        if tau_meas is None:
+            measured = model + shi
+            residual = shi.copy()
+        else:
+            measured = np.asarray(tau_meas, dtype=float)[:n]
+            residual = measured - model
+
+        return {
+            "tau_model": model.copy(),
+            "tau_meas": measured.copy(),
+            "tau_residual": residual.copy(),
+        }
+
     def joint_limit_barrier(
         self,
         arm_joint_pos: npt.NDArray[np.float64],

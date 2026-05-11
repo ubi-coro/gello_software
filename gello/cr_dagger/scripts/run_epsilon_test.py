@@ -98,6 +98,95 @@ def _expand_list(values: list[float], n: int, fill: float = 0.0) -> np.ndarray:
     return np.asarray(values[:n], dtype=float)
 
 
+class ContactGate:
+    """Lightweight online gate for contact hypotheses from residual torque."""
+
+    NO_CONTACT = 0.0
+    POSSIBLE_CONTACT = 1.0
+    CONFIRMED_CONTACT = 2.0
+    CORRECTION_ACTIVE = 3.0
+
+    def __init__(
+        self,
+        n_joints: int,
+        residual_low: float = 0.15,
+        residual_high: float = 0.45,
+        accel_gate: float = 8.0,
+        window: int = 8,
+    ):
+        self.residual_low = float(residual_low)
+        self.residual_high = max(float(residual_high), float(residual_low) + 1e-6)
+        self.accel_gate = max(float(accel_gate), 1e-6)
+        self.sign_hist = np.zeros((max(int(window), 1), int(n_joints)), dtype=float)
+        self.idx = 0
+        self.count = 0
+
+    def update(
+        self,
+        tau_residual: np.ndarray,
+        ddq_ref: np.ndarray,
+        correction_active: bool = False,
+    ) -> tuple[float, float]:
+        residual = np.asarray(tau_residual, dtype=float)
+        self.sign_hist[self.idx] = np.sign(residual)
+        self.idx = (self.idx + 1) % self.sign_hist.shape[0]
+        self.count = min(self.count + 1, self.sign_hist.shape[0])
+
+        mag = float(np.linalg.norm(residual))
+        mag_prob = np.clip(
+            (mag - self.residual_low) / (self.residual_high - self.residual_low),
+            0.0,
+            1.0,
+        )
+        ddq_norm = float(np.linalg.norm(ddq_ref))
+        motion_gate = 1.0 / np.sqrt(1.0 + (ddq_norm / self.accel_gate) ** 2)
+
+        hist = self.sign_hist[: self.count]
+        if self.count < 2 or mag <= self.residual_low:
+            consistency = 0.0
+        else:
+            consistency = float(np.max(np.abs(np.sum(hist, axis=0))) / self.count)
+
+        probability = float(np.clip(mag_prob * motion_gate * consistency, 0.0, 1.0))
+        if correction_active and probability >= 0.6:
+            state = self.CORRECTION_ACTIVE
+        elif probability >= 0.6:
+            state = self.CONFIRMED_CONTACT
+        elif probability >= 0.25:
+            state = self.POSSIBLE_CONTACT
+        else:
+            state = self.NO_CONTACT
+        return probability, state
+
+
+def _shi_torque_components(
+    system: FACTRGravityCompensation,
+    shi: Optional[MinimalistTorqueEstimator],
+    q: np.ndarray,
+    dq: np.ndarray,
+    currents_arm: Optional[np.ndarray],
+    tau_model: np.ndarray,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    n = int(system.num_arm_joints)
+    tau_ext = np.zeros(n, dtype=float)
+    tau_meas = None
+
+    if shi is not None and currents_arm is not None:
+        try:
+            tau_meas = shi.get_raw_motor_torque(dq, currents_arm)
+            tau_ext = shi.update(q, dq, currents_arm)
+        except Exception:
+            tau_ext = np.zeros(n, dtype=float)
+            tau_meas = None
+
+    components = system.separate_contact_torque_components(
+        tau_model=tau_model,
+        tau_ext_shi=tau_ext,
+        tau_meas=tau_meas,
+    )
+    return tau_ext, components
+
+
 def _start_prepared_teleop(system: FACTRGravityCompensation) -> bool:
     if not system.teleop_enabled or not system.teleop_prepared:
         return False
@@ -128,6 +217,18 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--target", choices=["leader", "follower"], default="leader")
     p.add_argument(
+        "--mode",
+        choices=[
+            "leader_tracking",
+            "leader_admittance",
+            "four_channel",
+            "follower_tracking",
+            "observer_only",
+        ],
+        default=None,
+        help="Architecture mode. If omitted, legacy --target/--four-channel flags are used.",
+    )
+    p.add_argument(
         "--test-mode",
         choices=["static_hold", "sine", "chirp", "ramp", "multi_joint", "taskspace"],
         default="sine",
@@ -140,14 +241,23 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--mirror-source",
-        choices=["cmd", "actual", "policy"],
+        choices=["cmd", "actual", "policy", "blend"],
         default=None,
         help="Override 4-channel mirror source (default: config).",
     )
+    p.add_argument("--mirror-blend-cmd", type=float, default=0.5)
+    p.add_argument("--mirror-blend-actual", type=float, default=0.3)
+    p.add_argument("--mirror-blend-policy", type=float, default=0.2)
 
     p.add_argument("--compensation", choices=["none", "velocity_ff", "feedforward", "computed_torque"], default="none")
     p.add_argument("--kp", type=float, default=5.0)
     p.add_argument("--kd", type=float, default=0.5)
+
+    p.add_argument("--adm-mass", type=float, default=1.0)
+    p.add_argument("--adm-damp", type=float, default=8.0)
+    p.add_argument("--adm-stiff", type=float, default=25.0)
+    p.add_argument("--adm-leak", type=float, default=0.02)
+    p.add_argument("--adm-delta-max", type=float, default=0.25)
 
     p.add_argument("--follower-kp", type=float, default=150.0)
     p.add_argument("--follower-kd", type=float, default=12.0)
@@ -178,6 +288,22 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--no-shi", action="store_true", help="Skip Shi torque estimator (records zeros)")
 
     return p.parse_args()
+
+
+def _resolve_arch_mode(args: argparse.Namespace) -> str:
+    if args.mode is not None:
+        if args.mode == "observer_only":
+            print(
+                "[WARN] observer_only is currently an alias for follower_tracking; "
+                "no sensor-only correction path is enabled yet"
+            )
+            return "follower_tracking"
+        return str(args.mode)
+    if args.four_channel:
+        return "four_channel"
+    if args.target == "follower":
+        return "follower_tracking"
+    return "leader_tracking"
 
 
 def _build_policy(
@@ -288,6 +414,7 @@ def _run_leader_mode(
 
     t_start = time.monotonic()
     last_warn = 0.0
+    contact_gate = ContactGate(n)
 
     while True:
         loop_t0 = time.perf_counter()
@@ -337,12 +464,18 @@ def _run_leader_mode(
             leader_state=(q, dq, float(grip), float(grip_vel)),
         )
 
-        tau_ext = np.zeros(n)
-        if shi is not None and currents_arm is not None:
-            try:
-                tau_ext = shi.update(q, dq, currents_arm)
-            except Exception:
-                tau_ext = np.zeros(n)
+        tau_ext, tau_components = _shi_torque_components(
+            system=system,
+            shi=shi,
+            q=q,
+            dq=dq,
+            currents_arm=currents_arm,
+            tau_model=tau_cmd,
+        )
+        contact_probability, contact_state = contact_gate.update(
+            tau_components["tau_residual"],
+            ddq_ref,
+        )
 
         q_follower = np.zeros(n)
         dq_follower = np.zeros(n)
@@ -360,10 +493,19 @@ def _run_leader_mode(
             ddq_ref=ddq_ref,
             q_leader=q,
             dq_leader=dq,
+            q_cmd_leader=q_ref,
+            q_c_leader=q_ref,
             q_follower=q_follower,
             dq_follower=dq_follower,
+            q_cmd_follower=np.full(n, np.nan),
+            delta_corr=np.zeros(n),
             tau_cmd=tau_cmd,
             tau_ext_shi=tau_ext,
+            tau_model=tau_components["tau_model"],
+            tau_meas=tau_components["tau_meas"],
+            tau_residual=tau_components["tau_residual"],
+            contact_probability=contact_probability,
+            contact_state=contact_state,
             epsilon=epsilon,
         )
 
@@ -449,6 +591,10 @@ def _run_follower_mode(
             args.follower_kd
         ) * (dq_ref_follower - dq_follower)
         tau_cmd = np.clip(tau_cmd, -tau_max, tau_max)
+        tau_components = system.separate_contact_torque_components(
+            tau_model=tau_cmd,
+            tau_ext_shi=np.zeros(n),
+        )
 
         epsilon = q_follower - q_ref_follower
         recorder.record(
@@ -458,10 +604,19 @@ def _run_follower_mode(
             ddq_ref=ddq_ref,
             q_leader=q_leader,
             dq_leader=dq_leader,
+            q_cmd_leader=q_ref_leader,
+            q_c_leader=q_ref_leader,
             q_follower=q_follower,
             dq_follower=dq_follower,
+            q_cmd_follower=q_ref_follower,
+            delta_corr=np.zeros(n),
             tau_cmd=tau_cmd,
             tau_ext_shi=np.zeros(n),
+            tau_model=tau_components["tau_model"],
+            tau_meas=tau_components["tau_meas"],
+            tau_residual=tau_components["tau_residual"],
+            contact_probability=0.0,
+            contact_state=ContactGate.NO_CONTACT,
             epsilon=epsilon,
         )
 
@@ -484,6 +639,161 @@ def _run_follower_mode(
         follower.robot.stopJ(2.0)
     except Exception:
         pass
+
+
+def _run_leader_admittance_mode(
+    system: FACTRGravityCompensation,
+    args: argparse.Namespace,
+    traj_interp: TrajectoryInterpolator,
+    recorder: EpsilonRecorder,
+    ddq_computer: FilteredDDQComputer,
+    obs_snap: SharedObservationSnapshot,
+    shi: Optional[MinimalistTorqueEstimator],
+) -> None:
+    n = system.num_arm_joints
+    dt = float(system.dt)
+
+    if not args.no_follower:
+        if not _start_prepared_teleop(system):
+            print("[WARN] teleop could not be started; continuing without follower")
+
+    print("[SETTLE] gravity comp warmup")
+    t_settle = time.perf_counter()
+    while time.perf_counter() - t_settle < float(args.settle_time):
+        _leader_gravity_hold(system, dt)
+
+    q0, _, _, _ = system.get_leader_joint_states()
+    q_c = np.asarray(q0[:n], dtype=float).copy()
+    dq_c = np.zeros(n, dtype=float)
+    contact_gate = ContactGate(n)
+    last_tau_residual = np.zeros(n, dtype=float)
+
+    mass = np.full(n, max(float(args.adm_mass), 1e-6), dtype=float)
+    damp = np.full(n, max(float(args.adm_damp), 0.0), dtype=float)
+    stiff = np.full(n, max(float(args.adm_stiff), 0.0), dtype=float)
+    leak = max(float(args.adm_leak), 0.0)
+    delta_max = max(float(args.adm_delta_max), 1e-6)
+
+    t_start = time.monotonic()
+    last_warn = 0.0
+
+    while True:
+        loop_t0 = time.perf_counter()
+        t_mono = time.monotonic()
+
+        if float(args.duration) > 0 and (t_mono - t_start) > float(args.duration):
+            break
+
+        currents_arm = None
+        if system.driver is not None and hasattr(system.driver, "get_positions_velocities_and_currents"):
+            pos_raw, vel_raw, cur_raw = system.driver.get_positions_velocities_and_currents()
+            q = (np.asarray(pos_raw[:n], dtype=float) - system.joint_offsets[:n]) * system.joint_signs[:n]
+            dq = np.asarray(vel_raw[:n], dtype=float) * system.joint_signs[:n]
+
+            if len(pos_raw) > n:
+                grip_raw = float(pos_raw[-1])
+                grip = (grip_raw - float(system.joint_offsets[-1])) * float(system.joint_signs[-1])
+                system.leader_gripper_raw_rad = grip_raw
+            else:
+                grip = 0.0
+                grip_raw = 0.0
+
+            if len(vel_raw) > n:
+                grip_vel = float(vel_raw[-1]) * float(system.joint_signs[-1])
+            else:
+                grip_vel = 0.0
+
+            system.gripper_pos = float(grip)
+            system._last_gripper_vel = float(grip_vel)
+
+            if shi is not None:
+                currents_arm = np.asarray(cur_raw[:n], dtype=float) * system.joint_signs[:n]
+        else:
+            q, dq, grip, grip_vel = system.get_leader_joint_states()
+            if shi is not None and system.driver is not None:
+                currents = system.driver.get_currents()
+                currents_arm = np.asarray(currents[:n], dtype=float) * system.joint_signs[:n]
+
+        q_ref, dq_ref, is_stale = traj_interp.get_reference(t_mono)
+        ddq_ref = ddq_computer.update(dq_ref, t_mono)
+
+        contact_probability, contact_state = contact_gate.update(
+            last_tau_residual,
+            ddq_ref,
+            correction_active=True,
+        )
+
+        tau_contact = last_tau_residual if contact_probability >= 0.6 else np.zeros(n)
+        ddq_c = (tau_contact - damp * dq_c - stiff * (q_c - q_ref)) / mass
+        dq_c = (1.0 - leak * dt) * (dq_c + ddq_c * dt)
+        q_c = q_c + dq_c * dt
+
+        delta = np.clip(q_c - q_ref, -delta_max, delta_max)
+        q_c = q_ref + delta
+
+        tau_cmd = system.control_loop_step_with_policy(
+            q_ref_policy=q_c,
+            dq_ref_policy=dq_c,
+            ddq_ref_policy=ddq_c,
+            compensation_mode=str(args.compensation),
+            leader_state=(q, dq, float(grip), float(grip_vel)),
+        )
+        tau_ext, tau_components = _shi_torque_components(
+            system=system,
+            shi=shi,
+            q=q,
+            dq=dq,
+            currents_arm=currents_arm,
+            tau_model=tau_cmd,
+        )
+        last_tau_residual = tau_components["tau_residual"].copy()
+
+        q_follower = np.zeros(n)
+        dq_follower = np.zeros(n)
+        if system.teleop_enabled:
+            try:
+                q_follower, dq_follower = system.get_follower_arm_state()
+            except Exception:
+                pass
+
+        epsilon = q - q_c
+        recorder.record(
+            t_mono=t_mono,
+            q_ref=q_ref,
+            dq_ref=dq_ref,
+            ddq_ref=ddq_ref,
+            q_leader=q,
+            dq_leader=dq,
+            q_cmd_leader=q_c,
+            q_c_leader=q_c,
+            q_follower=q_follower,
+            dq_follower=dq_follower,
+            q_cmd_follower=np.full(n, np.nan),
+            delta_corr=delta,
+            tau_cmd=tau_cmd,
+            tau_ext_shi=tau_ext,
+            tau_model=tau_components["tau_model"],
+            tau_meas=tau_components["tau_meas"],
+            tau_residual=tau_components["tau_residual"],
+            contact_probability=contact_probability,
+            contact_state=contact_state,
+            epsilon=epsilon,
+        )
+
+        obs_snap.write(
+            timestamp=t_mono,
+            q=q,
+            dq=dq,
+            grip=float(grip),
+            tau_ext=tau_components["tau_residual"],
+            wrench=np.zeros(6),
+        )
+
+        if is_stale and (t_mono - last_warn) > 1.0:
+            last_warn = t_mono
+            print("[WARN] trajectory stale")
+
+        _sleep_remaining(dt, loop_t0)
 
 
 def _run_four_channel_mode(
@@ -625,11 +935,13 @@ def _run_four_channel_mode(
                         delta_leader[leader_idx] = delta_follower[i] / sign
             q_mirror_target = q_ref_leader + delta_leader
             dq_mirror_target = dq_ref_leader.copy()
-        elif mirror_source == "actual":
+        elif mirror_source in ("actual", "blend"):
+            q_actual_target = q_mirror_target.copy()
+            dq_actual_target = dq_mirror_target.copy()
             try:
                 q_ur5e, dq_ur5e = system.get_follower_arm_state()
-                q_mirror_target = np.zeros(n, dtype=float)
-                dq_mirror_target = np.zeros(n, dtype=float)
+                q_actual_target = np.zeros(n, dtype=float)
+                dq_actual_target = np.zeros(n, dtype=float)
                 if (
                     system.map_index is not None
                     and system.map_signs is not None
@@ -640,12 +952,47 @@ def _run_four_channel_mode(
                         leader_idx = int(system.map_index[i])
                         sign = float(system.map_signs[i])
                         if leader_idx < n and abs(sign) > 1e-6:
-                            q_mirror_target[leader_idx] = (
+                            q_actual_target[leader_idx] = (
                                 q_ur5e[i] - system.map_offsets[i]
                             ) / sign
-                            dq_mirror_target[leader_idx] = dq_ur5e[i] / sign
+                            dq_actual_target[leader_idx] = dq_ur5e[i] / sign
             except Exception:
                 pass
+            if mirror_source == "actual":
+                q_mirror_target = q_actual_target
+                dq_mirror_target = dq_actual_target
+            else:
+                delta_leader = np.zeros(n, dtype=float)
+                if system.map_signs is not None and system.map_index is not None:
+                    lim = min(len(system.map_index), len(system.map_signs), n)
+                    for i in range(lim):
+                        leader_idx = int(system.map_index[i])
+                        sign = float(system.map_signs[i])
+                        if leader_idx < n and abs(sign) > 1e-6:
+                            delta_leader[leader_idx] = delta_follower[i] / sign
+                q_cmd_target = q_ref_leader + delta_leader
+                dq_cmd_target = dq_ref_leader.copy()
+                weights = np.array(
+                    [
+                        float(args.mirror_blend_cmd),
+                        float(args.mirror_blend_actual),
+                        float(args.mirror_blend_policy),
+                    ],
+                    dtype=float,
+                )
+                weights = np.maximum(weights, 0.0)
+                denom = float(np.sum(weights))
+                weights = weights / denom if denom > 1e-9 else np.array([1.0, 0.0, 0.0])
+                q_mirror_target = (
+                    weights[0] * q_cmd_target
+                    + weights[1] * q_actual_target
+                    + weights[2] * q_ref_leader
+                )
+                dq_mirror_target = (
+                    weights[0] * dq_cmd_target
+                    + weights[1] * dq_actual_target
+                    + weights[2] * dq_ref_leader
+                )
         else:
             q_mirror_target = q_ref_leader.copy()
             dq_mirror_target = dq_ref_leader.copy()
@@ -692,6 +1039,10 @@ def _run_four_channel_mode(
         system.set_leader_joint_torque(tau_cmd_total, float(torque_gripper))
 
         tau_ext_human = yamane.update(q=q_leader, dq=dq_leader, tau_cmd=tau_cmd_total, dt=dt)
+        tau_components = system.separate_contact_torque_components(
+            tau_model=tau_cmd_total,
+            tau_ext_shi=tau_ext_human,
+        )
 
         tau_ext_db = np.where(
             np.abs(tau_ext_human) > deadband_tau,
@@ -740,10 +1091,23 @@ def _run_four_channel_mode(
             ddq_ref=ddq_ref,
             q_leader=q_leader,
             dq_leader=dq_leader,
+            q_cmd_leader=q_mirror_target,
+            q_c_leader=q_mirror_target,
             q_follower=q_follower,
             dq_follower=dq_follower,
+            q_cmd_follower=q_cmd_ur5e,
+            delta_corr=delta_follower,
             tau_cmd=tau_cmd_total,
             tau_ext_shi=tau_ext_human,
+            tau_model=tau_components["tau_model"],
+            tau_meas=tau_components["tau_meas"],
+            tau_residual=tau_components["tau_residual"],
+            contact_probability=float(np.clip(np.linalg.norm(tau_ext_gated) / 0.45, 0.0, 1.0)),
+            contact_state=(
+                ContactGate.CORRECTION_ACTIVE
+                if np.linalg.norm(delta_follower) > 1e-6
+                else ContactGate.NO_CONTACT
+            ),
             epsilon=epsilon,
         )
 
@@ -770,6 +1134,7 @@ def _run_four_channel_mode(
 
 def main() -> int:
     args = _parse_args()
+    arch_mode = _resolve_arch_mode(args)
 
     config_path = Path(args.config)
     if not config_path.is_absolute():
@@ -866,27 +1231,30 @@ def main() -> int:
         ddq_computer = FilteredDDQComputer(n_joints=n)
 
         shi: Optional[MinimalistTorqueEstimator] = None
-        if not args.no_shi and not args.four_channel:
+        if not args.no_shi and arch_mode in ("leader_tracking", "leader_admittance"):
             try:
                 shi = _build_shi(system, config_path, n)
             except Exception as exc:
                 print(f"[WARN] Shi estimator unavailable: {exc}")
 
-        target_label = args.target
+        target_label = arch_mode
         mirror_source_used = None
-        if args.four_channel:
+        if arch_mode == "four_channel":
             if args.target != "follower":
-                print("[WARN] --four-channel records follower epsilon; ignoring --target leader")
-            target_label = "four_channel"
+                print("[WARN] four_channel records follower epsilon; ignoring --target leader")
             mirror_source_used = str(
                 args.mirror_source
                 or system.config.get("teleop", {}).get("four_channel", {}).get("mirror_source", "cmd")
             )
             _run_four_channel_mode(system, args, traj_interp, recorder, ddq_computer, obs_snap)
-        elif args.target == "leader":
+        elif arch_mode == "leader_tracking":
             _run_leader_mode(system, args, traj_interp, recorder, ddq_computer, obs_snap, shi)
-        else:
+        elif arch_mode == "leader_admittance":
+            _run_leader_admittance_mode(system, args, traj_interp, recorder, ddq_computer, obs_snap, shi)
+        elif arch_mode == "follower_tracking":
             _run_follower_mode(system, args, traj_interp, recorder, ddq_computer, obs_snap)
+        else:
+            raise ValueError(f"Unknown mode: {arch_mode}")
 
         out_dir = Path(args.log_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -894,6 +1262,7 @@ def main() -> int:
         fname = f"epsilon_{target_label}_{args.test_mode}_{timestamp}.npz"
         out_path = out_dir / fname
         metadata = {
+            "mode": arch_mode,
             "target": target_label,
             "test_mode": args.test_mode,
             "compensation": args.compensation,
@@ -901,8 +1270,16 @@ def main() -> int:
             "kd": float(args.kd),
             "follower_kp": float(args.follower_kp),
             "follower_kd": float(args.follower_kd),
-            "four_channel": bool(args.four_channel),
+            "four_channel": bool(arch_mode == "four_channel"),
             "mirror_source": mirror_source_used,
+            "mirror_blend_cmd": float(args.mirror_blend_cmd),
+            "mirror_blend_actual": float(args.mirror_blend_actual),
+            "mirror_blend_policy": float(args.mirror_blend_policy),
+            "adm_mass": float(args.adm_mass),
+            "adm_damp": float(args.adm_damp),
+            "adm_stiff": float(args.adm_stiff),
+            "adm_leak": float(args.adm_leak),
+            "adm_delta_max": float(args.adm_delta_max),
             "action_dt": float(args.action_dt),
             "horizon": int(args.horizon),
             "config": str(config_path),
