@@ -4,6 +4,9 @@ dynamixel:
   # USB port name given by the command: ls /dev/serial/by-id/
   dynamixel_port: /dev/ttyDXL_gello
   baudrate: 4000000
+  # EMA alpha for Dynamixel Present Velocity before control code sees dq.
+  # Higher values reduce phase lag and improve damping response; lower values smooth more but can destabilize damping.
+  velocity_filter_alpha: 0.8
   # Servo types
   servo_types: [
     "XC330_T288_T", "XM430_W350_T", "XM430_W350_T",

@@ -1028,11 +1028,22 @@ class FACTRGravityCompensation:
         # Initialize driver
         joint_ids = (np.arange(self.num_motors) + 1).tolist()
         baudrate = self.config["dynamixel"].get("baudrate", 57600)
+        velocity_filter_alpha = float(
+            self.config["dynamixel"].get("velocity_filter_alpha", 0.5)
+        )
         try:
             self.driver = DynamixelDriver(
-                joint_ids, self.servo_types, self.dynamixel_port, baudrate=baudrate
+                joint_ids,
+                self.servo_types,
+                self.dynamixel_port,
+                baudrate=baudrate,
+                velocity_filter_alpha=velocity_filter_alpha,
             )
-            print(f"Connected to Dynamixel servos on {self.dynamixel_port} with baudrate {baudrate}")
+            print(
+                f"Connected to Dynamixel servos on {self.dynamixel_port} "
+                f"with baudrate {baudrate}"
+            )
+            print(f"Dynamixel velocity filter alpha: {velocity_filter_alpha:.3f}")
         except Exception as e:
             raise RuntimeError(f"Failed to connect to Dynamixel servos: {e}") from e
 
