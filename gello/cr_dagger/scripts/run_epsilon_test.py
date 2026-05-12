@@ -98,6 +98,37 @@ def _expand_list(values: list[float], n: int, fill: float = 0.0) -> np.ndarray:
     return np.asarray(values[:n], dtype=float)
 
 
+def _joint_array_from_value(value: Any, n: int, default: float) -> np.ndarray:
+    if value is None:
+        return np.full(n, float(default), dtype=float)
+    if isinstance(value, str):
+        parsed = _parse_float_list(value)
+        if not parsed:
+            return np.full(n, float(default), dtype=float)
+        arr = np.asarray(parsed, dtype=float).reshape(-1)
+    elif np.isscalar(value):
+        return np.full(n, float(value), dtype=float)
+    else:
+        arr = np.asarray(value, dtype=float).reshape(-1)
+        if arr.size == 0:
+            return np.full(n, float(default), dtype=float)
+
+    if arr.size == 1:
+        return np.full(n, float(arr[0]), dtype=float)
+    if arr.size < n:
+        arr = np.pad(
+            arr,
+            (0, n - arr.size),
+            mode="constant",
+            constant_values=float(arr[-1]),
+        )
+    return arr[:n].astype(float, copy=True)
+
+
+def _format_joint_array(values: np.ndarray) -> str:
+    return "[" + ", ".join(f"{float(v):.3g}" for v in values) + "]"
+
+
 class ContactGate:
     """Lightweight online gate for contact hypotheses from residual torque."""
 
@@ -213,6 +244,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=str, default="configs/ur5e_gello_factr_hw_V3_PhaseB.yaml")
     p.add_argument("--duration", type=float, default=30.0, help="0 means run until Ctrl+C")
     p.add_argument("--settle-time", type=float, default=2.0)
+    p.add_argument(
+        "--impedance-ramp-time",
+        type=float,
+        default=2.0,
+        help="Seconds to ramp leader policy impedance from 0 to configured gains after settle.",
+    )
     p.add_argument("--max-duration", type=float, default=120.0)
 
     p.add_argument("--target", choices=["leader", "follower"], default="leader")
@@ -250,8 +287,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--mirror-blend-policy", type=float, default=0.2)
 
     p.add_argument("--compensation", choices=["none", "velocity_ff", "feedforward", "computed_torque"], default="none")
-    p.add_argument("--kp", type=float, default=5.0)
-    p.add_argument("--kd", type=float, default=0.5)
+    p.add_argument(
+        "--kp",
+        type=str,
+        default=None,
+        help="Leader policy Kp as scalar or comma-separated per-joint list. Default: config.",
+    )
+    p.add_argument(
+        "--kd",
+        type=str,
+        default=None,
+        help="Leader policy Kd as scalar or comma-separated per-joint list. Default: config.",
+    )
 
     p.add_argument("--adm-mass", type=float, default=1.0)
     p.add_argument("--adm-damp", type=float, default=8.0)
@@ -382,13 +429,34 @@ def _sleep_remaining(dt: float, t_start: float) -> None:
         time.sleep(sleep_s)
 
 
-def _leader_gravity_hold(system: FACTRGravityCompensation, dt: float) -> None:
+def _leader_gravity_hold(system: FACTRGravityCompensation, dt: float) -> np.ndarray:
     q, dq, _, _ = system.get_leader_joint_states()
     tau_grav = system.gravity_compensation(q, dq)
     tau_fric = system.friction_compensation(dq)
     tau_damp = -float(system.gravity_comp_velocity_damping) * dq
-    system.set_leader_joint_torque(tau_grav + tau_fric + tau_damp, 0.0)
+    tau_hold = tau_grav + tau_fric + tau_damp
+    system.set_leader_joint_torque(tau_hold, 0.0)
     time.sleep(max(0.0, dt - 0.0005))
+    return np.asarray(tau_hold, dtype=float)
+
+
+def _prime_policy_impedance_from_hold(system: FACTRGravityCompensation) -> np.ndarray:
+    q, dq, _, _ = system.get_leader_joint_states()
+    tau_hold = _leader_gravity_hold(system, float(system.dt))
+    n = int(system.num_arm_joints)
+    system._dq_filt = np.asarray(dq[:n], dtype=float).copy()
+    system._tau_cmd_prev = np.asarray(tau_hold[:n], dtype=float).copy()
+    system._tau_bias = np.zeros(n, dtype=float)
+    system._impedance_initialized = True
+    return np.asarray(q[:n], dtype=float).copy()
+
+
+def _impedance_ramp_scale(args: argparse.Namespace, elapsed_s: float) -> float:
+    ramp_time = max(float(args.impedance_ramp_time), 0.0)
+    if ramp_time <= 1e-9:
+        return 1.0
+    x = float(np.clip(float(elapsed_s) / ramp_time, 0.0, 1.0))
+    return x * x * (3.0 - 2.0 * x)
 
 
 def _run_leader_mode(
@@ -407,10 +475,11 @@ def _run_leader_mode(
         if not _start_prepared_teleop(system):
             print("[WARN] teleop could not be started; continuing without follower")
 
-    print("[SETTLE] gravity comp warmup")
-    t_settle = time.perf_counter()
-    while time.perf_counter() - t_settle < float(args.settle_time):
-        _leader_gravity_hold(system, dt)
+    if float(args.settle_time) > 0.0:
+        print("[SETTLE] gravity comp warmup")
+        t_settle = time.perf_counter()
+        while time.perf_counter() - t_settle < float(args.settle_time):
+            _leader_gravity_hold(system, dt)
 
     t_start = time.monotonic()
     last_warn = 0.0
@@ -455,6 +524,7 @@ def _run_leader_mode(
 
         q_ref, dq_ref, is_stale = traj_interp.get_reference(t_mono)
         ddq_ref = ddq_computer.update(dq_ref, t_mono)
+        system.policy_impedance_scale = _impedance_ramp_scale(args, t_mono - t_start)
 
         tau_cmd = system.control_loop_step_with_policy(
             q_ref_policy=q_ref,
@@ -540,10 +610,11 @@ def _run_follower_mode(
     n = system.num_arm_joints
     dt = float(system.dt)
 
-    print("[SETTLE] gravity comp warmup")
-    t_settle = time.perf_counter()
-    while time.perf_counter() - t_settle < float(args.settle_time):
-        _leader_gravity_hold(system, dt)
+    if float(args.settle_time) > 0.0:
+        print("[SETTLE] gravity comp warmup")
+        t_settle = time.perf_counter()
+        while time.perf_counter() - t_settle < float(args.settle_time):
+            _leader_gravity_hold(system, dt)
 
     t_start = time.monotonic()
     last_warn = 0.0
@@ -657,10 +728,11 @@ def _run_leader_admittance_mode(
         if not _start_prepared_teleop(system):
             print("[WARN] teleop could not be started; continuing without follower")
 
-    print("[SETTLE] gravity comp warmup")
-    t_settle = time.perf_counter()
-    while time.perf_counter() - t_settle < float(args.settle_time):
-        _leader_gravity_hold(system, dt)
+    if float(args.settle_time) > 0.0:
+        print("[SETTLE] gravity comp warmup")
+        t_settle = time.perf_counter()
+        while time.perf_counter() - t_settle < float(args.settle_time):
+            _leader_gravity_hold(system, dt)
 
     q0, _, _, _ = system.get_leader_joint_states()
     q_c = np.asarray(q0[:n], dtype=float).copy()
@@ -730,6 +802,7 @@ def _run_leader_admittance_mode(
 
         delta = np.clip(q_c - q_ref, -delta_max, delta_max)
         q_c = q_ref + delta
+        system.policy_impedance_scale = _impedance_ramp_scale(args, t_mono - t_start)
 
         tau_cmd = system.control_loop_step_with_policy(
             q_ref_policy=q_c,
@@ -825,8 +898,8 @@ def _run_four_channel_mode(
     if args.mirror_source:
         mirror_source = str(args.mirror_source)
 
-    kp_mirror = float(system.policy_impedance_kp)
-    kd_mirror = float(system.policy_impedance_kd)
+    kp_mirror = _joint_array_from_value(system.policy_impedance_kp, n, 5.0)
+    kd_mirror = _joint_array_from_value(system.policy_impedance_kd, n, 0.5)
 
     yamane = GeneralizedMomentumObserver(
         pin_model=system.pin_model,
@@ -860,10 +933,11 @@ def _run_four_channel_mode(
 
         Thread(target=gripper_worker, daemon=True, name="epsilon-4ch-gripper").start()
 
-    print("[SETTLE] gravity comp warmup")
-    t_settle = time.perf_counter()
-    while time.perf_counter() - t_settle < float(args.settle_time):
-        _leader_gravity_hold(system, dt)
+    if float(args.settle_time) > 0.0:
+        print("[SETTLE] gravity comp warmup")
+        t_settle = time.perf_counter()
+        while time.perf_counter() - t_settle < float(args.settle_time):
+            _leader_gravity_hold(system, dt)
 
     t_start = time.monotonic()
     last_warn = 0.0
@@ -1027,6 +1101,7 @@ def _run_four_channel_mode(
             kp_mirror * (q_mirror_target - q_leader)
             + kd_mirror * (dq_mirror_target - dq_leader)
         )
+        tau_mirror *= _impedance_ramp_scale(args, t_mono - t_start)
 
         tau_cmd_total = (
             tau_gravity
@@ -1163,8 +1238,16 @@ def main() -> int:
             raise RuntimeError("Dynamixel driver is not available")
 
         n = int(system.num_arm_joints)
-        system.policy_impedance_kp = float(args.kp)
-        system.policy_impedance_kd = float(args.kd)
+        policy_impedance_cfg = system.config.get("controller", {}).get("policy_impedance", {})
+        kp_value = args.kp if args.kp is not None else policy_impedance_cfg.get("kp", system.policy_impedance_kp)
+        kd_value = args.kd if args.kd is not None else policy_impedance_cfg.get("kd", system.policy_impedance_kd)
+        system.policy_impedance_kp = _joint_array_from_value(kp_value, n, 5.0)
+        system.policy_impedance_kd = _joint_array_from_value(kd_value, n, 0.5)
+        print(
+            "[IMPEDANCE] leader policy "
+            f"Kp={_format_joint_array(system.policy_impedance_kp)} "
+            f"Kd={_format_joint_array(system.policy_impedance_kd)}"
+        )
 
         if system.driver is not None:
             system.driver.set_torque_mode(False)
@@ -1174,7 +1257,15 @@ def main() -> int:
             system.driver.set_torque_mode(True)
             time.sleep(0.05)
 
-        q0, _, _, _ = system.get_leader_joint_states()
+        startup_settle_time = max(float(args.settle_time), 0.0)
+        if startup_settle_time > 0.0:
+            print("[SETTLE] gravity comp warmup before trajectory capture")
+            t_settle = time.perf_counter()
+            while time.perf_counter() - t_settle < startup_settle_time:
+                _leader_gravity_hold(system, float(system.dt))
+
+        q0 = _prime_policy_impedance_from_hold(system)
+        args.settle_time = 0.0
 
         horizon = int(args.horizon)
         traj_buf = SharedTrajectoryBuffer(
@@ -1266,8 +1357,15 @@ def main() -> int:
             "target": target_label,
             "test_mode": args.test_mode,
             "compensation": args.compensation,
-            "kp": float(args.kp),
-            "kd": float(args.kd),
+            "joint_index": int(args.joint_index),
+            "amplitude": float(args.amplitude),
+            "frequency": float(args.frequency),
+            "multi_amplitudes": _parse_float_list(args.multi_amplitudes),
+            "multi_frequencies": _parse_float_list(args.multi_frequencies),
+            "ramp_delta": float(args.ramp_delta),
+            "ramp_duration": float(args.ramp_duration),
+            "kp": np.asarray(system.policy_impedance_kp, dtype=float).tolist(),
+            "kd": np.asarray(system.policy_impedance_kd, dtype=float).tolist(),
             "follower_kp": float(args.follower_kp),
             "follower_kd": float(args.follower_kd),
             "four_channel": bool(arch_mode == "four_channel"),
@@ -1280,6 +1378,8 @@ def main() -> int:
             "adm_stiff": float(args.adm_stiff),
             "adm_leak": float(args.adm_leak),
             "adm_delta_max": float(args.adm_delta_max),
+            "settle_time": startup_settle_time,
+            "impedance_ramp_time": float(args.impedance_ramp_time),
             "action_dt": float(args.action_dt),
             "horizon": int(args.horizon),
             "config": str(config_path),

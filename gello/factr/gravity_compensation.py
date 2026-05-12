@@ -869,15 +869,6 @@ class FACTRGravityCompensation:
         self.gripper_feedback_damping = gripper_feedback_cfg.get("damping", 0.1)
         self._follower_gripper_feedback: Dict[str, Any] = {}  # Cache for follower gripper state
 
-        policy_impedance_cfg = self.config["controller"].get("policy_impedance", {})
-        self.policy_impedance_kp = float(policy_impedance_cfg.get("kp", 5.0))
-        self.policy_impedance_kd = float(policy_impedance_cfg.get("kd", 0.5))
-        self._policy_q_ref: Optional[npt.NDArray[np.float64]] = None
-        self._dq_filt = np.zeros(self.num_arm_joints, dtype=float)
-        self._tau_cmd_prev = np.zeros(self.num_arm_joints, dtype=float)
-        self._tau_bias = np.zeros(self.num_arm_joints, dtype=float)
-        self._impedance_initialized = False
-
         def _policy_joint_array(key: str, default: list[float]) -> np.ndarray:
             value = policy_impedance_cfg.get(key, default)
             if np.isscalar(value):
@@ -895,6 +886,16 @@ class FACTRGravityCompensation:
                         constant_values=pad_value,
                     )
             return arr[: self.num_arm_joints].astype(float, copy=True)
+
+        policy_impedance_cfg = self.config["controller"].get("policy_impedance", {})
+        self.policy_impedance_kp = _policy_joint_array("kp", [5.0])
+        self.policy_impedance_kd = _policy_joint_array("kd", [0.5])
+        self._policy_q_ref: Optional[npt.NDArray[np.float64]] = None
+        self._dq_filt = np.zeros(self.num_arm_joints, dtype=float)
+        self._tau_cmd_prev = np.zeros(self.num_arm_joints, dtype=float)
+        self._tau_bias = np.zeros(self.num_arm_joints, dtype=float)
+        self._impedance_initialized = False
+        self.policy_impedance_scale = 1.0
 
         self._vel_filter_alpha = float(policy_impedance_cfg.get("vel_filter_alpha", 0.15))
         self._vel_filter_alpha = float(np.clip(self._vel_filter_alpha, 0.0, 1.0))
@@ -2701,8 +2702,18 @@ class FACTRGravityCompensation:
 
             tau_ff = tau_gravity + tau_friction + tau_damping
 
-        kp = float(self.policy_impedance_kp)
-        kd = float(self.policy_impedance_kd)
+        kp = np.asarray(self.policy_impedance_kp, dtype=float).reshape(-1)
+        kd = np.asarray(self.policy_impedance_kd, dtype=float).reshape(-1)
+        if kp.size == 1:
+            kp = np.full(n, float(kp[0]), dtype=float)
+        if kd.size == 1:
+            kd = np.full(n, float(kd[0]), dtype=float)
+        if kp.size < n:
+            kp = np.pad(kp, (0, n - kp.size), mode="edge")
+        if kd.size < n:
+            kd = np.pad(kd, (0, n - kd.size), mode="edge")
+        kp = kp[:n]
+        kd = kd[:n]
 
         pos_error = q_ref - q
 
@@ -2711,8 +2722,8 @@ class FACTRGravityCompensation:
         elif compensation_mode == "velocity_ff":
             tau_policy = kp * pos_error + kd * (dq_ref - dq_filt)
         elif compensation_mode == "feedforward":
-            if abs(kp) < 1e-6:
-                raise ValueError("policy_impedance_kp must be non-zero for feedforward")
+            if np.any(np.abs(kp) < 1e-6):
+                raise ValueError("policy_impedance_kp entries must be non-zero for feedforward")
             pin_nq = int(getattr(self, "_pin_nq", len(q)))
             q_full = np.zeros((pin_nq,), dtype=float)
             q_full[:n] = q[:n]
@@ -2760,6 +2771,7 @@ class FACTRGravityCompensation:
             self._tau_bias += self._bias_alpha * pos_error
             self._tau_bias = np.clip(self._tau_bias, -self._bias_max, self._bias_max)
         tau_policy += self._tau_bias
+        tau_policy *= float(np.clip(getattr(self, "policy_impedance_scale", 1.0), 0.0, 1.0))
         tau_policy = np.clip(tau_policy, -self._tau_max_pd, self._tau_max_pd)
 
         torque_arm = tau_ff + tau_policy

@@ -37,25 +37,73 @@ def _epsilon_metrics(epsilon: np.ndarray, joint_index: int) -> dict[str, float]:
     }
 
 
+def _format_meta_value(value: Any, joint_index: int | None = None) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        if joint_index is not None and 0 <= joint_index < len(value):
+            try:
+                return f"{float(value[joint_index]):.4g}"
+            except (TypeError, ValueError):
+                return str(value[joint_index])
+        if len(value) == 0:
+            return "[]"
+        return "[" + ",".join(_format_meta_value(v) for v in value) + "]"
+    if isinstance(value, float):
+        return f"{value:.4g}"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _meta_column(meta: dict[str, Any], name: str, joint_index: int) -> str:
+    if name == "kp_j":
+        return _format_meta_value(meta.get("kp"), joint_index)
+    if name == "kd_j":
+        return _format_meta_value(meta.get("kd"), joint_index)
+    if name == "amp_j":
+        multi_amplitudes = meta.get("multi_amplitudes")
+        if isinstance(multi_amplitudes, (list, tuple)) and len(multi_amplitudes) > 0:
+            return _format_meta_value(multi_amplitudes, joint_index)
+        return _format_meta_value(meta.get("amplitude"))
+    if name == "freq_j":
+        multi_frequencies = meta.get("multi_frequencies")
+        if isinstance(multi_frequencies, (list, tuple)) and len(multi_frequencies) > 0:
+            return _format_meta_value(multi_frequencies, joint_index)
+        return _format_meta_value(meta.get("frequency"))
+    return _format_meta_value(meta.get(name))
+
+
 def _print_table(rows: list[dict[str, Any]]) -> None:
-    headers = ["file", "rms", "max", "mean", "rms_norm", "max_norm"]
+    metric_headers = ["rms", "max", "mean", "rms_norm", "max_norm"]
+    meta_headers = [
+        "mode",
+        "test_mode",
+        "joint_index",
+        "amp_j",
+        "freq_j",
+        "kp_j",
+        "kd_j",
+        "impedance_ramp_time",
+        "settle_time",
+    ]
+    headers = ["file", *metric_headers, *meta_headers]
     col_widths = {h: max(len(h), 10) for h in headers}
     for row in rows:
-        col_widths["file"] = max(col_widths["file"], len(row["file"]))
+        for h in headers:
+            col_widths[h] = max(col_widths[h], len(str(row.get(h, ""))))
     header_line = " ".join(h.ljust(col_widths[h]) for h in headers)
     print(header_line)
     print("-" * len(header_line))
     for row in rows:
-        line = " ".join(
-            [
-                row["file"].ljust(col_widths["file"]),
-                f"{row['rms']:+.5f}".rjust(col_widths["rms"]),
-                f"{row['max']:+.5f}".rjust(col_widths["max"]),
-                f"{row['mean']:+.5f}".rjust(col_widths["mean"]),
-                f"{row['rms_norm']:+.5f}".rjust(col_widths["rms_norm"]),
-                f"{row['max_norm']:+.5f}".rjust(col_widths["max_norm"]),
-            ]
-        )
+        cells = [str(row["file"]).ljust(col_widths["file"])]
+        for h in metric_headers:
+            cells.append(f"{row[h]:+.5f}".rjust(col_widths[h]))
+        for h in meta_headers:
+            cells.append(str(row.get(h, "-")).ljust(col_widths[h]))
+        line = " ".join(cells)
         print(line)
 
 
@@ -148,8 +196,22 @@ def main() -> int:
         rows = []
         for file_path in sorted(path.glob("*.npz")):
             data = _load_npz(file_path)
+            meta = _parse_metadata(data)
             metrics = _epsilon_metrics(np.asarray(data["epsilon"], dtype=float), int(args.joint_index))
-            rows.append({"file": file_path.name, **metrics})
+            row = {"file": file_path.name, **metrics}
+            for name in [
+                "mode",
+                "test_mode",
+                "joint_index",
+                "amp_j",
+                "freq_j",
+                "kp_j",
+                "kd_j",
+                "impedance_ramp_time",
+                "settle_time",
+            ]:
+                row[name] = _meta_column(meta, name, int(args.joint_index))
+            rows.append(row)
         _print_table(rows)
         return 0
 
