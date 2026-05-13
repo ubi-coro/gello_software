@@ -37,6 +37,32 @@ def _epsilon_metrics(epsilon: np.ndarray, joint_index: int) -> dict[str, float]:
     }
 
 
+def _actual_array(data: dict[str, Any], meta: dict[str, Any]) -> np.ndarray:
+    target = str(meta.get("target", "leader"))
+    if target == "follower":
+        return np.asarray(data["q_follower"], dtype=float)
+    return np.asarray(data["q_leader"], dtype=float)
+
+
+def _tracking_metrics(
+    data: dict[str, Any],
+    meta: dict[str, Any],
+    joint_index: int,
+) -> dict[str, float]:
+    q_ref = np.asarray(data["q_ref"], dtype=float)
+    q_actual = _actual_array(data, meta)
+    q_ref_j = q_ref[:, joint_index]
+    q_actual_j = q_actual[:, joint_index]
+    ref_range = float(np.max(q_ref_j) - np.min(q_ref_j))
+    actual_range = float(np.max(q_actual_j) - np.min(q_actual_j))
+    tracking_gain = actual_range / ref_range if ref_range > 1e-9 else float("nan")
+    return {
+        "ref_rng": ref_range,
+        "act_rng": actual_range,
+        "track_gain": tracking_gain,
+    }
+
+
 def _format_meta_value(value: Any, joint_index: int | None = None) -> str:
     if value is None:
         return "-"
@@ -77,7 +103,16 @@ def _meta_column(meta: dict[str, Any], name: str, joint_index: int) -> str:
 
 
 def _print_table(rows: list[dict[str, Any]]) -> None:
-    metric_headers = ["rms", "max", "mean", "rms_norm", "max_norm"]
+    metric_headers = [
+        "rms",
+        "max",
+        "mean",
+        "rms_norm",
+        "max_norm",
+        "ref_rng",
+        "act_rng",
+        "track_gain",
+    ]
     meta_headers = [
         "mode",
         "test_mode",
@@ -86,6 +121,7 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
         "freq_j",
         "kp_j",
         "kd_j",
+        "admittance_observer",
         "impedance_ramp_time",
         "settle_time",
     ]
@@ -100,7 +136,11 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
     for row in rows:
         cells = [str(row["file"]).ljust(col_widths["file"])]
         for h in metric_headers:
-            cells.append(f"{row[h]:+.5f}".rjust(col_widths[h]))
+            value = float(row[h])
+            if np.isnan(value):
+                cells.append("nan".rjust(col_widths[h]))
+            else:
+                cells.append(f"{value:+.5f}".rjust(col_widths[h]))
         for h in meta_headers:
             cells.append(str(row.get(h, "-")).ljust(col_widths[h]))
         line = " ".join(cells)
@@ -198,7 +238,8 @@ def main() -> int:
             data = _load_npz(file_path)
             meta = _parse_metadata(data)
             metrics = _epsilon_metrics(np.asarray(data["epsilon"], dtype=float), int(args.joint_index))
-            row = {"file": file_path.name, **metrics}
+            tracking_metrics = _tracking_metrics(data, meta, int(args.joint_index))
+            row = {"file": file_path.name, **metrics, **tracking_metrics}
             for name in [
                 "mode",
                 "test_mode",
@@ -207,6 +248,7 @@ def main() -> int:
                 "freq_j",
                 "kp_j",
                 "kd_j",
+                "admittance_observer",
                 "impedance_ramp_time",
                 "settle_time",
             ]:
@@ -223,7 +265,10 @@ def main() -> int:
     meta = _parse_metadata(data)
     _plot_single(data, meta, int(args.joint_index), Path(args.save_dir) if args.save_dir else None, bool(args.no_show))
 
-    metrics = _epsilon_metrics(np.asarray(data["epsilon"], dtype=float), int(args.joint_index))
+    metrics = {
+        **_epsilon_metrics(np.asarray(data["epsilon"], dtype=float), int(args.joint_index)),
+        **_tracking_metrics(data, meta, int(args.joint_index)),
+    }
     print("Metrics:")
     for key, value in metrics.items():
         print(f"  {key}: {value:+.6f}")

@@ -818,17 +818,47 @@ class FACTRGravityCompensation:
         # These are Coulomb friction torques added in direction of motion
         friction_cfg = self.config["controller"].get("static_friction_comp", {})
         default_ff = [0.0] * self.num_arm_joints
-        self.friction_feedforward = np.array(
-            friction_cfg.get("friction_feedforward", default_ff)
+
+        def _friction_joint_array(key: str, default: list[float]) -> np.ndarray:
+            value = friction_cfg.get(key, default)
+            if np.isscalar(value):
+                arr = np.full(self.num_arm_joints, float(value), dtype=float)
+            else:
+                arr = np.asarray(value, dtype=float).reshape(-1)
+                if arr.size == 0:
+                    arr = np.asarray(default, dtype=float).reshape(-1)
+                if arr.size < self.num_arm_joints:
+                    arr = np.pad(
+                        arr,
+                        (0, self.num_arm_joints - arr.size),
+                        mode="edge",
+                    )
+            return arr[: self.num_arm_joints].astype(float, copy=True)
+
+        self.friction_model = str(friction_cfg.get("model", "legacy")).lower()
+        self.friction_sign_source = str(friction_cfg.get("sign_source", "actual")).lower()
+        self.friction_feedforward = _friction_joint_array(
+            "friction_feedforward",
+            default_ff,
         )
         # Viscous friction coefficient (Nm*s/rad)
-        self.viscous_friction = np.array(
-            friction_cfg.get("viscous_friction", default_ff)
+        self.viscous_friction = _friction_joint_array(
+            "viscous_friction",
+            default_ff,
         )
         # Velocity deadband - don't apply friction comp below this
         default_deadband = [0.05] * self.num_arm_joints
-        self.friction_velocity_deadband = np.array(
-            friction_cfg.get("velocity_deadband", default_deadband)
+        self.friction_velocity_deadband = _friction_joint_array(
+            "velocity_deadband",
+            default_deadband,
+        )
+        self.friction_smooth_velocity = _friction_joint_array(
+            "smooth_velocity",
+            [0.03] * self.num_arm_joints,
+        )
+        self.friction_smooth_error = _friction_joint_array(
+            "smooth_error",
+            [0.03] * self.num_arm_joints,
         )
 
         # Joint limit barrier
@@ -2684,17 +2714,16 @@ class FACTRGravityCompensation:
         self._dq_filt = alpha * dq_raw + (1.0 - alpha) * self._dq_filt
         dq_filt = self._dq_filt
 
+        pos_error = q_ref - q
         tau_ff = np.zeros(n, dtype=float)
 
         if self.enable_gravity_comp and compensation_mode != "computed_torque":
             tau_gravity = self.gravity_compensation(q, dq_filt)
-
-            tau_friction = np.zeros(n, dtype=float)
-            for i in range(n):
-                vel = dq_filt[i]
-                if abs(vel) > self.friction_velocity_deadband[i]:
-                    tau_friction[i] += self.friction_feedforward[i] * np.sign(vel)
-                    tau_friction[i] += self.viscous_friction[i] * vel
+            tau_friction = self._policy_friction_compensation(
+                dq_filt=dq_filt,
+                dq_ref=dq_ref,
+                pos_error=pos_error,
+            )
 
             tau_damping = np.zeros(n, dtype=float)
             if self.gravity_comp_velocity_damping != 0.0:
@@ -2714,8 +2743,6 @@ class FACTRGravityCompensation:
             kd = np.pad(kd, (0, n - kd.size), mode="edge")
         kp = kp[:n]
         kd = kd[:n]
-
-        pos_error = q_ref - q
 
         if compensation_mode == "none":
             tau_policy = kp * pos_error - kd * dq_filt
@@ -2753,12 +2780,11 @@ class FACTRGravityCompensation:
                 v_ref,
                 a_ref,
             )
-            tau_friction = np.zeros(n, dtype=float)
-            for i in range(n):
-                vel = dq_filt[i]
-                if abs(vel) > self.friction_velocity_deadband[i]:
-                    tau_friction[i] += self.friction_feedforward[i] * np.sign(vel)
-                    tau_friction[i] += self.viscous_friction[i] * vel
+            tau_friction = self._policy_friction_compensation(
+                dq_filt=dq_filt,
+                dq_ref=dq_ref,
+                pos_error=pos_error,
+            )
             tau_damping = np.zeros(n, dtype=float)
             if self.gravity_comp_velocity_damping != 0.0:
                 tau_damping = -self.gravity_comp_velocity_damping * dq_filt
@@ -2938,6 +2964,50 @@ class FACTRGravityCompensation:
                 self.stiction_dither_flag[i] = ~self.stiction_dither_flag[i]
         
         return tau_ss
+
+    def _policy_friction_compensation(
+        self,
+        dq_filt: npt.NDArray[np.float64],
+        dq_ref: npt.NDArray[np.float64],
+        pos_error: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        """Friction feedforward for policy tracking.
+
+        The legacy model keys Coulomb friction off measured velocity. The smooth model
+        can key it off the reference velocity or position error to help break stiction
+        before measured velocity becomes reliable.
+        """
+        n = self.num_arm_joints
+        tau_friction = np.zeros(n, dtype=float)
+
+        model = str(getattr(self, "friction_model", "legacy")).lower()
+        sign_source = str(getattr(self, "friction_sign_source", "actual")).lower()
+
+        for i in range(n):
+            vel = float(dq_filt[i])
+            if model == "smooth":
+                if sign_source in ("reference", "ref", "dq_ref"):
+                    source = float(dq_ref[i])
+                    scale = max(float(self.friction_smooth_velocity[i]), 1e-6)
+                elif sign_source in ("error", "pos_error", "position_error"):
+                    source = float(pos_error[i])
+                    scale = max(float(self.friction_smooth_error[i]), 1e-6)
+                else:
+                    source = vel
+                    scale = max(float(self.friction_smooth_velocity[i]), 1e-6)
+
+                if abs(source) > float(self.friction_velocity_deadband[i]):
+                    tau_friction[i] += float(self.friction_feedforward[i]) * np.tanh(
+                        source / scale
+                    )
+            else:
+                if abs(vel) > float(self.friction_velocity_deadband[i]):
+                    tau_friction[i] += float(self.friction_feedforward[i]) * np.sign(vel)
+
+            if abs(vel) > float(self.friction_velocity_deadband[i]):
+                tau_friction[i] += float(self.viscous_friction[i]) * vel
+
+        return tau_friction
 
     def null_space_regulation(
         self,

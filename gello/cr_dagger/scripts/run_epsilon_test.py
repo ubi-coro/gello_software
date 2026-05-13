@@ -305,6 +305,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--adm-stiff", type=float, default=25.0)
     p.add_argument("--adm-leak", type=float, default=0.02)
     p.add_argument("--adm-delta-max", type=float, default=0.25)
+    p.add_argument(
+        "--admittance-observer",
+        choices=["shi", "yamane", "none"],
+        default="shi",
+        help="External torque source for leader_admittance mode.",
+    )
 
     p.add_argument("--follower-kp", type=float, default=150.0)
     p.add_argument("--follower-kd", type=float, default=12.0)
@@ -721,8 +727,11 @@ def _run_leader_admittance_mode(
     obs_snap: SharedObservationSnapshot,
     shi: Optional[MinimalistTorqueEstimator],
 ) -> None:
+    from gello.cr_dagger.core.yamane_observer import GeneralizedMomentumObserver
+
     n = system.num_arm_joints
     dt = float(system.dt)
+    observer_mode = str(args.admittance_observer).lower()
 
     if not args.no_follower:
         if not _start_prepared_teleop(system):
@@ -739,6 +748,23 @@ def _run_leader_admittance_mode(
     dq_c = np.zeros(n, dtype=float)
     contact_gate = ContactGate(n)
     last_tau_residual = np.zeros(n, dtype=float)
+    yamane: GeneralizedMomentumObserver | None = None
+    if observer_mode == "yamane":
+        four_cfg = system.config.get("teleop", {}).get("four_channel", {})
+        yamane = GeneralizedMomentumObserver(
+            pin_model=system.pin_model,
+            num_arm_joints=n,
+            K_obs=float(four_cfg.get("yamane_K_obs", 50.0)),
+            dt=dt,
+            filter_fc=float(four_cfg.get("yamane_filter_fc", 5.0)),
+        )
+        _, dq0, _, _ = system.get_leader_joint_states()
+        yamane.reset(q0[:n], np.asarray(dq0[:n], dtype=float))
+        print("[ADMITTANCE] observer=yamane")
+    elif observer_mode == "none":
+        print("[ADMITTANCE] observer=none")
+    else:
+        print("[ADMITTANCE] observer=shi")
 
     mass = np.full(n, max(float(args.adm_mass), 1e-6), dtype=float)
     damp = np.full(n, max(float(args.adm_damp), 0.0), dtype=float)
@@ -778,11 +804,11 @@ def _run_leader_admittance_mode(
             system.gripper_pos = float(grip)
             system._last_gripper_vel = float(grip_vel)
 
-            if shi is not None:
+            if observer_mode == "shi" and shi is not None:
                 currents_arm = np.asarray(cur_raw[:n], dtype=float) * system.joint_signs[:n]
         else:
             q, dq, grip, grip_vel = system.get_leader_joint_states()
-            if shi is not None and system.driver is not None:
+            if observer_mode == "shi" and shi is not None and system.driver is not None:
                 currents = system.driver.get_currents()
                 currents_arm = np.asarray(currents[:n], dtype=float) * system.joint_signs[:n]
 
@@ -811,14 +837,27 @@ def _run_leader_admittance_mode(
             compensation_mode=str(args.compensation),
             leader_state=(q, dq, float(grip), float(grip_vel)),
         )
-        tau_ext, tau_components = _shi_torque_components(
-            system=system,
-            shi=shi,
-            q=q,
-            dq=dq,
-            currents_arm=currents_arm,
-            tau_model=tau_cmd,
-        )
+        if observer_mode == "yamane" and yamane is not None:
+            tau_ext = yamane.update(q=q, dq=dq, tau_cmd=tau_cmd, dt=dt)
+            tau_components = system.separate_contact_torque_components(
+                tau_model=tau_cmd,
+                tau_ext_shi=tau_ext,
+            )
+        elif observer_mode == "none":
+            tau_ext = np.zeros(n, dtype=float)
+            tau_components = system.separate_contact_torque_components(
+                tau_model=tau_cmd,
+                tau_ext_shi=tau_ext,
+            )
+        else:
+            tau_ext, tau_components = _shi_torque_components(
+                system=system,
+                shi=shi,
+                q=q,
+                dq=dq,
+                currents_arm=currents_arm,
+                tau_model=tau_cmd,
+            )
         last_tau_residual = tau_components["tau_residual"].copy()
 
         q_follower = np.zeros(n)
@@ -1322,7 +1361,11 @@ def main() -> int:
         ddq_computer = FilteredDDQComputer(n_joints=n)
 
         shi: Optional[MinimalistTorqueEstimator] = None
-        if not args.no_shi and arch_mode in ("leader_tracking", "leader_admittance"):
+        needs_shi = arch_mode == "leader_tracking" or (
+            arch_mode == "leader_admittance"
+            and str(args.admittance_observer).lower() == "shi"
+        )
+        if not args.no_shi and needs_shi:
             try:
                 shi = _build_shi(system, config_path, n)
             except Exception as exc:
@@ -1378,6 +1421,7 @@ def main() -> int:
             "adm_stiff": float(args.adm_stiff),
             "adm_leak": float(args.adm_leak),
             "adm_delta_max": float(args.adm_delta_max),
+            "admittance_observer": str(args.admittance_observer),
             "settle_time": startup_settle_time,
             "impedance_ramp_time": float(args.impedance_ramp_time),
             "action_dt": float(args.action_dt),
