@@ -40,6 +40,7 @@ class EpsilonRecorder:
             "tau_model": np.zeros((self.max_steps, self.n_joints), dtype=float),
             "tau_meas": np.zeros((self.max_steps, self.n_joints), dtype=float),
             "tau_residual": np.zeros((self.max_steps, self.n_joints), dtype=float),
+            "wrench": np.zeros((self.max_steps, 6), dtype=float),
             "contact_probability": np.zeros(self.max_steps, dtype=float),
             "contact_state": np.zeros(self.max_steps, dtype=float),
             "epsilon": np.zeros((self.max_steps, self.n_joints), dtype=float),

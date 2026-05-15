@@ -257,7 +257,10 @@ def _parse_args() -> argparse.Namespace:
         "--mode",
         choices=[
             "leader_tracking",
+            "leader_observer",
             "leader_admittance",
+            "leader_admittance_impedance",
+            "leader_admittance_position",
             "four_channel",
             "follower_tracking",
             "observer_only",
@@ -309,7 +312,10 @@ def _parse_args() -> argparse.Namespace:
         "--admittance-observer",
         choices=["shi", "yamane", "none"],
         default="shi",
-        help="External torque source for leader_admittance mode.",
+        help=(
+            "External torque source for leader admittance/observer modes. "
+            "Yamane is only valid when the leader is torque-commanded."
+        ),
     )
 
     p.add_argument("--follower-kp", type=float, default=150.0)
@@ -347,10 +353,16 @@ def _resolve_arch_mode(args: argparse.Namespace) -> str:
     if args.mode is not None:
         if args.mode == "observer_only":
             print(
-                "[WARN] observer_only is currently an alias for follower_tracking; "
-                "no sensor-only correction path is enabled yet"
+                "[WARN] observer_only is deprecated; using leader_observer instead"
             )
-            return "follower_tracking"
+            return "leader_observer"
+        if args.mode == "leader_admittance":
+            print(
+                "[WARN] leader_admittance is an alias for "
+                "leader_admittance_impedance. Use leader_admittance_position "
+                "for true position-mode admittance."
+            )
+            return "leader_admittance_impedance"
         return str(args.mode)
     if args.four_channel:
         return "four_channel"
@@ -474,8 +486,35 @@ def _run_leader_mode(
     obs_snap: SharedObservationSnapshot,
     shi: Optional[MinimalistTorqueEstimator],
 ) -> None:
+    from gello.cr_dagger.core.yamane_observer import GeneralizedMomentumObserver
+
     n = system.num_arm_joints
     dt = float(system.dt)
+    observer_mode = (
+        str(args.admittance_observer).lower()
+        if str(getattr(args, "mode", "")).lower() in ("leader_observer", "observer_only")
+        else "shi"
+    )
+    yamane: GeneralizedMomentumObserver | None = None
+    if observer_mode == "yamane":
+        four_cfg = system.config.get("teleop", {}).get("four_channel", {})
+        yamane = GeneralizedMomentumObserver(
+            pin_model=system.pin_model,
+            num_arm_joints=n,
+            K_obs=float(four_cfg.get("yamane_K_obs", 50.0)),
+            dt=dt,
+            filter_fc=float(four_cfg.get("yamane_filter_fc", 5.0)),
+        )
+        q_init, dq_init, _, _ = system.get_leader_joint_states()
+        yamane.reset(
+            np.asarray(q_init[:n], dtype=float),
+            np.asarray(dq_init[:n], dtype=float),
+        )
+        print("[OBSERVER] leader tracking observer=yamane")
+    elif observer_mode == "none":
+        print("[OBSERVER] leader tracking observer=none")
+    else:
+        print("[OBSERVER] leader tracking observer=shi")
 
     if not args.no_follower:
         if not _start_prepared_teleop(system):
@@ -520,11 +559,11 @@ def _run_leader_mode(
             system.gripper_pos = float(grip)
             system._last_gripper_vel = float(grip_vel)
 
-            if shi is not None:
+            if observer_mode == "shi" and shi is not None:
                 currents_arm = np.asarray(cur_raw[:n], dtype=float) * system.joint_signs[:n]
         else:
             q, dq, grip, grip_vel = system.get_leader_joint_states()
-            if shi is not None and system.driver is not None:
+            if observer_mode == "shi" and shi is not None and system.driver is not None:
                 currents = system.driver.get_currents()
                 currents_arm = np.asarray(currents[:n], dtype=float) * system.joint_signs[:n]
 
@@ -540,14 +579,27 @@ def _run_leader_mode(
             leader_state=(q, dq, float(grip), float(grip_vel)),
         )
 
-        tau_ext, tau_components = _shi_torque_components(
-            system=system,
-            shi=shi,
-            q=q,
-            dq=dq,
-            currents_arm=currents_arm,
-            tau_model=tau_cmd,
-        )
+        if observer_mode == "yamane" and yamane is not None:
+            tau_ext = yamane.update(q=q, dq=dq, tau_cmd=tau_cmd, dt=dt)
+            tau_components = system.separate_contact_torque_components(
+                tau_model=tau_cmd,
+                tau_ext_shi=tau_ext,
+            )
+        elif observer_mode == "none":
+            tau_ext = np.zeros(n, dtype=float)
+            tau_components = system.separate_contact_torque_components(
+                tau_model=tau_cmd,
+                tau_ext_shi=tau_ext,
+            )
+        else:
+            tau_ext, tau_components = _shi_torque_components(
+                system=system,
+                shi=shi,
+                q=q,
+                dq=dq,
+                currents_arm=currents_arm,
+                tau_model=tau_cmd,
+            )
         contact_probability, contact_state = contact_gate.update(
             tau_components["tau_residual"],
             ddq_ref,
@@ -906,6 +958,197 @@ def _run_leader_admittance_mode(
             print("[WARN] trajectory stale")
 
         _sleep_remaining(dt, loop_t0)
+
+
+def _run_leader_admittance_position_mode(
+    system: FACTRGravityCompensation,
+    args: argparse.Namespace,
+    traj_interp: TrajectoryInterpolator,
+    recorder: EpsilonRecorder,
+    ddq_computer: FilteredDDQComputer,
+    obs_snap: SharedObservationSnapshot,
+    shi: Optional[MinimalistTorqueEstimator],
+) -> None:
+    n = system.num_arm_joints
+    dt = float(system.dt)
+    observer_mode = str(args.admittance_observer).lower()
+    if observer_mode == "yamane":
+        raise ValueError(
+            "leader_admittance_position cannot use Yamane because Dynamixel "
+            "position mode hides the commanded motor torque. Use "
+            "leader_admittance_impedance --admittance-observer yamane instead."
+        )
+
+    if not args.no_follower:
+        if not _start_prepared_teleop(system):
+            print("[WARN] teleop could not be started; continuing without follower")
+
+    if float(args.settle_time) > 0.0:
+        print("[SETTLE] gravity comp warmup")
+        t_settle = time.perf_counter()
+        while time.perf_counter() - t_settle < float(args.settle_time):
+            _leader_gravity_hold(system, dt)
+
+    q0, _, _, _ = system.get_leader_joint_states()
+    q_c = np.asarray(q0[:n], dtype=float).copy()
+    dq_c = np.zeros(n, dtype=float)
+    contact_gate = ContactGate(n)
+    last_tau_residual = np.zeros(n, dtype=float)
+
+    mass = np.full(n, max(float(args.adm_mass), 1e-6), dtype=float)
+    damp = np.full(n, max(float(args.adm_damp), 0.0), dtype=float)
+    stiff = np.full(n, max(float(args.adm_stiff), 0.0), dtype=float)
+    leak = max(float(args.adm_leak), 0.0)
+    delta_max = max(float(args.adm_delta_max), 1e-6)
+
+    print(f"[ADMITTANCE] position mode observer={observer_mode}")
+    if system.driver is not None:
+        system.driver.set_torque_mode(False)
+        time.sleep(0.05)
+        system.driver.set_operating_mode(3)
+        time.sleep(0.05)
+        system.driver.set_torque_mode(True)
+        time.sleep(0.05)
+
+    t_start = time.monotonic()
+    last_warn = 0.0
+
+    try:
+        while True:
+            loop_t0 = time.perf_counter()
+            t_mono = time.monotonic()
+
+            if float(args.duration) > 0 and (t_mono - t_start) > float(args.duration):
+                break
+
+            currents_arm = None
+            if system.driver is not None and hasattr(system.driver, "get_positions_velocities_and_currents"):
+                pos_raw, vel_raw, cur_raw = system.driver.get_positions_velocities_and_currents()
+                q = (np.asarray(pos_raw[:n], dtype=float) - system.joint_offsets[:n]) * system.joint_signs[:n]
+                dq = np.asarray(vel_raw[:n], dtype=float) * system.joint_signs[:n]
+
+                if len(pos_raw) > n:
+                    grip_raw = float(pos_raw[-1])
+                    grip = (grip_raw - float(system.joint_offsets[-1])) * float(system.joint_signs[-1])
+                    system.leader_gripper_raw_rad = grip_raw
+                else:
+                    grip = 0.0
+                    grip_raw = 0.0
+
+                if len(vel_raw) > n:
+                    grip_vel = float(vel_raw[-1]) * float(system.joint_signs[-1])
+                else:
+                    grip_vel = 0.0
+
+                system.gripper_pos = float(grip)
+                system._last_gripper_vel = float(grip_vel)
+
+                if observer_mode == "shi" and shi is not None:
+                    currents_arm = np.asarray(cur_raw[:n], dtype=float) * system.joint_signs[:n]
+            else:
+                q, dq, grip, grip_vel = system.get_leader_joint_states()
+                if observer_mode == "shi" and shi is not None and system.driver is not None:
+                    currents = system.driver.get_currents()
+                    currents_arm = np.asarray(currents[:n], dtype=float) * system.joint_signs[:n]
+
+            q_ref, dq_ref, is_stale = traj_interp.get_reference(t_mono)
+            ddq_ref = ddq_computer.update(dq_ref, t_mono)
+
+            contact_probability, contact_state = contact_gate.update(
+                last_tau_residual,
+                ddq_ref,
+                correction_active=True,
+            )
+            tau_contact = last_tau_residual if contact_probability >= 0.6 else np.zeros(n)
+            ddq_c = (tau_contact - damp * dq_c - stiff * (q_c - q_ref)) / mass
+            dq_c = (1.0 - leak * dt) * (dq_c + ddq_c * dt)
+            q_c = q_c + dq_c * dt
+
+            delta = np.clip(q_c - q_ref, -delta_max, delta_max)
+            q_c = q_ref + delta
+            q_c = np.clip(q_c, system.arm_joint_limits_min[:n], system.arm_joint_limits_max[:n])
+
+            target_hw = np.zeros(system.num_motors)
+            target_hw[:n] = q_c * system.joint_signs[:n] + system.joint_offsets[:n]
+            if system.num_motors > n:
+                target_hw[-1] = getattr(system, "leader_gripper_raw_rad", 0.0)
+            system.driver.set_joints(target_hw.tolist())
+
+            tau_cmd = np.zeros(n, dtype=float)
+            if observer_mode == "none":
+                tau_ext = np.zeros(n, dtype=float)
+                tau_components = system.separate_contact_torque_components(
+                    tau_model=tau_cmd,
+                    tau_ext_shi=tau_ext,
+                )
+            else:
+                tau_ext, tau_components = _shi_torque_components(
+                    system=system,
+                    shi=shi,
+                    q=q,
+                    dq=dq,
+                    currents_arm=currents_arm,
+                    tau_model=tau_cmd,
+                )
+            last_tau_residual = tau_components["tau_residual"].copy()
+
+            q_follower = np.zeros(n)
+            dq_follower = np.zeros(n)
+            if system.teleop_enabled:
+                try:
+                    q_follower, dq_follower = system.get_follower_arm_state()
+                except Exception:
+                    pass
+
+            epsilon = q - q_c
+            recorder.record(
+                t_mono=t_mono,
+                q_ref=q_ref,
+                dq_ref=dq_ref,
+                ddq_ref=ddq_ref,
+                q_leader=q,
+                dq_leader=dq,
+                q_cmd_leader=q_c,
+                q_c_leader=q_c,
+                q_follower=q_follower,
+                dq_follower=dq_follower,
+                q_cmd_follower=np.full(n, np.nan),
+                delta_corr=delta,
+                tau_cmd=tau_cmd,
+                tau_ext_shi=tau_ext,
+                tau_model=tau_components["tau_model"],
+                tau_meas=tau_components["tau_meas"],
+                tau_residual=tau_components["tau_residual"],
+                contact_probability=contact_probability,
+                contact_state=contact_state,
+                epsilon=epsilon,
+            )
+
+            obs_snap.write(
+                timestamp=t_mono,
+                q=q,
+                dq=dq,
+                grip=float(grip),
+                tau_ext=tau_components["tau_residual"],
+                wrench=np.zeros(6),
+            )
+
+            if is_stale and (t_mono - last_warn) > 1.0:
+                last_warn = t_mono
+                print("[WARN] trajectory stale")
+
+            _sleep_remaining(dt, loop_t0)
+    finally:
+        if system.driver is not None:
+            try:
+                system.driver.set_torque_mode(False)
+                time.sleep(0.05)
+                system.driver.set_operating_mode(0)
+                time.sleep(0.05)
+                system.driver.set_torque_mode(True)
+                time.sleep(0.05)
+            except Exception:
+                pass
 
 
 def _run_four_channel_mode(
@@ -1362,7 +1605,10 @@ def main() -> int:
 
         shi: Optional[MinimalistTorqueEstimator] = None
         needs_shi = arch_mode == "leader_tracking" or (
-            arch_mode == "leader_admittance"
+            arch_mode == "leader_observer"
+            and str(args.admittance_observer).lower() == "shi"
+        ) or (
+            arch_mode in ("leader_admittance_impedance", "leader_admittance_position")
             and str(args.admittance_observer).lower() == "shi"
         )
         if not args.no_shi and needs_shi:
@@ -1381,10 +1627,20 @@ def main() -> int:
                 or system.config.get("teleop", {}).get("four_channel", {}).get("mirror_source", "cmd")
             )
             _run_four_channel_mode(system, args, traj_interp, recorder, ddq_computer, obs_snap)
-        elif arch_mode == "leader_tracking":
+        elif arch_mode in ("leader_tracking", "leader_observer"):
             _run_leader_mode(system, args, traj_interp, recorder, ddq_computer, obs_snap, shi)
-        elif arch_mode == "leader_admittance":
+        elif arch_mode == "leader_admittance_impedance":
             _run_leader_admittance_mode(system, args, traj_interp, recorder, ddq_computer, obs_snap, shi)
+        elif arch_mode == "leader_admittance_position":
+            _run_leader_admittance_position_mode(
+                system,
+                args,
+                traj_interp,
+                recorder,
+                ddq_computer,
+                obs_snap,
+                shi,
+            )
         elif arch_mode == "follower_tracking":
             _run_follower_mode(system, args, traj_interp, recorder, ddq_computer, obs_snap)
         else:
@@ -1398,6 +1654,13 @@ def main() -> int:
         metadata = {
             "mode": arch_mode,
             "target": target_label,
+            "architecture": arch_mode,
+            "leader_command_mode": (
+                "position"
+                if arch_mode == "leader_admittance_position"
+                else "current"
+            ),
+            "wrench_source": "none",
             "test_mode": args.test_mode,
             "compensation": args.compensation,
             "joint_index": int(args.joint_index),
@@ -1422,6 +1685,15 @@ def main() -> int:
             "adm_leak": float(args.adm_leak),
             "adm_delta_max": float(args.adm_delta_max),
             "admittance_observer": str(args.admittance_observer),
+            "admittance_inner_loop": (
+                "dynamixel_position"
+                if arch_mode == "leader_admittance_position"
+                else (
+                    "software_impedance"
+                    if arch_mode == "leader_admittance_impedance"
+                    else "none"
+                )
+            ),
             "settle_time": startup_settle_time,
             "impedance_ramp_time": float(args.impedance_ramp_time),
             "action_dt": float(args.action_dt),
