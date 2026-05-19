@@ -18,7 +18,7 @@ dynamixel:
 
 arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
-  leader_urdf: "gello/factr/urdf/GELLO_Assembly_URDF_V7/robot.urdf"
+  leader_urdf: "gello/factr/urdf/gello_urdf_minione/robot.urdf"
   num_arm_joints: 6
   arm_joint_limits_max: [6.28318, 3.14159, 7.0, 4.53786, 6.28318, 2.0]
   arm_joint_limits_min: [3.14159, -1.571, 3.4, 0.0, 3.14159, -1.0]
@@ -83,23 +83,23 @@ controller:
     # Alternatives supported by code: actual, reference, error.
     sign_source: reference
     # Small Coulomb feedforward torques [Nm]. Keep wrists near zero; too much causes overshoot.
-    friction_feedforward: [0.0, 0.002, 0.002, 0.0005, 0.0, 0.0]
+    friction_feedforward: [0.0, 0.0005, 0.0, 0.0002, 0.0, 0.0]
     # Small viscous term [Nm*s/rad] added from measured dq once outside velocity_deadband.
-    viscous_friction: [0.003, 0.010, 0.004, 0.001, 0.0, 0.0]
+    viscous_friction: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     # Deadband for friction terms [rad/s]. Higher wrist values avoid velocity-noise toggling.
-    velocity_deadband: [0.005, 0.02, 0.02, 0.02, 0.03, 0.03]
+    velocity_deadband: [0.01, 0.04, 0.06, 0.04, 0.05, 0.05]
     # Smooth transition scale for tanh(dq_ref / smooth_velocity) [rad/s].
-    smooth_velocity: [0.03, 0.03, 0.03, 0.025, 0.03, 0.03]
+    smooth_velocity: [0.05, 0.07, 0.09, 0.06, 0.07, 0.07]
     # Smooth transition scale if sign_source: error is selected [rad].
-    smooth_error: [0.03, 0.03, 0.03, 0.025, 0.03, 0.03]
+    smooth_error: [0.05, 0.07, 0.09, 0.06, 0.07, 0.07]
   joint_limit_barrier:
     kp: 0.0 #1.0
     kd: 0.0 #0.01
   policy_impedance:
     # Per-joint mirror impedance for Phase B epsilon/4-channel tests.
     # J1/J2 keep the measured usable baseline; wrists stay soft to avoid J5/J6 self-motion.
-    kp: [1.5, 2.5, 3.0, 0.4, 0.3, 0.12]
-    kd: [0.12, 0.25, 0.3, 0.05, 0.03, 0.015]
+    kp: [1.5, 2.5, 2.7, 0.4, 0.3, 0.12]
+    kd: [0.12, 0.3, 0.35, 0.05, 0.03, 0.015]
     vel_filter_alpha: 0.9
     tau_slew_rate: [0.5, 1.2, 1.2, 0.08, 0.05, 0.03]
     tau_max_pd: [1.2, 2.0, 2.0, 0.4, 0.25, 0.12]

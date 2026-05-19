@@ -190,6 +190,247 @@ class ContactGate:
         return probability, state
 
 
+class BotaMiniOneReader:
+    """Thin lifecycle wrapper around bota_driver for optional Phase-B wrench input."""
+
+    def __init__(self, config_path: Path, driver_tare: bool = False):
+        try:
+            import bota_driver
+        except ImportError as exc:
+            raise RuntimeError(
+                "bota_driver is not importable. Activate the environment with "
+                "the Bota Systems Python driver or run without --bota-enable."
+            ) from exc
+
+        if not config_path.exists():
+            raise FileNotFoundError(f"Bota config not found: {config_path}")
+
+        self.driver = bota_driver.BotaDriver(str(config_path))
+        self.driver_tare = bool(driver_tare)
+        self.active = False
+        self.expected_hz: float | None = None
+        self.last_timestamp_us: int | None = None
+        self.new_frames = 0
+        self.duplicate_frames = 0
+        self.status_flags = np.zeros(4, dtype=float)
+
+    def start(self) -> None:
+        print(f"[BOTA] driver version: {self.driver.get_driver_version_string()}")
+        if not self.driver.configure():
+            raise RuntimeError("Bota configure() failed")
+        if self.driver_tare:
+            print("[BOTA] driver tare in INACTIVE state")
+            if not self.driver.tare():
+                raise RuntimeError("Bota tare() failed")
+        if not self.driver.activate():
+            raise RuntimeError("Bota activate() failed")
+        self.active = True
+        try:
+            dt = self.driver.get_expected_timestep().total_seconds()
+            if dt > 0.0:
+                self.expected_hz = 1.0 / float(dt)
+                print(f"[BOTA] expected rate: {self.expected_hz:.2f} Hz")
+        except Exception:
+            self.expected_hz = None
+
+    def read_latest(self) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray, bool]:
+        if not self.active:
+            raise RuntimeError("Bota reader is not active")
+        frame = self.driver.read_frame()
+        status = frame.status
+        wrench = np.asarray(list(frame.force[:3]) + list(frame.torque[:3]), dtype=float)
+        flags = np.asarray(
+            [
+                float(bool(status.throttled)),
+                float(bool(status.overrange)),
+                float(bool(status.invalid)),
+                float(bool(status.raw)),
+            ],
+            dtype=float,
+        )
+        timestamp_us = int(frame.timestamp)
+        is_new = self.last_timestamp_us != timestamp_us
+        if is_new:
+            self.new_frames += 1
+        else:
+            self.duplicate_frames += 1
+        self.last_timestamp_us = timestamp_us
+        self.status_flags = flags
+        return wrench, flags, timestamp_us, float(frame.temperature), np.zeros(6, dtype=float), is_new
+
+    def close(self) -> None:
+        try:
+            if self.active:
+                self.driver.deactivate()
+                self.active = False
+        except Exception as exc:
+            print(f"[WARN] Bota deactivate failed: {exc}")
+        try:
+            self.driver.cleanup()
+        except Exception:
+            pass
+        try:
+            self.driver.shutdown()
+        except Exception as exc:
+            print(f"[WARN] Bota shutdown failed: {exc}")
+
+
+class BotaWrenchConditioner:
+    """raw -> bias -> frame transform -> gravity -> low-pass -> deadband -> saturation."""
+
+    def __init__(
+        self,
+        cutoff_hz: float,
+        deadband: np.ndarray,
+        saturation: np.ndarray,
+        gravity_comp: bool,
+        payload_mass_kg: float,
+        payload_com_sensor: np.ndarray,
+        gravity_sign: float,
+    ):
+        self.cutoff_hz = max(float(cutoff_hz), 0.0)
+        self.deadband = np.asarray(deadband, dtype=float).reshape(6)
+        self.saturation = np.asarray(saturation, dtype=float).reshape(6)
+        self.gravity_comp = bool(gravity_comp)
+        self.payload_mass_kg = max(float(payload_mass_kg), 0.0)
+        self.payload_com_sensor = np.asarray(payload_com_sensor, dtype=float).reshape(3)
+        self.gravity_sign = float(gravity_sign)
+        self.bias_sensor = np.zeros(6, dtype=float)
+        self.filtered_base = np.zeros(6, dtype=float)
+        self.initialized = False
+
+    def set_bias(self, samples_sensor: list[np.ndarray]) -> None:
+        if samples_sensor:
+            self.bias_sensor = np.mean(np.asarray(samples_sensor, dtype=float), axis=0)
+            print(f"[BOTA] software bias: {np.array2string(self.bias_sensor, precision=4)}")
+
+    def update(self, wrench_sensor_raw: np.ndarray, r_base_sensor: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarray]:
+        wrench_sensor = np.asarray(wrench_sensor_raw, dtype=float).reshape(6) - self.bias_sensor
+        force_base = r_base_sensor @ wrench_sensor[:3]
+        torque_base = r_base_sensor @ wrench_sensor[3:]
+        wrench_base = np.concatenate([force_base, torque_base])
+
+        if self.gravity_comp and self.payload_mass_kg > 0.0:
+            g_base = np.array([0.0, 0.0, -9.80665], dtype=float)
+            force_g_base = self.payload_mass_kg * g_base
+            r_com_base = r_base_sensor @ self.payload_com_sensor
+            torque_g_base = np.cross(r_com_base, force_g_base)
+            wrench_base = wrench_base - self.gravity_sign * np.concatenate([force_g_base, torque_g_base])
+
+        if self.cutoff_hz > 0.0:
+            tau = 1.0 / (2.0 * np.pi * self.cutoff_hz)
+            alpha = float(dt) / (tau + float(dt))
+        else:
+            alpha = 1.0
+        if not self.initialized:
+            self.filtered_base = wrench_base.copy()
+            self.initialized = True
+        else:
+            self.filtered_base = self.filtered_base + alpha * (wrench_base - self.filtered_base)
+
+        conditioned = self.filtered_base.copy()
+        conditioned = np.where(
+            np.abs(conditioned) > self.deadband,
+            conditioned - np.sign(conditioned) * self.deadband,
+            0.0,
+        )
+        conditioned = np.clip(conditioned, -self.saturation, self.saturation)
+        return wrench_base, conditioned
+
+
+class GelloTaskspaceKinematics:
+    """Pinocchio FK/Jacobian helper using base-aligned frame coordinates."""
+
+    def __init__(self, system: FACTRGravityCompensation, n_joints: int, frame_name: str | None = None):
+        import pinocchio as pin
+
+        self.pin = pin
+        self.model = system.pin_model
+        self.data = system.pin_data
+        self.n_joints = int(n_joints)
+        self.nq = int(getattr(self.model, "nq", self.n_joints))
+        if frame_name:
+            frame_id = int(self.model.getFrameId(frame_name))
+            if frame_id >= int(self.model.nframes):
+                raise ValueError(f"Pinocchio frame not found: {frame_name}")
+            self.frame_id = frame_id
+            self.frame_name = str(frame_name)
+        else:
+            self.frame_id = int(self.model.nframes - 1)
+            self.frame_name = str(self.model.frames[self.frame_id].name)
+
+    def _q_full(self, q: np.ndarray) -> np.ndarray:
+        q_full = np.zeros(self.nq, dtype=float)
+        q_arr = np.asarray(q, dtype=float).reshape(-1)
+        q_full[: min(q_arr.size, self.nq)] = q_arr[: min(q_arr.size, self.nq)]
+        return q_full
+
+    def pose_and_jacobian(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        q_full = self._q_full(q)
+        self.pin.forwardKinematics(self.model, self.data, q_full)
+        self.pin.updateFramePlacements(self.model, self.data)
+        pose = self.data.oMf[self.frame_id]
+        jac = self.pin.computeFrameJacobian(
+            self.model,
+            self.data,
+            q_full,
+            self.frame_id,
+            self.pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        )[:, : self.n_joints]
+        return np.asarray(pose.translation), np.asarray(pose.rotation), np.asarray(jac)
+
+
+class CartesianAdmittance6D:
+    """Base-frame 6D admittance that produces a small task-space offset."""
+
+    def __init__(
+        self,
+        mass: np.ndarray,
+        damping: np.ndarray,
+        stiffness: np.ndarray,
+        leak: float,
+        max_offset: np.ndarray,
+        axis_mask: np.ndarray,
+    ):
+        self.mass = np.maximum(np.asarray(mass, dtype=float).reshape(6), 1e-6)
+        self.damping = np.maximum(np.asarray(damping, dtype=float).reshape(6), 0.0)
+        self.stiffness = np.maximum(np.asarray(stiffness, dtype=float).reshape(6), 0.0)
+        self.leak = max(float(leak), 0.0)
+        self.max_offset = np.maximum(np.asarray(max_offset, dtype=float).reshape(6), 1e-9)
+        self.axis_mask = np.asarray(axis_mask, dtype=float).reshape(6)
+        self.x = np.zeros(6, dtype=float)
+        self.dx = np.zeros(6, dtype=float)
+
+    def step(self, wrench_base: np.ndarray, dt: float) -> np.ndarray:
+        wrench = np.asarray(wrench_base, dtype=float).reshape(6) * self.axis_mask
+        ddx = (wrench - self.damping * self.dx - self.stiffness * self.x) / self.mass
+        self.dx = (1.0 - self.leak * float(dt)) * (self.dx + ddx * float(dt))
+        self.x = self.x + self.dx * float(dt)
+        self.x = np.clip(self.x, -self.max_offset, self.max_offset)
+        self.x *= self.axis_mask
+        self.dx *= self.axis_mask
+        return self.x.copy()
+
+
+def _damped_least_squares_delta_q(jacobian: np.ndarray, task_delta: np.ndarray, damping: float) -> np.ndarray:
+    jac = np.asarray(jacobian, dtype=float)
+    delta = np.asarray(task_delta, dtype=float).reshape(6)
+    lam2 = max(float(damping), 0.0) ** 2
+    lhs = jac @ jac.T + lam2 * np.eye(6)
+    return jac.T @ np.linalg.solve(lhs, delta)
+
+
+def _bota_contact_probability(wrench_base: np.ndarray, force_scale: float, torque_scale: float) -> tuple[float, float]:
+    force_norm = float(np.linalg.norm(wrench_base[:3])) / max(float(force_scale), 1e-6)
+    torque_norm = float(np.linalg.norm(wrench_base[3:])) / max(float(torque_scale), 1e-6)
+    probability = float(np.clip(max(force_norm, torque_norm), 0.0, 1.0))
+    if probability >= 0.6:
+        return probability, ContactGate.CORRECTION_ACTIVE
+    if probability >= 0.25:
+        return probability, ContactGate.POSSIBLE_CONTACT
+    return probability, ContactGate.NO_CONTACT
+
+
 def _shi_torque_components(
     system: FACTRGravityCompensation,
     shi: Optional[MinimalistTorqueEstimator],
@@ -308,6 +549,33 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--adm-stiff", type=float, default=25.0)
     p.add_argument("--adm-leak", type=float, default=0.02)
     p.add_argument("--adm-delta-max", type=float, default=0.25)
+    p.add_argument(
+        "--admittance-source",
+        choices=["observer", "bota_cartesian", "bota_joint"],
+        default="observer",
+        help="Signal used to drive leader_admittance_position. Bota sources also log the other projection.",
+    )
+    p.add_argument("--bota-enable", action="store_true", help="Open MiniOne and record conditioned wrench signals.")
+    p.add_argument("--bota-config", type=str, default="configs/bota_binary.json")
+    p.add_argument("--bota-driver-tare", action="store_true", help="Call bota_driver.tare() before activation.")
+    p.add_argument("--bota-bias-seconds", type=float, default=1.0, help="Software bias collection duration after activation.")
+    p.add_argument("--bota-filter-cutoff", type=float, default=20.0, help="EMA low-pass cutoff for base-frame wrench.")
+    p.add_argument("--bota-deadband", type=str, default="0.25,0.25,0.25,0.01,0.01,0.01")
+    p.add_argument("--bota-saturation", type=str, default="25,25,25,1.5,1.5,1.5")
+    p.add_argument("--bota-gravity-comp", action="store_true", help="Subtract modeled payload gravity from the MiniOne wrench.")
+    p.add_argument("--bota-payload-mass", type=float, default=0.070, help="Distal payload mass seen by the sensor [kg].")
+    p.add_argument("--bota-payload-com", type=str, default="0,0,0.0146", help="Payload COM in sensor frame [m].")
+    p.add_argument("--bota-gravity-sign", type=float, default=1.0, help="Flip to -1 if static gravity compensation has wrong sign.")
+    p.add_argument("--bota-frame", type=str, default="", help="Pinocchio end-effector frame. Empty uses the last URDF frame.")
+    p.add_argument("--bota-axis-mask", type=str, default="1,1,1,1,1,1", help="6D mask for Cartesian admittance axes.")
+    p.add_argument("--bota-cart-mass", type=str, default="4,4,4,0.25,0.25,0.25")
+    p.add_argument("--bota-cart-damp", type=str, default="35,35,35,1.5,1.5,1.5")
+    p.add_argument("--bota-cart-stiff", type=str, default="70,70,70,4,4,4")
+    p.add_argument("--bota-cart-max", type=str, default="0.08,0.08,0.08,0.35,0.35,0.35")
+    p.add_argument("--bota-joint-gain", type=float, default=1.0, help="Gain for J.T @ wrench before joint-space admittance.")
+    p.add_argument("--bota-dls-damping", type=float, default=0.03, help="Damped least-squares factor for Cartesian delta_q.")
+    p.add_argument("--bota-contact-force-scale", type=float, default=8.0)
+    p.add_argument("--bota-contact-torque-scale", type=float, default=0.35)
     p.add_argument(
         "--admittance-observer",
         choices=["shi", "yamane", "none"],
@@ -992,6 +1260,8 @@ def _run_leader_admittance_position_mode(
     q0, _, _, _ = system.get_leader_joint_states()
     q_c = np.asarray(q0[:n], dtype=float).copy()
     dq_c = np.zeros(n, dtype=float)
+    q_bota_joint = q_c.copy()
+    dq_bota_joint = np.zeros(n, dtype=float)
     contact_gate = ContactGate(n)
     last_tau_residual = np.zeros(n, dtype=float)
 
@@ -1001,7 +1271,63 @@ def _run_leader_admittance_position_mode(
     leak = max(float(args.adm_leak), 0.0)
     delta_max = max(float(args.adm_delta_max), 1e-6)
 
-    print(f"[ADMITTANCE] position mode observer={observer_mode}")
+    admittance_source = str(args.admittance_source).lower()
+    bota_enabled = bool(args.bota_enable or admittance_source.startswith("bota_"))
+    bota_reader: BotaMiniOneReader | None = None
+    bota_conditioner: BotaWrenchConditioner | None = None
+    bota_kin: GelloTaskspaceKinematics | None = None
+    bota_cart: CartesianAdmittance6D | None = None
+    bota_config = Path(args.bota_config)
+    if not bota_config.is_absolute():
+        bota_config = (REPO_ROOT / bota_config).resolve()
+
+    if bota_enabled:
+        bota_kin = GelloTaskspaceKinematics(
+            system,
+            n,
+            frame_name=str(args.bota_frame).strip() or None,
+        )
+        bota_conditioner = BotaWrenchConditioner(
+            cutoff_hz=float(args.bota_filter_cutoff),
+            deadband=_expand_list(_parse_float_list(args.bota_deadband), 6, 0.0),
+            saturation=_expand_list(_parse_float_list(args.bota_saturation), 6, 1e9),
+            gravity_comp=bool(args.bota_gravity_comp),
+            payload_mass_kg=float(args.bota_payload_mass),
+            payload_com_sensor=_expand_list(_parse_float_list(args.bota_payload_com), 3, 0.0),
+            gravity_sign=float(args.bota_gravity_sign),
+        )
+        bota_cart = CartesianAdmittance6D(
+            mass=_expand_list(_parse_float_list(args.bota_cart_mass), 6, 1.0),
+            damping=_expand_list(_parse_float_list(args.bota_cart_damp), 6, 1.0),
+            stiffness=_expand_list(_parse_float_list(args.bota_cart_stiff), 6, 0.0),
+            leak=leak,
+            max_offset=_expand_list(_parse_float_list(args.bota_cart_max), 6, 0.05),
+            axis_mask=_expand_list(_parse_float_list(args.bota_axis_mask), 6, 1.0),
+        )
+        bota_reader = BotaMiniOneReader(bota_config, driver_tare=bool(args.bota_driver_tare))
+        bota_reader.start()
+        bias_samples: list[np.ndarray] = []
+        bias_seconds = max(float(args.bota_bias_seconds), 0.0)
+        if bias_seconds > 0.0:
+            print(f"[BOTA] collecting software bias for {bias_seconds:.2f}s")
+            t_bias = time.perf_counter()
+            while time.perf_counter() - t_bias < bias_seconds:
+                try:
+                    raw_wrench, *_ = bota_reader.read_latest()
+                    bias_samples.append(raw_wrench.copy())
+                except Exception as exc:
+                    print(f"[WARN] Bota bias read failed: {exc}")
+                    break
+                _leader_gravity_hold(system, dt)
+                time.sleep(max(0.0, dt))
+            bota_conditioner.set_bias(bias_samples)
+        print(
+            "[BOTA] enabled "
+            f"source={admittance_source} frame={bota_kin.frame_name} "
+            f"gravity_comp={bool(args.bota_gravity_comp)}"
+        )
+
+    print(f"[ADMITTANCE] position mode observer={observer_mode} source={admittance_source}")
     if system.driver is not None:
         system.driver.set_torque_mode(False)
         time.sleep(0.05)
@@ -1012,6 +1338,7 @@ def _run_leader_admittance_position_mode(
 
     t_start = time.monotonic()
     last_warn = 0.0
+    last_bota_warn = 0.0
 
     try:
         while True:
@@ -1054,15 +1381,90 @@ def _run_leader_admittance_position_mode(
             q_ref, dq_ref, is_stale = traj_interp.get_reference(t_mono)
             ddq_ref = ddq_computer.update(dq_ref, t_mono)
 
-            contact_probability, contact_state = contact_gate.update(
-                last_tau_residual,
-                ddq_ref,
-                correction_active=True,
-            )
-            tau_contact = last_tau_residual if contact_probability >= 0.6 else np.zeros(n)
-            ddq_c = (tau_contact - damp * dq_c - stiff * (q_c - q_ref)) / mass
-            dq_c = (1.0 - leak * dt) * (dq_c + ddq_c * dt)
-            q_c = q_c + dq_c * dt
+            bota_wrench_raw = np.zeros(6, dtype=float)
+            bota_wrench_base = np.zeros(6, dtype=float)
+            bota_wrench_conditioned = np.zeros(6, dtype=float)
+            bota_tau_joint = np.zeros(n, dtype=float)
+            bota_delta_q_cartesian = np.zeros(n, dtype=float)
+            bota_delta_q_joint = np.zeros(n, dtype=float)
+            bota_task_offset = np.zeros(6, dtype=float)
+            bota_status = np.zeros(4, dtype=float)
+
+            if bota_enabled and bota_reader is not None and bota_conditioner is not None and bota_kin is not None:
+                try:
+                    bota_wrench_raw, bota_status, _, _, _, _ = bota_reader.read_latest()
+                    _, r_base_sensor, jacobian_6d = bota_kin.pose_and_jacobian(q_ref)
+                    bota_wrench_base, bota_wrench_conditioned = bota_conditioner.update(
+                        bota_wrench_raw,
+                        r_base_sensor,
+                        dt,
+                    )
+                    bota_tau_joint = (
+                        float(args.bota_joint_gain)
+                        * (jacobian_6d.T @ bota_wrench_conditioned)
+                    )
+
+                    ddq_bota_joint = (
+                        bota_tau_joint - damp * dq_bota_joint - stiff * (q_bota_joint - q_ref)
+                    ) / mass
+                    dq_bota_joint = (1.0 - leak * dt) * (dq_bota_joint + ddq_bota_joint * dt)
+                    q_bota_joint = q_bota_joint + dq_bota_joint * dt
+                    bota_delta_q_joint = np.clip(q_bota_joint - q_ref, -delta_max, delta_max)
+                    q_bota_joint = np.clip(
+                        q_ref + bota_delta_q_joint,
+                        system.arm_joint_limits_min[:n],
+                        system.arm_joint_limits_max[:n],
+                    )
+
+                    if bota_cart is not None:
+                        bota_task_offset = bota_cart.step(bota_wrench_conditioned, dt)
+                        bota_delta_q_cartesian = _damped_least_squares_delta_q(
+                            jacobian_6d,
+                            bota_task_offset,
+                            float(args.bota_dls_damping),
+                        )
+                        bota_delta_q_cartesian = np.clip(
+                            bota_delta_q_cartesian,
+                            -delta_max,
+                            delta_max,
+                        )
+                except Exception as exc:
+                    if (t_mono - last_bota_warn) > 1.0:
+                        last_bota_warn = t_mono
+                        print(f"[WARN] Bota read/admittance update failed: {exc}")
+
+            if admittance_source == "observer":
+                contact_probability, contact_state = contact_gate.update(
+                    last_tau_residual,
+                    ddq_ref,
+                    correction_active=True,
+                )
+                tau_contact = last_tau_residual if contact_probability >= 0.6 else np.zeros(n)
+                ddq_c = (tau_contact - damp * dq_c - stiff * (q_c - q_ref)) / mass
+                dq_c = (1.0 - leak * dt) * (dq_c + ddq_c * dt)
+                q_c = q_c + dq_c * dt
+                delta = np.clip(q_c - q_ref, -delta_max, delta_max)
+                q_c = q_ref + delta
+            elif admittance_source == "bota_joint":
+                contact_probability, contact_state = _bota_contact_probability(
+                    bota_wrench_conditioned,
+                    float(args.bota_contact_force_scale),
+                    float(args.bota_contact_torque_scale),
+                )
+                delta = bota_delta_q_joint.copy()
+                q_c = q_ref + delta
+                dq_c = dq_bota_joint.copy()
+            elif admittance_source == "bota_cartesian":
+                contact_probability, contact_state = _bota_contact_probability(
+                    bota_wrench_conditioned,
+                    float(args.bota_contact_force_scale),
+                    float(args.bota_contact_torque_scale),
+                )
+                delta = bota_delta_q_cartesian.copy()
+                q_c = q_ref + delta
+                dq_c = np.zeros(n, dtype=float)
+            else:
+                raise ValueError(f"Unsupported admittance source: {admittance_source}")
 
             delta = np.clip(q_c - q_ref, -delta_max, delta_max)
             q_c = q_ref + delta
@@ -1119,18 +1521,28 @@ def _run_leader_admittance_position_mode(
                 tau_model=tau_components["tau_model"],
                 tau_meas=tau_components["tau_meas"],
                 tau_residual=tau_components["tau_residual"],
+                wrench=bota_wrench_conditioned,
+                bota_wrench_raw=bota_wrench_raw,
+                bota_wrench_base=bota_wrench_base,
+                bota_wrench_conditioned=bota_wrench_conditioned,
+                bota_tau_joint=bota_tau_joint,
+                bota_delta_q_cartesian=bota_delta_q_cartesian,
+                bota_delta_q_joint=bota_delta_q_joint,
+                bota_task_offset=bota_task_offset,
+                bota_status=bota_status,
                 contact_probability=contact_probability,
                 contact_state=contact_state,
                 epsilon=epsilon,
             )
 
+            tau_obs = bota_tau_joint if admittance_source.startswith("bota_") else tau_components["tau_residual"]
             obs_snap.write(
                 timestamp=t_mono,
                 q=q,
                 dq=dq,
                 grip=float(grip),
-                tau_ext=tau_components["tau_residual"],
-                wrench=np.zeros(6),
+                tau_ext=tau_obs,
+                wrench=bota_wrench_conditioned,
             )
 
             if is_stale and (t_mono - last_warn) > 1.0:
@@ -1139,6 +1551,8 @@ def _run_leader_admittance_position_mode(
 
             _sleep_remaining(dt, loop_t0)
     finally:
+        if bota_reader is not None:
+            bota_reader.close()
         if system.driver is not None:
             try:
                 system.driver.set_torque_mode(False)
@@ -1684,7 +2098,29 @@ def main() -> int:
             "adm_stiff": float(args.adm_stiff),
             "adm_leak": float(args.adm_leak),
             "adm_delta_max": float(args.adm_delta_max),
+            "admittance_source": str(args.admittance_source),
             "admittance_observer": str(args.admittance_observer),
+            "bota_enable": bool(args.bota_enable or str(args.admittance_source).startswith("bota_")),
+            "bota_config": str((REPO_ROOT / args.bota_config).resolve() if not Path(args.bota_config).is_absolute() else Path(args.bota_config).resolve()),
+            "bota_driver_tare": bool(args.bota_driver_tare),
+            "bota_bias_seconds": float(args.bota_bias_seconds),
+            "bota_filter_cutoff": float(args.bota_filter_cutoff),
+            "bota_deadband": _parse_float_list(args.bota_deadband),
+            "bota_saturation": _parse_float_list(args.bota_saturation),
+            "bota_gravity_comp": bool(args.bota_gravity_comp),
+            "bota_payload_mass": float(args.bota_payload_mass),
+            "bota_payload_com": _parse_float_list(args.bota_payload_com),
+            "bota_gravity_sign": float(args.bota_gravity_sign),
+            "bota_frame": str(args.bota_frame),
+            "bota_axis_mask": _parse_float_list(args.bota_axis_mask),
+            "bota_cart_mass": _parse_float_list(args.bota_cart_mass),
+            "bota_cart_damp": _parse_float_list(args.bota_cart_damp),
+            "bota_cart_stiff": _parse_float_list(args.bota_cart_stiff),
+            "bota_cart_max": _parse_float_list(args.bota_cart_max),
+            "bota_joint_gain": float(args.bota_joint_gain),
+            "bota_dls_damping": float(args.bota_dls_damping),
+            "bota_contact_force_scale": float(args.bota_contact_force_scale),
+            "bota_contact_torque_scale": float(args.bota_contact_torque_scale),
             "admittance_inner_loop": (
                 "dynamixel_position"
                 if arch_mode == "leader_admittance_position"
