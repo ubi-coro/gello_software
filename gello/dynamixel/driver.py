@@ -49,6 +49,15 @@ LEN_PRESENT_VELOCITY = 4
 ADDR_OPERATING_MODE = 11
 CURRENT_CONTROL_MODE = 0
 POSITION_CONTROL_MODE = 3
+CURRENT_BASED_POSITION_CONTROL_MODE = 5
+ADDR_CURRENT_LIMIT = 38
+LEN_CURRENT_LIMIT = 2
+ADDR_VELOCITY_I_GAIN = 76
+ADDR_VELOCITY_P_GAIN = 78
+ADDR_POSITION_D_GAIN = 80
+ADDR_POSITION_I_GAIN = 82
+ADDR_POSITION_P_GAIN = 84
+LEN_GAIN = 2
 ADDR_PRESENT_CURRENT = 126
 LEN_PRESENT_CURRENT = 2
 
@@ -95,12 +104,45 @@ class DynamixelDriverProtocol(Protocol):
         """Set motor currents (mA) for current control mode."""
         ...
 
+    def write_goal_positions_unchecked(self, joint_angles: Sequence[float]):
+        """Write Goal Position without requiring torque to be enabled."""
+        ...
+
     def set_torque(self, torques: Sequence[float]):
         """Set joint torques (Nm), mapped to motor currents using servo mappings."""
         ...
 
     def set_operating_mode(self, mode: int):
         """Set the operating mode (e.g., CURRENT_CONTROL_MODE or POSITION_CONTROL_MODE)."""
+        ...
+
+    def set_current_limits(self, limits: Sequence[int]):
+        """Set per-servo Current Limit(38) values."""
+        ...
+
+    def set_goal_currents_raw(self, currents: Sequence[int]):
+        """Set per-servo Goal Current(102) values in raw Dynamixel units."""
+        ...
+
+    def set_position_pid_gains(
+        self,
+        p_gains: Optional[Sequence[int]] = None,
+        i_gains: Optional[Sequence[int]] = None,
+        d_gains: Optional[Sequence[int]] = None,
+    ):
+        """Set per-servo Position PID gains."""
+        ...
+
+    def set_velocity_pi_gains(
+        self,
+        p_gains: Optional[Sequence[int]] = None,
+        i_gains: Optional[Sequence[int]] = None,
+    ):
+        """Set per-servo Velocity PI gains."""
+        ...
+
+    def read_control_table_2byte(self, address: int, signed: bool = False) -> np.ndarray:
+        """Read a 2-byte register from all servos."""
         ...
 
     def verify_operating_mode(self, expected_mode: int):
@@ -146,6 +188,11 @@ class FakeDynamixelDriver(DynamixelDriverProtocol):
             raise RuntimeError("Torque must be enabled to set joint angles")
         self._joint_angles = np.array(joint_angles, dtype=float)
 
+    def write_goal_positions_unchecked(self, joint_angles: Sequence[float]):
+        if len(joint_angles) != len(self._ids):
+            raise ValueError("The length of joint_angles must match the number of servos")
+        self._joint_angles = np.array(joint_angles, dtype=float)
+
     def set_current(self, currents: Sequence[float]):
         if len(currents) != len(self._ids):
             raise ValueError("The length of currents must match the number of servos")
@@ -158,6 +205,30 @@ class FakeDynamixelDriver(DynamixelDriverProtocol):
 
     def set_operating_mode(self, mode: int):
         pass
+
+    def set_current_limits(self, limits: Sequence[int]):
+        pass
+
+    def set_goal_currents_raw(self, currents: Sequence[int]):
+        self._currents = np.array(currents, dtype=float)
+
+    def set_position_pid_gains(
+        self,
+        p_gains: Optional[Sequence[int]] = None,
+        i_gains: Optional[Sequence[int]] = None,
+        d_gains: Optional[Sequence[int]] = None,
+    ):
+        pass
+
+    def set_velocity_pi_gains(
+        self,
+        p_gains: Optional[Sequence[int]] = None,
+        i_gains: Optional[Sequence[int]] = None,
+    ):
+        pass
+
+    def read_control_table_2byte(self, address: int, signed: bool = False) -> np.ndarray:
+        return np.zeros(len(self._ids), dtype=np.int32)
 
     def verify_operating_mode(self, expected_mode: int):
         pass
@@ -537,35 +608,45 @@ class DynamixelDriver(DynamixelDriverProtocol):
             "error_rate": self._read_errors / max(self._read_count, 1),
         }
 
+    def _syncwrite_goal_positions(self, joint_angles: Sequence[float]) -> None:
+        if self._is_fake:
+            self._fake_joint_angles = np.array(joint_angles)
+            return
+
+        with self._lock:
+            try:
+                for dxl_id, angle in zip(self._ids, joint_angles):
+                    position_value = int(angle * 2048 / np.pi)
+                    param_goal_position = [
+                        DXL_LOBYTE(DXL_LOWORD(position_value)),
+                        DXL_HIBYTE(DXL_LOWORD(position_value)),
+                        DXL_LOBYTE(DXL_HIWORD(position_value)),
+                        DXL_HIBYTE(DXL_HIWORD(position_value)),
+                    ]
+                    if not self._groupSyncWrite.addParam(dxl_id, param_goal_position):
+                        raise RuntimeError(
+                            f"Failed to set joint angle for Dynamixel with ID {dxl_id}"
+                        )
+
+                dxl_comm_result = self._groupSyncWrite.txPacket()
+                if dxl_comm_result != COMM_SUCCESS:
+                    raise RuntimeError("Failed to syncwrite goal position")
+            finally:
+                self._groupSyncWrite.clearParam()
+
+    def write_goal_positions_unchecked(self, joint_angles: Sequence[float]):
+        """Write Goal Position(116) without requiring torque to be enabled."""
+        if len(joint_angles) != self._num_joints:
+            raise ValueError("The length of joint_angles must match the number of servos")
+        self._syncwrite_goal_positions(joint_angles)
+
     def set_joints(self, joint_angles: Sequence[float]):
         """Set goal positions for position control mode."""
         if len(joint_angles) != self._num_joints:
             raise ValueError("The length of joint_angles must match the number of servos")
         if not self._torque_enabled:
             raise RuntimeError("Torque must be enabled to set joint angles")
-
-        if self._is_fake:
-            self._fake_joint_angles = np.array(joint_angles)
-            return
-
-        with self._lock:
-            for dxl_id, angle in zip(self._ids, joint_angles):
-                position_value = int(angle * 2048 / np.pi)
-                param_goal_position = [
-                    DXL_LOBYTE(DXL_LOWORD(position_value)),
-                    DXL_HIBYTE(DXL_LOWORD(position_value)),
-                    DXL_LOBYTE(DXL_HIWORD(position_value)),
-                    DXL_HIBYTE(DXL_HIWORD(position_value)),
-                ]
-                if not self._groupSyncWrite.addParam(dxl_id, param_goal_position):
-                    raise RuntimeError(
-                        f"Failed to set joint angle for Dynamixel with ID {dxl_id}"
-                    )
-
-            dxl_comm_result = self._groupSyncWrite.txPacket()
-            if dxl_comm_result != COMM_SUCCESS:
-                raise RuntimeError("Failed to syncwrite goal position")
-            self._groupSyncWrite.clearParam()
+        self._syncwrite_goal_positions(joint_angles)
 
     def set_current(self, currents: Sequence[float]):
         """Set goal currents for current control mode."""
@@ -599,6 +680,82 @@ class DynamixelDriver(DynamixelDriverProtocol):
             if dxl_comm_result != COMM_SUCCESS:
                 raise RuntimeError("Failed to syncwrite goal current")
             self._groupSyncWriteCurrent.clearParam()
+
+    def _write_2byte_values(self, address: int, values: Sequence[int], signed: bool = False):
+        if len(values) != self._num_joints:
+            raise ValueError("The length of values must match the number of servos")
+        if self._is_fake:
+            return
+
+        with self._lock:
+            for dxl_id, value in zip(self._ids, values):
+                value_int = int(value)
+                if signed:
+                    value_int &= 0xFFFF
+                else:
+                    value_int = max(0, min(value_int, 0xFFFF))
+                dxl_comm_result, dxl_error = self._packetHandler.write2ByteTxRx(
+                    self._portHandler, dxl_id, address, value_int
+                )
+                if dxl_comm_result != COMM_SUCCESS or dxl_error != 0:
+                    raise RuntimeError(
+                        f"Failed to write 2-byte register {address} for Dynamixel ID {dxl_id}"
+                    )
+
+    def read_control_table_2byte(self, address: int, signed: bool = False) -> np.ndarray:
+        """Read a 2-byte register from all servos."""
+        if self._is_fake:
+            return np.zeros(self._num_joints, dtype=np.int32)
+
+        values = np.zeros(self._num_joints, dtype=np.int32)
+        with self._lock:
+            for i, dxl_id in enumerate(self._ids):
+                value, dxl_comm_result, dxl_error = self._packetHandler.read2ByteTxRx(
+                    self._portHandler, dxl_id, address
+                )
+                if dxl_comm_result != COMM_SUCCESS or dxl_error != 0:
+                    raise RuntimeError(
+                        f"Failed to read 2-byte register {address} for Dynamixel ID {dxl_id}"
+                    )
+                if signed and value > 0x7FFF:
+                    value -= 0x10000
+                values[i] = int(value)
+        return values
+
+    def set_current_limits(self, limits: Sequence[int]):
+        """Set Current Limit(38) for all servos in raw Dynamixel units."""
+        self._write_2byte_values(ADDR_CURRENT_LIMIT, limits, signed=False)
+        if self.current_limits is not None:
+            self.current_limits = np.asarray(limits, dtype=float)
+
+    def set_goal_currents_raw(self, currents: Sequence[int]):
+        """Set Goal Current(102) for all servos in raw Dynamixel units."""
+        self._write_2byte_values(ADDR_GOAL_CURRENT, currents, signed=True)
+
+    def set_position_pid_gains(
+        self,
+        p_gains: Optional[Sequence[int]] = None,
+        i_gains: Optional[Sequence[int]] = None,
+        d_gains: Optional[Sequence[int]] = None,
+    ):
+        """Set Position PID gains for all servos."""
+        if d_gains is not None:
+            self._write_2byte_values(ADDR_POSITION_D_GAIN, d_gains, signed=False)
+        if i_gains is not None:
+            self._write_2byte_values(ADDR_POSITION_I_GAIN, i_gains, signed=False)
+        if p_gains is not None:
+            self._write_2byte_values(ADDR_POSITION_P_GAIN, p_gains, signed=False)
+
+    def set_velocity_pi_gains(
+        self,
+        p_gains: Optional[Sequence[int]] = None,
+        i_gains: Optional[Sequence[int]] = None,
+    ):
+        """Set Velocity PI gains for all servos."""
+        if i_gains is not None:
+            self._write_2byte_values(ADDR_VELOCITY_I_GAIN, i_gains, signed=False)
+        if p_gains is not None:
+            self._write_2byte_values(ADDR_VELOCITY_P_GAIN, p_gains, signed=False)
 
     def set_torque(self, torques: Sequence[float]):
         """Set joint torques (Nm), converted to motor currents."""

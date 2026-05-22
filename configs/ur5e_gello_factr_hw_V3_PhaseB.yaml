@@ -30,7 +30,7 @@ arm_teleop:
     initial_match_joint_pos: [ 4.7, 3.14159, 1.57, 0.0, 1.57, -0.03 ]
     # Optional persistent leader offsets (raw -> decoded): q = sign * (raw - offset)
     # Measured with scripts/gello_get_offset.py (median over multiple runs)
-    joint_offsets: [-0.0593, 0.0, 0.134, 0.0, 0.0, 3.1416]
+    joint_offsets: [-0.0398, -0.0766, 0.0776, -0.0260, -0.1260, 3.1163]
     # If true, use joint_offsets above instead of running per-start offset search.
     use_precomputed_offsets: true
     # Per-boot turn-index disambiguation on top of permanent offsets (recommended for reproducibility).
@@ -64,8 +64,8 @@ controller:
     max_torque: 1.5   # Safety limit per joint (Nm)
   gravity_comp:
     enable: True
-    gain: 0.75
-    gain_per_joint: [0.5, 0.8, 1.0, 1.2, 1.2, 1.2]
+    gain: 0.7
+    gain_per_joint: [0.5, 0.8, 1.0, 1.2, 2.0, 2.0]
     velocity_damping: 0.04
   null_space_regulation:
     null_space_joint_target: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -115,7 +115,7 @@ controller:
     max_torque: 0.2
 
 teleop:
-  enable: false
+  enable: true
   use_direct_rtde: true
   hz: 250
   wait_for_server_timeout_s: 5.0
@@ -151,7 +151,7 @@ teleop:
     # Signs to align sim/hardware with leader frames
     signs: [1, 1, -1, 1, 1, 1]
     # Additional offsets (radians) applied to follower after signs
-    offsets: [-4.5378, -4.7124, 3.1416, -1.5708, -3.1416, 3.1416]
+    offsets: [-4.7162, -4.7196, 3.2220, -1.6382, -3.1613, 3.1194]
     # Alignment mode at startup:
     # - legacy_auto_align: old behavior (offsets = follower - mapped leader)
     # - turn_disambiguate: preserve configured offsets and only correct by integer 2pi turns

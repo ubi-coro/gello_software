@@ -9,6 +9,7 @@ mounted on GELLO.
 from __future__ import annotations
 
 import argparse
+import math
 import signal
 import sys
 import time
@@ -115,6 +116,29 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable matplotlib live plot. Best for clean frequency readings.",
     )
+    parser.add_argument(
+        "--ema-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "Enable EMA wrench filtering with fixed alpha in (0, 1]. "
+            "Set 0 to disable. Ignored when --ema-cutoff > 0."
+        ),
+    )
+    parser.add_argument(
+        "--ema-cutoff",
+        type=float,
+        default=0.0,
+        help=(
+            "Enable EMA wrench filtering using a cutoff frequency in Hz. "
+            "Alpha is recomputed from measured dt. Overrides --ema-alpha."
+        ),
+    )
+    parser.add_argument(
+        "--ema-print-only",
+        action="store_true",
+        help="Print EMA values but keep the live plot on raw wrench values.",
+    )
     return parser.parse_args()
 
 
@@ -164,6 +188,72 @@ def _print_sample(sample: WrenchSample, avg_hz: float, expected_hz: float | None
             ]
         ),
         flush=True,
+    )
+
+
+def _print_filtered_sample(
+    raw_sample: WrenchSample,
+    filtered_sample: WrenchSample,
+    avg_hz: float,
+    expected_hz: float | None,
+) -> None:
+    expected = f", expected={expected_hz:.2f} Hz" if expected_hz else ""
+    print(
+        " | ".join(
+            [
+                f"rate={avg_hz:.2f} Hz{expected}",
+                f"F={_format_vec(raw_sample.force, 'N')}",
+                f"T={_format_vec(raw_sample.torque, 'Nm')}",
+                f"F_ema={_format_vec(filtered_sample.force, 'N')}",
+                f"T_ema={_format_vec(filtered_sample.torque, 'Nm')}",
+                f"temp={raw_sample.temperature_c:.2f} C",
+                (
+                    "status="
+                    f"val={raw_sample.status_val} "
+                    f"thr={raw_sample.throttled} over={raw_sample.overrange} "
+                    f"invalid={raw_sample.invalid} raw={raw_sample.raw}"
+                ),
+                f"sensor_ts={raw_sample.sensor_timestamp_us} us",
+            ]
+        ),
+        flush=True,
+    )
+
+
+def _ema_alpha_from_cutoff(cutoff_hz: float, dt_s: float) -> float:
+    if cutoff_hz <= 0.0 or dt_s <= 0.0:
+        return 1.0
+    return 1.0 - math.exp(-2.0 * math.pi * cutoff_hz * dt_s)
+
+
+def _filtered_sample(
+    sample: WrenchSample,
+    previous: WrenchSample | None,
+    alpha: float,
+) -> WrenchSample:
+    if previous is None:
+        return sample
+
+    a = min(max(float(alpha), 0.0), 1.0)
+    force = tuple(
+        previous.force[idx] + a * (sample.force[idx] - previous.force[idx])
+        for idx in range(3)
+    )
+    torque = tuple(
+        previous.torque[idx] + a * (sample.torque[idx] - previous.torque[idx])
+        for idx in range(3)
+    )
+    return WrenchSample(
+        host_t=sample.host_t,
+        sensor_timestamp_us=sample.sensor_timestamp_us,
+        force=force,
+        torque=torque,
+        temperature_c=sample.temperature_c,
+        status_val=sample.status_val,
+        throttled=sample.throttled,
+        overrange=sample.overrange,
+        invalid=sample.invalid,
+        raw=sample.raw,
     )
 
 
@@ -310,7 +400,11 @@ def main() -> int:
 
     max_samples = max(10, int(args.buffer_seconds * args.nominal_rate))
     samples: Deque[WrenchSample] = deque(maxlen=max_samples)
+    plot_samples: Deque[WrenchSample] = deque(maxlen=max_samples)
     intervals_s: Deque[float] = deque(maxlen=max(2, int(args.rate_window)))
+    ema_enabled = args.ema_cutoff > 0.0 or args.ema_alpha > 0.0
+    filtered_sample: WrenchSample | None = None
+    last_filter_sensor_ts: int | None = None
 
     plot = None
     if not args.no_plot:
@@ -348,14 +442,44 @@ def main() -> int:
 
             if last_read_t is not None:
                 intervals_s.append(read_t - last_read_t)
+            dt_s = 0.0 if last_read_t is None else read_t - last_read_t
             last_read_t = read_t
 
+            if ema_enabled:
+                is_new_sensor_frame = sample.sensor_timestamp_us != last_filter_sensor_ts
+                if is_new_sensor_frame:
+                    if last_filter_sensor_ts is None:
+                        filter_dt_s = 0.0
+                    else:
+                        filter_dt_s = max(
+                            0.0,
+                            (sample.sensor_timestamp_us - last_filter_sensor_ts) * 1e-6,
+                        )
+                    if args.ema_cutoff > 0.0:
+                        alpha = _ema_alpha_from_cutoff(args.ema_cutoff, filter_dt_s)
+                    else:
+                        alpha = args.ema_alpha
+                    filtered_sample = _filtered_sample(sample, filtered_sample, alpha)
+                    last_filter_sensor_ts = sample.sensor_timestamp_us
+                plot_sample = sample if args.ema_print_only else filtered_sample or sample
+            else:
+                plot_sample = sample
+            plot_samples.append(plot_sample)
+
             if read_t - last_print_t >= 1.0 / max(args.print_rate, 1e-6):
-                _print_sample(sample, _frequency_hz(intervals_s), expected_hz)
+                if ema_enabled and filtered_sample is not None:
+                    _print_filtered_sample(
+                        sample,
+                        filtered_sample,
+                        _frequency_hz(intervals_s),
+                        expected_hz,
+                    )
+                else:
+                    _print_sample(sample, _frequency_hz(intervals_s), expected_hz)
                 last_print_t = read_t
 
             if plot and read_t - last_plot_t >= 1.0 / max(args.plot_rate, 1e-6):
-                plot.update(samples, start_t)
+                plot.update(plot_samples, start_t)
                 last_plot_t = read_t
 
             if args.poll:

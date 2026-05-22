@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import multiprocessing as mp
 import signal
 import sys
@@ -24,6 +25,15 @@ from gello.cr_dagger.ipc.shared_trajectory_buffer import SharedTrajectoryBuffer
 from gello.cr_dagger.policy.filtered_ddq import FilteredDDQComputer
 from gello.cr_dagger.policy.policy_worker import policy_worker
 from gello.cr_dagger.policy.trajectory_interpolator import TrajectoryInterpolator
+from gello.dynamixel.driver import (
+    ADDR_CURRENT_LIMIT,
+    ADDR_GOAL_CURRENT,
+    ADDR_POSITION_D_GAIN,
+    ADDR_POSITION_I_GAIN,
+    ADDR_POSITION_P_GAIN,
+    ADDR_VELOCITY_I_GAIN,
+    ADDR_VELOCITY_P_GAIN,
+)
 from gello.factr.gravity_compensation import FACTRGravityCompensation
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -96,6 +106,25 @@ def _expand_list(values: list[float], n: int, fill: float = 0.0) -> np.ndarray:
     if len(values) < n:
         return np.asarray(values + [fill] * (n - len(values)), dtype=float)
     return np.asarray(values[:n], dtype=float)
+
+
+def _parse_optional_int_array(value: str | None, n: int) -> np.ndarray | None:
+    if value is None or not str(value).strip():
+        return None
+    raw = [int(round(float(v.strip()))) for v in str(value).split(",") if v.strip()]
+    if not raw:
+        return None
+    if len(raw) == 1:
+        return np.full(n, raw[0], dtype=np.int32)
+    if len(raw) < n:
+        raw = raw + [raw[-1]] * (n - len(raw))
+    return np.asarray(raw[:n], dtype=np.int32)
+
+
+def _int_array_metadata(value: str | None) -> list[int]:
+    if value is None or not str(value).strip():
+        return []
+    return [int(round(float(v.strip()))) for v in str(value).split(",") if v.strip()]
 
 
 def _joint_array_from_value(value: Any, n: int, default: float) -> np.ndarray:
@@ -281,6 +310,7 @@ class BotaWrenchConditioner:
     def __init__(
         self,
         cutoff_hz: float,
+        alpha: float,
         deadband: np.ndarray,
         saturation: np.ndarray,
         gravity_comp: bool,
@@ -289,6 +319,7 @@ class BotaWrenchConditioner:
         gravity_sign: float,
     ):
         self.cutoff_hz = max(float(cutoff_hz), 0.0)
+        self.alpha = float(np.clip(float(alpha), 0.0, 1.0))
         self.deadband = np.asarray(deadband, dtype=float).reshape(6)
         self.saturation = np.asarray(saturation, dtype=float).reshape(6)
         self.gravity_comp = bool(gravity_comp)
@@ -298,13 +329,30 @@ class BotaWrenchConditioner:
         self.bias_sensor = np.zeros(6, dtype=float)
         self.filtered_base = np.zeros(6, dtype=float)
         self.initialized = False
+        self.last_filter_timestamp_us: int | None = None
+
+    def _filter_alpha(self, dt_s: float) -> float:
+        if self.cutoff_hz > 0.0:
+            if dt_s <= 0.0:
+                return 1.0
+            return 1.0 - math.exp(-2.0 * math.pi * self.cutoff_hz * dt_s)
+        if self.alpha > 0.0:
+            return self.alpha
+        return 1.0
 
     def set_bias(self, samples_sensor: list[np.ndarray]) -> None:
         if samples_sensor:
             self.bias_sensor = np.mean(np.asarray(samples_sensor, dtype=float), axis=0)
             print(f"[BOTA] software bias: {np.array2string(self.bias_sensor, precision=4)}")
 
-    def update(self, wrench_sensor_raw: np.ndarray, r_base_sensor: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarray]:
+    def update(
+        self,
+        wrench_sensor_raw: np.ndarray,
+        r_base_sensor: np.ndarray,
+        dt: float,
+        timestamp_us: int | None = None,
+        is_new_frame: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray]:
         wrench_sensor = np.asarray(wrench_sensor_raw, dtype=float).reshape(6) - self.bias_sensor
         force_base = r_base_sensor @ wrench_sensor[:3]
         torque_base = r_base_sensor @ wrench_sensor[3:]
@@ -317,16 +365,23 @@ class BotaWrenchConditioner:
             torque_g_base = np.cross(r_com_base, force_g_base)
             wrench_base = wrench_base - self.gravity_sign * np.concatenate([force_g_base, torque_g_base])
 
-        if self.cutoff_hz > 0.0:
-            tau = 1.0 / (2.0 * np.pi * self.cutoff_hz)
-            alpha = float(dt) / (tau + float(dt))
-        else:
-            alpha = 1.0
         if not self.initialized:
             self.filtered_base = wrench_base.copy()
             self.initialized = True
+            self.last_filter_timestamp_us = int(timestamp_us) if timestamp_us is not None else None
         else:
-            self.filtered_base = self.filtered_base + alpha * (wrench_base - self.filtered_base)
+            should_update = bool(is_new_frame)
+            filter_dt_s = max(float(dt), 0.0)
+            if timestamp_us is not None:
+                ts = int(timestamp_us)
+                should_update = self.last_filter_timestamp_us != ts
+                if should_update and self.last_filter_timestamp_us is not None:
+                    filter_dt_s = max(0.0, (ts - self.last_filter_timestamp_us) * 1e-6)
+                if should_update:
+                    self.last_filter_timestamp_us = ts
+            if should_update:
+                alpha = self._filter_alpha(filter_dt_s)
+                self.filtered_base = self.filtered_base + alpha * (wrench_base - self.filtered_base)
 
         conditioned = self.filtered_base.copy()
         conditioned = np.where(
@@ -377,7 +432,11 @@ class GelloTaskspaceKinematics:
             self.frame_id,
             self.pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
         )[:, : self.n_joints]
-        return np.asarray(pose.translation), np.asarray(pose.rotation), np.asarray(jac)
+        return (
+            np.asarray(pose.translation, dtype=float).copy(),
+            np.asarray(pose.rotation, dtype=float).copy(),
+            np.asarray(jac, dtype=float).copy(),
+        )
 
 
 class CartesianAdmittance6D:
@@ -410,6 +469,174 @@ class CartesianAdmittance6D:
         self.x *= self.axis_mask
         self.dx *= self.axis_mask
         return self.x.copy()
+
+
+def _so3_log(rotation: np.ndarray) -> np.ndarray:
+    r = np.asarray(rotation, dtype=float).reshape(3, 3)
+    cos_theta = float(np.clip((np.trace(r) - 1.0) * 0.5, -1.0, 1.0))
+    theta = math.acos(cos_theta)
+    vee = np.array([r[2, 1] - r[1, 2], r[0, 2] - r[2, 0], r[1, 0] - r[0, 1]], dtype=float)
+    if theta < 1e-6:
+        return 0.5 * vee
+    return theta / (2.0 * math.sin(theta)) * vee
+
+
+def _pose_error_base(
+    pos_current: np.ndarray,
+    rot_current: np.ndarray,
+    pos_ref: np.ndarray,
+    rot_ref: np.ndarray,
+) -> np.ndarray:
+    pos_err = np.asarray(pos_current, dtype=float).reshape(3) - np.asarray(pos_ref, dtype=float).reshape(3)
+    rot_err = _so3_log(np.asarray(rot_current, dtype=float).reshape(3, 3) @ np.asarray(rot_ref, dtype=float).reshape(3, 3).T)
+    return np.concatenate([pos_err, rot_err])
+
+
+class SE3PoseAdmittance6D:
+    """6D wrench admittance with SE(3) pose-error logging."""
+
+    def __init__(
+        self,
+        mass: np.ndarray,
+        damping: np.ndarray,
+        stiffness: np.ndarray,
+        leak: float,
+        max_offset: np.ndarray,
+        axis_mask: np.ndarray,
+        stiction: np.ndarray,
+        wrench_sign: float,
+        output_mode: str = "offset",
+    ):
+        self.mass = np.maximum(np.asarray(mass, dtype=float).reshape(6), 1e-6)
+        self.damping = np.maximum(np.asarray(damping, dtype=float).reshape(6), 0.0)
+        self.stiffness = np.maximum(np.asarray(stiffness, dtype=float).reshape(6), 0.0)
+        self.leak = max(float(leak), 0.0)
+        self.max_offset = np.maximum(np.asarray(max_offset, dtype=float).reshape(6), 1e-9)
+        self.axis_mask = np.asarray(axis_mask, dtype=float).reshape(6)
+        self.stiction = np.maximum(np.asarray(stiction, dtype=float).reshape(6), 0.0)
+        self.wrench_sign = 1.0 if float(wrench_sign) >= 0.0 else -1.0
+        self.output_mode = str(output_mode).lower()
+        if self.output_mode not in ("offset", "pose_error"):
+            raise ValueError("SE3PoseAdmittance6D output_mode must be 'offset' or 'pose_error'")
+        self.offset = np.zeros(6, dtype=float)
+        self.velocity = np.zeros(6, dtype=float)
+
+    def reset(self) -> None:
+        self.offset.fill(0.0)
+        self.velocity.fill(0.0)
+
+    def step(
+        self,
+        pos_ref: np.ndarray,
+        rot_ref: np.ndarray,
+        pos_current: np.ndarray,
+        rot_current: np.ndarray,
+        wrench_base: np.ndarray,
+        dt: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        dt_s = max(float(dt), 0.0)
+        pose_error = _pose_error_base(pos_current, rot_current, pos_ref, rot_ref)
+        pose_error *= self.axis_mask
+
+        wrench = self.wrench_sign * np.asarray(wrench_base, dtype=float).reshape(6)
+        wrench *= self.axis_mask
+
+        if self.output_mode == "pose_error":
+            spring_state = pose_error
+            wrench_all = wrench - self.stiffness * spring_state - self.damping * self.velocity
+            wrench_all *= self.axis_mask
+            wrench_all = np.where(
+                np.abs(wrench_all) > self.stiction,
+                wrench_all - np.sign(wrench_all) * self.stiction,
+                0.0,
+            )
+            ddx = wrench_all / self.mass
+            self.velocity = (1.0 - self.leak * dt_s) * (self.velocity + ddx * dt_s)
+            self.velocity *= self.axis_mask
+            command_error = pose_error + self.velocity * dt_s
+            command_error = np.clip(command_error, -self.max_offset, self.max_offset)
+            command_error *= self.axis_mask
+            if dt_s > 0.0:
+                self.velocity = (command_error - pose_error) / dt_s
+                self.velocity *= self.axis_mask
+            return command_error.copy(), pose_error.copy()
+
+        wrench_all = wrench - self.stiffness * self.offset - self.damping * self.velocity
+        wrench_all *= self.axis_mask
+        wrench_all = np.where(
+            np.abs(wrench_all) > self.stiction,
+            wrench_all - np.sign(wrench_all) * self.stiction,
+            0.0,
+        )
+        ddx = wrench_all / self.mass
+        self.velocity = (1.0 - self.leak * dt_s) * (self.velocity + ddx * dt_s)
+        self.velocity *= self.axis_mask
+        self.offset = self.offset + self.velocity * dt_s
+        self.offset = np.clip(self.offset, -self.max_offset, self.max_offset)
+        self.offset *= self.axis_mask
+        return self.offset.copy(), pose_error.copy()
+
+
+class ForceControlStyleAdmittance6D:
+    """Force-control-style HFVC admittance that outputs a 6D task offset.
+
+    This mirrors the control role of the original CR-DAgger hardware wrapper:
+    a virtual Cartesian mass-damper-spring centered on the policy reference.
+    It intentionally stops at a task-space offset because this script still
+    logs and commands leader corrections as joint-space delta_q via DLS.
+    """
+
+    def __init__(
+        self,
+        mass: np.ndarray,
+        damping: np.ndarray,
+        stiffness: np.ndarray,
+        leak: float,
+        max_offset: np.ndarray,
+        axis_mask: np.ndarray,
+        force_dims: int,
+        stiction: np.ndarray,
+        wrench_sign: float,
+    ):
+        self.mass = np.maximum(np.asarray(mass, dtype=float).reshape(6), 1e-6)
+        self.damping = np.maximum(np.asarray(damping, dtype=float).reshape(6), 0.0)
+        self.stiffness = np.maximum(np.asarray(stiffness, dtype=float).reshape(6), 0.0)
+        self.leak = max(float(leak), 0.0)
+        self.max_offset = np.maximum(np.asarray(max_offset, dtype=float).reshape(6), 1e-9)
+        self.axis_mask = np.asarray(axis_mask, dtype=float).reshape(6)
+        self.stiction = np.maximum(np.asarray(stiction, dtype=float).reshape(6), 0.0)
+        self.wrench_sign = 1.0 if float(wrench_sign) >= 0.0 else -1.0
+
+        n_force = int(np.clip(int(force_dims), 0, 6))
+        selection = np.zeros(6, dtype=float)
+        selection[:n_force] = 1.0
+        selection *= self.axis_mask
+        self.force_selection = selection
+
+        self.offset = np.zeros(6, dtype=float)
+        self.velocity = np.zeros(6, dtype=float)
+
+    def step(self, wrench_base: np.ndarray, dt: float) -> np.ndarray:
+        dt_s = max(float(dt), 0.0)
+        wrench = self.wrench_sign * np.asarray(wrench_base, dtype=float).reshape(6)
+        wrench *= self.force_selection
+
+        spring = self.stiffness * self.offset
+        damping = self.damping * self.velocity
+        wrench_all = self.force_selection * (wrench - spring - damping)
+        wrench_all = np.where(
+            np.abs(wrench_all) > self.stiction,
+            wrench_all - np.sign(wrench_all) * self.stiction,
+            0.0,
+        )
+
+        ddx = wrench_all / self.mass
+        self.velocity = (1.0 - self.leak * dt_s) * (self.velocity + ddx * dt_s)
+        self.velocity *= self.force_selection
+        self.offset = self.offset + self.velocity * dt_s
+        self.offset *= self.force_selection
+        self.offset = np.clip(self.offset, -self.max_offset, self.max_offset)
+        return self.offset.copy()
 
 
 def _damped_least_squares_delta_q(jacobian: np.ndarray, task_delta: np.ndarray, damping: float) -> np.ndarray:
@@ -478,6 +705,91 @@ def _start_prepared_teleop(system: FACTRGravityCompensation) -> bool:
     system.teleop_thread.start()
     print(f"[TELEOP] started follower mirroring thread ({mode} mode)")
     return True
+
+
+def _map_leader_delta_to_follower_delta(
+    system: FACTRGravityCompensation,
+    delta_leader: np.ndarray,
+    n: int,
+) -> np.ndarray:
+    delta = np.asarray(delta_leader[:n], dtype=float)
+    if system.map_index is None or system.map_signs is None:
+        return delta.copy()
+
+    lim = min(len(system.map_index), len(system.map_signs), n)
+    delta_follower = np.zeros(n, dtype=float)
+    for follower_idx in range(lim):
+        leader_idx = int(system.map_index[follower_idx])
+        if 0 <= leader_idx < len(delta):
+            delta_follower[follower_idx] = float(system.map_signs[follower_idx]) * delta[leader_idx]
+    return delta_follower
+
+
+def _start_direct_follower_command_thread(
+    system: FACTRGravityCompensation,
+    args: argparse.Namespace,
+    initial_target: np.ndarray,
+) -> tuple[threading.Event, threading.Lock, dict[str, np.ndarray], Thread]:
+    if not system.teleop_enabled or system._direct_follower_robot is None:
+        raise RuntimeError("Follower command thread requires teleop.enable=true with direct RTDE")
+
+    follower = system._direct_follower_robot
+    stop_event = threading.Event()
+    state_lock = threading.Lock()
+    state: dict[str, np.ndarray] = {"q": np.asarray(initial_target, dtype=float).copy()}
+
+    try:
+        q_follower_now, _ = system.get_follower_arm_state()
+        q_follower_now = np.asarray(q_follower_now[: len(state["q"])], dtype=float)
+        q_error = state["q"] - q_follower_now
+        print(
+            "[FOLLOWER] initial command error "
+            f"max={float(np.max(np.abs(q_error))):.4f}rad "
+            f"mean={float(np.mean(np.abs(q_error))):.4f}rad"
+        )
+    except Exception as exc:
+        print(f"[FOLLOWER] initial command error unavailable: {exc}")
+
+    def _worker() -> None:
+        dt_thread = 1.0 / 500.0
+        failures = 0
+        last_warn = 0.0
+        while not stop_event.is_set():
+            loop_t0 = time.perf_counter()
+            with state_lock:
+                q_target = state["q"].copy()
+            try:
+                ok = follower.command_joint_state_impedance(
+                    target_joints=q_target,
+                    target_velocities=None,
+                    kp=float(args.follower_kp),
+                    kd=float(args.follower_kd),
+                )
+                if ok is False:
+                    failures += 1
+                    now = time.monotonic()
+                    if now - last_warn > 1.0:
+                        last_warn = now
+                        print(f"[FOLLOWER] directTorque returned False ({failures} total)")
+            except Exception as exc:
+                failures += 1
+                now = time.monotonic()
+                if now - last_warn > 1.0:
+                    last_warn = now
+                    print(f"[FOLLOWER] command failed ({failures} total): {exc}")
+
+            sleep_time = dt_thread - (time.perf_counter() - loop_t0)
+            if sleep_time > 0.0:
+                time.sleep(sleep_time)
+
+    thread = Thread(
+        target=_worker,
+        daemon=True,
+        name="leader-admittance-position-follower-command",
+    )
+    thread.start()
+    print("[FOLLOWER] direct command thread started (500Hz, source=q_ref+delta)")
+    return stop_event, state_lock, state, thread
 
 
 def _parse_args() -> argparse.Namespace:
@@ -551,15 +863,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--adm-delta-max", type=float, default=0.25)
     p.add_argument(
         "--admittance-source",
-        choices=["observer", "bota_cartesian", "bota_joint"],
+        choices=["observer", "bota_cartesian", "bota_hfvc", "bota_se3", "bota_joint"],
         default="observer",
         help="Signal used to drive leader_admittance_position. Bota sources also log the other projection.",
     )
     p.add_argument("--bota-enable", action="store_true", help="Open MiniOne and record conditioned wrench signals.")
     p.add_argument("--bota-config", type=str, default="configs/bota_binary.json")
     p.add_argument("--bota-driver-tare", action="store_true", help="Call bota_driver.tare() before activation.")
-    p.add_argument("--bota-bias-seconds", type=float, default=1.0, help="Software bias collection duration after activation.")
-    p.add_argument("--bota-filter-cutoff", type=float, default=20.0, help="EMA low-pass cutoff for base-frame wrench.")
+    p.add_argument("--bota-warmup-seconds", type=float, default=0.0, help="Discard Bota frames for this long after activation before bias/logging/admittance.")
+    p.add_argument("--bota-bias-seconds", type=float, default=1.0, help="Software bias collection duration after activation/warmup. Set 0 to disable.")
+    p.add_argument("--bota-filter-cutoff", type=float, default=20.0, help="EMA low-pass cutoff for base-frame wrench. Set <=0 to use --bota-filter-alpha or disable filtering.")
+    p.add_argument("--bota-filter-alpha", type=float, default=0.0, help="Fixed EMA alpha in (0, 1]; used only when --bota-filter-cutoff <= 0.")
     p.add_argument("--bota-deadband", type=str, default="0.25,0.25,0.25,0.01,0.01,0.01")
     p.add_argument("--bota-saturation", type=str, default="25,25,25,1.5,1.5,1.5")
     p.add_argument("--bota-gravity-comp", action="store_true", help="Subtract modeled payload gravity from the MiniOne wrench.")
@@ -572,8 +886,60 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--bota-cart-damp", type=str, default="35,35,35,1.5,1.5,1.5")
     p.add_argument("--bota-cart-stiff", type=str, default="70,70,70,4,4,4")
     p.add_argument("--bota-cart-max", type=str, default="0.08,0.08,0.08,0.35,0.35,0.35")
+    p.add_argument("--bota-hfvc-force-dims", type=int, default=6, help="Number of force-controlled task axes for bota_hfvc, starting from x,y,z,rx,ry,rz.")
+    p.add_argument("--bota-hfvc-stiction", type=str, default="0,0,0,0,0,0", help="6D wrench deadzone inside the HFVC admittance after BOTA conditioning.")
+    p.add_argument("--bota-wrench-sign", type=float, default=1.0, help="Set to -1 if bota_hfvc/bota_se3 moves opposite to the intended push direction.")
+    p.add_argument(
+        "--bota-se3-output-mode",
+        choices=["offset", "pose_error"],
+        default="offset",
+        help="offset: no-force SE3 admittance decays to zero; pose_error: legacy mode that also follows leader sag.",
+    )
     p.add_argument("--bota-joint-gain", type=float, default=1.0, help="Gain for J.T @ wrench before joint-space admittance.")
     p.add_argument("--bota-dls-damping", type=float, default=0.03, help="Damped least-squares factor for Cartesian delta_q.")
+    p.add_argument(
+        "--leader-position-operating-mode",
+        type=int,
+        choices=[3, 5],
+        default=3,
+        help="DYNAMIXEL mode used by leader_admittance_position: 3=position, 5=current-based position.",
+    )
+    p.add_argument(
+        "--leader-position-handoff-settle-seconds",
+        type=float,
+        default=0.35,
+        help="Seconds to let DYNAMIXEL position mode settle before rebasing the held pose.",
+    )
+    p.add_argument(
+        "--leader-position-arm-settle-seconds",
+        type=float,
+        default=0.5,
+        help="Unrecorded settle time after handoff/follower arming before the test clock starts.",
+    )
+    p.add_argument(
+        "--leader-position-recover-pre-handoff",
+        action="store_true",
+        help="After position-mode handoff, recover the leader to the pre-handoff pose before follower/recording are armed.",
+    )
+    p.add_argument(
+        "--leader-position-recover-seconds",
+        type=float,
+        default=0.8,
+        help="Duration for optional unrecorded recovery to the pre-handoff pose.",
+    )
+    p.add_argument(
+        "--leader-position-recover-max-delta",
+        type=float,
+        default=0.35,
+        help="Skip optional pre-handoff recovery if any wrapped joint delta exceeds this value; set <=0 to disable limit.",
+    )
+    p.add_argument("--leader-current-limit", type=str, default="", help="Raw Current Limit(38) as scalar or comma list. Empty leaves device value unchanged.")
+    p.add_argument("--leader-goal-current", type=str, default="", help="Raw Goal Current(102) as scalar or comma list. Used for current-based position tests.")
+    p.add_argument("--leader-position-p-gains", type=str, default="", help="Position P Gain(84) as scalar or comma list after operating-mode switch.")
+    p.add_argument("--leader-position-i-gains", type=str, default="", help="Position I Gain(82) as scalar or comma list after operating-mode switch.")
+    p.add_argument("--leader-position-d-gains", type=str, default="", help="Position D Gain(80) as scalar or comma list after operating-mode switch.")
+    p.add_argument("--leader-velocity-p-gains", type=str, default="", help="Velocity P Gain(78) as scalar or comma list after operating-mode switch.")
+    p.add_argument("--leader-velocity-i-gains", type=str, default="", help="Velocity I Gain(76) as scalar or comma list after operating-mode switch.")
     p.add_argument("--bota-contact-force-scale", type=float, default=8.0)
     p.add_argument("--bota-contact-torque-scale", type=float, default=0.35)
     p.add_argument(
@@ -637,6 +1003,56 @@ def _resolve_arch_mode(args: argparse.Namespace) -> str:
     if args.target == "follower":
         return "follower_tracking"
     return "leader_tracking"
+
+
+def _leader_position_local_reference(
+    args: argparse.Namespace,
+    n: int,
+    center: np.ndarray,
+    elapsed_s: float,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    mode = str(args.test_mode)
+    q_ref = np.asarray(center[:n], dtype=float).copy()
+    dq_ref = np.zeros(n, dtype=float)
+    t = max(float(elapsed_s), 0.0)
+
+    if mode == "static_hold":
+        return q_ref, dq_ref
+
+    if mode == "sine":
+        amplitudes = np.zeros(n, dtype=float)
+        frequencies = np.zeros(n, dtype=float)
+        if 0 <= int(args.joint_index) < n:
+            amplitudes[int(args.joint_index)] = float(args.amplitude)
+            frequencies[int(args.joint_index)] = float(args.frequency)
+        else:
+            amplitudes[:] = float(args.amplitude)
+            frequencies[:] = float(args.frequency)
+        phase = 2.0 * np.pi * frequencies * t
+        q_ref = q_ref + amplitudes * np.sin(phase)
+        dq_ref = amplitudes * 2.0 * np.pi * frequencies * np.cos(phase)
+        return q_ref, dq_ref
+
+    if mode == "multi_joint":
+        amplitudes = _expand_list(_parse_float_list(args.multi_amplitudes), n, 0.0)
+        frequencies = _expand_list(_parse_float_list(args.multi_frequencies), n, 0.2)
+        phase = 2.0 * np.pi * frequencies * t
+        q_ref = q_ref + amplitudes * np.sin(phase)
+        dq_ref = amplitudes * 2.0 * np.pi * frequencies * np.cos(phase)
+        return q_ref, dq_ref
+
+    if mode == "ramp":
+        duration = max(float(args.ramp_duration), 1e-6)
+        alpha = float(np.clip(t / duration, 0.0, 1.0))
+        q_end = q_ref.copy()
+        if 0 <= int(args.joint_index) < n:
+            q_end[int(args.joint_index)] += float(args.ramp_delta)
+        q_ref = (1.0 - alpha) * q_ref + alpha * q_end
+        if alpha < 1.0 and 0 <= int(args.joint_index) < n:
+            dq_ref[int(args.joint_index)] = float(args.ramp_delta) / duration
+        return q_ref, dq_ref
+
+    return None
 
 
 def _build_policy(
@@ -715,6 +1131,63 @@ def _sleep_remaining(dt: float, t_start: float) -> None:
         time.sleep(sleep_s)
 
 
+def _wrap_angle_delta(delta: np.ndarray) -> np.ndarray:
+    return (np.asarray(delta, dtype=float) + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def _recover_leader_position_after_handoff(
+    system: FACTRGravityCompensation,
+    target_raw_pre_handoff: np.ndarray,
+    current_raw: np.ndarray,
+    args: argparse.Namespace,
+) -> np.ndarray:
+    n = int(system.num_arm_joints)
+    duration = max(float(getattr(args, "leader_position_recover_seconds", 0.0)), 0.0)
+    max_delta = max(float(getattr(args, "leader_position_recover_max_delta", 0.0)), 0.0)
+    if duration <= 0.0:
+        return np.asarray(current_raw, dtype=float).copy()
+
+    target_raw_pre_handoff = np.asarray(target_raw_pre_handoff, dtype=float)
+    current_raw = np.asarray(current_raw, dtype=float)
+    if target_raw_pre_handoff.shape[0] != current_raw.shape[0]:
+        print("[DXL] pre-handoff recovery skipped: target/current length mismatch")
+        return current_raw.copy()
+
+    delta_raw = np.zeros_like(current_raw)
+    delta_raw[:n] = _wrap_angle_delta(target_raw_pre_handoff[:n] - current_raw[:n])
+    max_abs = float(np.max(np.abs(delta_raw[:n]))) if n > 0 else 0.0
+    mean_abs = float(np.mean(np.abs(delta_raw[:n]))) if n > 0 else 0.0
+    if max_delta > 0.0 and max_abs > max_delta:
+        print(
+            "[DXL] pre-handoff recovery skipped: "
+            f"target delta max={max_abs:.4f}rad exceeds limit {max_delta:.4f}rad"
+        )
+        return current_raw.copy()
+
+    target_raw = current_raw + delta_raw
+    if system.num_motors > n:
+        target_raw[n:] = current_raw[n:]
+
+    print(
+        "[DXL] recovering leader to pre-handoff pose "
+        f"over {duration:.2f}s max={max_abs:.4f}rad mean={mean_abs:.4f}rad"
+    )
+    steps = max(1, int(np.ceil(duration / max(float(system.dt), 1e-3))))
+    start_raw = current_raw.copy()
+    for step in range(1, steps + 1):
+        alpha = step / steps
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+        cmd = start_raw + alpha * (target_raw - start_raw)
+        system.driver.set_joints(cmd.tolist())
+        time.sleep(max(float(system.dt), 0.001))
+
+    raw_after = np.asarray(system.driver.get_joints(), dtype=float)
+    if raw_after.shape[0] != current_raw.shape[0]:
+        raw_after = target_raw
+    system.driver.set_joints(raw_after.tolist())
+    return raw_after
+
+
 def _leader_gravity_hold(system: FACTRGravityCompensation, dt: float) -> np.ndarray:
     q, dq, _, _ = system.get_leader_joint_states()
     tau_grav = system.gravity_compensation(q, dq)
@@ -724,6 +1197,155 @@ def _leader_gravity_hold(system: FACTRGravityCompensation, dt: float) -> np.ndar
     system.set_leader_joint_torque(tau_hold, 0.0)
     time.sleep(max(0.0, dt - 0.0005))
     return np.asarray(tau_hold, dtype=float)
+
+
+def _readback_2byte(driver: Any, address: int, signed: bool = False) -> list[int]:
+    if not hasattr(driver, "read_control_table_2byte"):
+        return []
+    try:
+        return [int(v) for v in driver.read_control_table_2byte(address, signed=signed).tolist()]
+    except Exception as exc:
+        print(f"[DXL] readback failed for register {address}: {exc}")
+        return []
+
+
+def _switch_leader_to_position_hold(
+    system: FACTRGravityCompensation, args: argparse.Namespace
+) -> np.ndarray:
+    """Enter Dynamixel position mode and return the pose actually held after handoff."""
+    if system.driver is None:
+        return np.zeros(int(system.num_motors), dtype=float)
+
+    raw_pos_now = np.asarray(system.driver.get_joints(), dtype=float)
+    if raw_pos_now.shape[0] != int(system.num_motors):
+        raise RuntimeError(
+            "Unexpected Dynamixel state length during position-mode handoff "
+            f"(got {raw_pos_now.shape[0]}, expected {system.num_motors})"
+        )
+
+    num_motors = int(system.num_motors)
+    operating_mode = int(args.leader_position_operating_mode)
+    if operating_mode not in (3, 5):
+        raise ValueError("--leader-position-operating-mode must be 3 or 5")
+
+    current_limit = _parse_optional_int_array(args.leader_current_limit, num_motors)
+    goal_current = _parse_optional_int_array(args.leader_goal_current, num_motors)
+    pos_p = _parse_optional_int_array(args.leader_position_p_gains, num_motors)
+    pos_i = _parse_optional_int_array(args.leader_position_i_gains, num_motors)
+    pos_d = _parse_optional_int_array(args.leader_position_d_gains, num_motors)
+    vel_p = _parse_optional_int_array(args.leader_velocity_p_gains, num_motors)
+    vel_i = _parse_optional_int_array(args.leader_velocity_i_gains, num_motors)
+
+    setattr(system, "_leader_position_pre_handoff_raw", raw_pos_now.copy())
+
+    system.driver.set_torque_mode(False)
+    time.sleep(0.02)
+
+    restore: dict[str, list[int]] = {}
+    if current_limit is not None:
+        previous = _readback_2byte(system.driver, ADDR_CURRENT_LIMIT)
+        if previous:
+            restore["current_limit"] = previous
+
+    system.driver.set_operating_mode(operating_mode)
+    time.sleep(0.02)
+    if hasattr(system.driver, "verify_operating_mode"):
+        system.driver.verify_operating_mode(operating_mode)
+
+    if current_limit is not None:
+        system.driver.set_current_limits(current_limit.tolist())
+        time.sleep(0.01)
+
+    if operating_mode == 5 and goal_current is None and current_limit is not None:
+        goal_current = current_limit.copy()
+    if goal_current is not None:
+        system.driver.set_goal_currents_raw(goal_current.tolist())
+        time.sleep(0.01)
+
+    if any(v is not None for v in (pos_p, pos_i, pos_d)):
+        system.driver.set_position_pid_gains(
+            p_gains=None if pos_p is None else pos_p.tolist(),
+            i_gains=None if pos_i is None else pos_i.tolist(),
+            d_gains=None if pos_d is None else pos_d.tolist(),
+        )
+        time.sleep(0.01)
+
+    if any(v is not None for v in (vel_p, vel_i)):
+        system.driver.set_velocity_pi_gains(
+            p_gains=None if vel_p is None else vel_p.tolist(),
+            i_gains=None if vel_i is None else vel_i.tolist(),
+        )
+        time.sleep(0.01)
+
+    setattr(system, "_leader_position_handoff_restore", restore)
+
+    print(f"[DXL] leader position handoff operating_mode={operating_mode}")
+    readbacks = {
+        "current_limit": _readback_2byte(system.driver, ADDR_CURRENT_LIMIT),
+        "goal_current": _readback_2byte(system.driver, ADDR_GOAL_CURRENT, signed=True),
+        "pos_p": _readback_2byte(system.driver, ADDR_POSITION_P_GAIN),
+        "pos_i": _readback_2byte(system.driver, ADDR_POSITION_I_GAIN),
+        "pos_d": _readback_2byte(system.driver, ADDR_POSITION_D_GAIN),
+        "vel_p": _readback_2byte(system.driver, ADDR_VELOCITY_P_GAIN),
+        "vel_i": _readback_2byte(system.driver, ADDR_VELOCITY_I_GAIN),
+    }
+    for name, values in readbacks.items():
+        if values:
+            print(f"[DXL] {name}: {values}")
+
+    raw_pos_post_mode = np.asarray(system.driver.get_joints(), dtype=float)
+    if raw_pos_post_mode.shape[0] != int(system.num_motors):
+        raw_pos_post_mode = raw_pos_now
+    handoff_motion = _wrap_angle_delta(raw_pos_post_mode[: system.num_arm_joints] - raw_pos_now[: system.num_arm_joints])
+    print(
+        "[DXL] handoff pre-torque drift "
+        f"max={float(np.max(np.abs(handoff_motion))):.4f}rad "
+        f"mean={float(np.mean(np.abs(handoff_motion))):.4f}rad"
+    )
+
+    # Preload the settled/current position as Goal Position before torque is
+    # re-enabled. Otherwise the position controller first pulls back to the
+    # pre-mode-switch pose, which looks like a synthetic intervention.
+    if hasattr(system.driver, "write_goal_positions_unchecked"):
+        system.driver.write_goal_positions_unchecked(raw_pos_post_mode.tolist())
+    else:
+        system.driver.set_torque_mode(True)
+        time.sleep(0.005)
+        system.driver.set_joints(raw_pos_post_mode.tolist())
+        time.sleep(0.005)
+        raw_pos_post_mode = np.asarray(system.driver.get_joints(), dtype=float)
+        if raw_pos_post_mode.shape[0] != int(system.num_motors):
+            raw_pos_post_mode = raw_pos_now
+        system.driver.set_torque_mode(False)
+        time.sleep(0.005)
+    time.sleep(0.005)
+    system.driver.set_torque_mode(True)
+    time.sleep(0.02)
+
+    settle_s = max(float(getattr(args, "leader_position_handoff_settle_seconds", 0.0)), 0.0)
+    if settle_s > 0.0:
+        print(
+            f"[DXL] settling position hold for {settle_s:.2f}s before rebase "
+            "(hands off unless safety requires support)"
+        )
+        t_settle = time.perf_counter()
+        while time.perf_counter() - t_settle < settle_s:
+            time.sleep(min(0.02, max(0.0, settle_s - (time.perf_counter() - t_settle))))
+
+    # Rebase again after the position controller has settled so static tests do
+    # not carry residual startup error from the mode switch itself.
+    raw_pos_after = np.asarray(system.driver.get_joints(), dtype=float)
+    if raw_pos_after.shape[0] != int(system.num_motors):
+        return raw_pos_post_mode
+    post_enable_motion = _wrap_angle_delta(raw_pos_after[: system.num_arm_joints] - raw_pos_post_mode[: system.num_arm_joints])
+    print(
+        "[DXL] handoff post-enable drift "
+        f"max={float(np.max(np.abs(post_enable_motion))):.4f}rad "
+        f"mean={float(np.mean(np.abs(post_enable_motion))):.4f}rad"
+    )
+    system.driver.set_joints(raw_pos_after.tolist())
+    time.sleep(0.02)
+    return raw_pos_after
 
 
 def _prime_policy_impedance_from_hold(system: FACTRGravityCompensation) -> np.ndarray:
@@ -1247,9 +1869,20 @@ def _run_leader_admittance_position_mode(
             "leader_admittance_impedance --admittance-observer yamane instead."
         )
 
+    follower_cmd_stop: threading.Event | None = None
+    follower_cmd_lock: threading.Lock | None = None
+    follower_cmd_state: dict[str, np.ndarray] | None = None
+    follower_cmd_thread: Thread | None = None
     if not args.no_follower:
-        if not _start_prepared_teleop(system):
-            print("[WARN] teleop could not be started; continuing without follower")
+        if (
+            not system.teleop_enabled
+            or not system.teleop_prepared
+            or system._direct_follower_robot is None
+        ):
+            raise RuntimeError(
+                "leader_admittance_position with follower requires a prepared "
+                "direct-RTDE follower. Check teleop.enable and follower setup."
+            )
 
     if float(args.settle_time) > 0.0:
         print("[SETTLE] gravity comp warmup")
@@ -1277,6 +1910,8 @@ def _run_leader_admittance_position_mode(
     bota_conditioner: BotaWrenchConditioner | None = None
     bota_kin: GelloTaskspaceKinematics | None = None
     bota_cart: CartesianAdmittance6D | None = None
+    bota_hfvc: ForceControlStyleAdmittance6D | None = None
+    bota_se3: SE3PoseAdmittance6D | None = None
     bota_config = Path(args.bota_config)
     if not bota_config.is_absolute():
         bota_config = (REPO_ROOT / bota_config).resolve()
@@ -1289,6 +1924,7 @@ def _run_leader_admittance_position_mode(
         )
         bota_conditioner = BotaWrenchConditioner(
             cutoff_hz=float(args.bota_filter_cutoff),
+            alpha=float(args.bota_filter_alpha),
             deadband=_expand_list(_parse_float_list(args.bota_deadband), 6, 0.0),
             saturation=_expand_list(_parse_float_list(args.bota_saturation), 6, 1e9),
             gravity_comp=bool(args.bota_gravity_comp),
@@ -1304,41 +1940,148 @@ def _run_leader_admittance_position_mode(
             max_offset=_expand_list(_parse_float_list(args.bota_cart_max), 6, 0.05),
             axis_mask=_expand_list(_parse_float_list(args.bota_axis_mask), 6, 1.0),
         )
+        bota_hfvc = ForceControlStyleAdmittance6D(
+            mass=_expand_list(_parse_float_list(args.bota_cart_mass), 6, 1.0),
+            damping=_expand_list(_parse_float_list(args.bota_cart_damp), 6, 1.0),
+            stiffness=_expand_list(_parse_float_list(args.bota_cart_stiff), 6, 0.0),
+            leak=leak,
+            max_offset=_expand_list(_parse_float_list(args.bota_cart_max), 6, 0.05),
+            axis_mask=_expand_list(_parse_float_list(args.bota_axis_mask), 6, 1.0),
+            force_dims=int(args.bota_hfvc_force_dims),
+            stiction=_expand_list(_parse_float_list(args.bota_hfvc_stiction), 6, 0.0),
+            wrench_sign=float(args.bota_wrench_sign),
+        )
+        bota_se3 = SE3PoseAdmittance6D(
+            mass=_expand_list(_parse_float_list(args.bota_cart_mass), 6, 1.0),
+            damping=_expand_list(_parse_float_list(args.bota_cart_damp), 6, 1.0),
+            stiffness=_expand_list(_parse_float_list(args.bota_cart_stiff), 6, 0.0),
+            leak=leak,
+            max_offset=_expand_list(_parse_float_list(args.bota_cart_max), 6, 0.05),
+            axis_mask=_expand_list(_parse_float_list(args.bota_axis_mask), 6, 1.0),
+            stiction=_expand_list(_parse_float_list(args.bota_hfvc_stiction), 6, 0.0),
+            wrench_sign=float(args.bota_wrench_sign),
+            output_mode=str(args.bota_se3_output_mode),
+        )
         bota_reader = BotaMiniOneReader(bota_config, driver_tare=bool(args.bota_driver_tare))
         bota_reader.start()
+
+        warmup_seconds = max(float(args.bota_warmup_seconds), 0.0)
+        if warmup_seconds > 0.0:
+            print(f"[BOTA] warmup/discarding frames for {warmup_seconds:.2f}s")
+            t_warmup = time.perf_counter()
+            warmup_new = 0
+            warmup_dup = 0
+            while time.perf_counter() - t_warmup < warmup_seconds:
+                try:
+                    *_, is_new = bota_reader.read_latest()
+                    if is_new:
+                        warmup_new += 1
+                    else:
+                        warmup_dup += 1
+                except Exception as exc:
+                    print(f"[WARN] Bota warmup read failed: {exc}")
+                    break
+                _leader_gravity_hold(system, dt)
+            print(f"[BOTA] warmup frames new={warmup_new} duplicate={warmup_dup}")
+
         bias_samples: list[np.ndarray] = []
         bias_seconds = max(float(args.bota_bias_seconds), 0.0)
         if bias_seconds > 0.0:
             print(f"[BOTA] collecting software bias for {bias_seconds:.2f}s")
             t_bias = time.perf_counter()
+            bias_new = 0
+            bias_dup = 0
             while time.perf_counter() - t_bias < bias_seconds:
                 try:
-                    raw_wrench, *_ = bota_reader.read_latest()
-                    bias_samples.append(raw_wrench.copy())
+                    raw_wrench, *_, is_new = bota_reader.read_latest()
+                    if is_new:
+                        bias_samples.append(raw_wrench.copy())
+                        bias_new += 1
+                    else:
+                        bias_dup += 1
                 except Exception as exc:
                     print(f"[WARN] Bota bias read failed: {exc}")
                     break
                 _leader_gravity_hold(system, dt)
-                time.sleep(max(0.0, dt))
+            print(f"[BOTA] bias frames new={bias_new} duplicate={bias_dup}")
             bota_conditioner.set_bias(bias_samples)
         print(
             "[BOTA] enabled "
             f"source={admittance_source} frame={bota_kin.frame_name} "
-            f"gravity_comp={bool(args.bota_gravity_comp)}"
+            f"gravity_comp={bool(args.bota_gravity_comp)} "
+            f"filter_cutoff={float(args.bota_filter_cutoff):.2f}Hz "
+            f"filter_alpha={float(args.bota_filter_alpha):.3f}"
         )
 
     print(f"[ADMITTANCE] position mode observer={observer_mode} source={admittance_source}")
     if system.driver is not None:
-        system.driver.set_torque_mode(False)
-        time.sleep(0.05)
-        system.driver.set_operating_mode(3)
-        time.sleep(0.05)
-        system.driver.set_torque_mode(True)
-        time.sleep(0.05)
+        raw_pos_hold = _switch_leader_to_position_hold(system, args)
+        if bool(getattr(args, "leader_position_recover_pre_handoff", False)):
+            pre_handoff_raw = getattr(system, "_leader_position_pre_handoff_raw", None)
+            if pre_handoff_raw is not None:
+                raw_pos_hold = _recover_leader_position_after_handoff(
+                    system,
+                    np.asarray(pre_handoff_raw, dtype=float),
+                    raw_pos_hold,
+                    args,
+                )
+            else:
+                print("[DXL] pre-handoff recovery requested but no pre-handoff pose is available")
+        last_sent_raw = raw_pos_hold.copy()
+        q_c = (
+            raw_pos_hold[:n] - system.joint_offsets[:n]
+        ) * system.joint_signs[:n]
+        q_bota_joint = q_c.copy()
+        dq_c = np.zeros(n, dtype=float)
+        dq_bota_joint = np.zeros(n, dtype=float)
+    else:
+        last_sent_raw = np.zeros(system.num_motors, dtype=float)
+
+    position_mode_hold_q = q_c.copy()
+    if bota_se3 is not None:
+        bota_se3.reset()
+    if str(args.test_mode) == "static_hold" and hasattr(traj_interp, "traj_buf"):
+        traj_interp.traj_buf.write(
+            np.tile(position_mode_hold_q, (int(args.horizon), 1)),
+            time.monotonic(),
+        )
+
+    if not args.no_follower:
+        initial_follower_action = system._build_follower_action(
+            q_c,
+            float(getattr(system, "gripper_pos", 0.0)),
+        )
+        initial_follower_target = np.asarray(initial_follower_action[:n], dtype=float)
+        (
+            follower_cmd_stop,
+            follower_cmd_lock,
+            follower_cmd_state,
+            follower_cmd_thread,
+        ) = _start_direct_follower_command_thread(system, args, initial_follower_target)
+
+    arm_settle_s = max(float(getattr(args, "leader_position_arm_settle_seconds", 0.0)), 0.0)
+    if arm_settle_s > 0.0:
+        print(
+            f"[ARMING] settling {arm_settle_s:.2f}s after handoff/follower start "
+            "before test clock and recording"
+        )
+        t_arm = time.perf_counter()
+        while time.perf_counter() - t_arm < arm_settle_s:
+            time.sleep(min(0.02, max(0.0, arm_settle_s - (time.perf_counter() - t_arm))))
+
+    if bota_se3 is not None:
+        bota_se3.reset()
+    if hasattr(traj_interp, "traj_buf"):
+        traj_interp.traj_buf.write(
+            np.tile(position_mode_hold_q, (int(args.horizon), 1)),
+            time.monotonic(),
+        )
 
     t_start = time.monotonic()
+    local_reference_center = position_mode_hold_q.copy()
     last_warn = 0.0
     last_bota_warn = 0.0
+    last_follower_cmd_warn = 0.0
 
     try:
         while True:
@@ -1378,7 +2121,17 @@ def _run_leader_admittance_position_mode(
                     currents = system.driver.get_currents()
                     currents_arm = np.asarray(currents[:n], dtype=float) * system.joint_signs[:n]
 
-            q_ref, dq_ref, is_stale = traj_interp.get_reference(t_mono)
+            local_ref = _leader_position_local_reference(
+                args,
+                n,
+                local_reference_center,
+                t_mono - t_start,
+            )
+            if local_ref is not None:
+                q_ref, dq_ref = local_ref
+                is_stale = False
+            else:
+                q_ref, dq_ref, is_stale = traj_interp.get_reference(t_mono)
             ddq_ref = ddq_computer.update(dq_ref, t_mono)
 
             bota_wrench_raw = np.zeros(6, dtype=float)
@@ -1386,18 +2139,27 @@ def _run_leader_admittance_position_mode(
             bota_wrench_conditioned = np.zeros(6, dtype=float)
             bota_tau_joint = np.zeros(n, dtype=float)
             bota_delta_q_cartesian = np.zeros(n, dtype=float)
+            bota_delta_q_hfvc = np.zeros(n, dtype=float)
+            bota_delta_q_se3 = np.zeros(n, dtype=float)
             bota_delta_q_joint = np.zeros(n, dtype=float)
             bota_task_offset = np.zeros(6, dtype=float)
+            bota_task_offset_hfvc = np.zeros(6, dtype=float)
+            bota_task_offset_se3 = np.zeros(6, dtype=float)
+            bota_pose_error_se3 = np.zeros(6, dtype=float)
             bota_status = np.zeros(4, dtype=float)
 
             if bota_enabled and bota_reader is not None and bota_conditioner is not None and bota_kin is not None:
                 try:
-                    bota_wrench_raw, bota_status, _, _, _, _ = bota_reader.read_latest()
-                    _, r_base_sensor, jacobian_6d = bota_kin.pose_and_jacobian(q_ref)
+                    bota_wrench_raw, bota_status, bota_timestamp_us, _, _, bota_is_new = bota_reader.read_latest()
+                    pos_ref, rot_ref, jacobian_6d = bota_kin.pose_and_jacobian(q_ref)
+                    pos_current, rot_current, _ = bota_kin.pose_and_jacobian(q)
+                    r_base_sensor = rot_current if admittance_source == "bota_se3" else rot_ref
                     bota_wrench_base, bota_wrench_conditioned = bota_conditioner.update(
                         bota_wrench_raw,
                         r_base_sensor,
                         dt,
+                        timestamp_us=bota_timestamp_us,
+                        is_new_frame=bota_is_new,
                     )
                     bota_tau_joint = (
                         float(args.bota_joint_gain)
@@ -1410,11 +2172,7 @@ def _run_leader_admittance_position_mode(
                     dq_bota_joint = (1.0 - leak * dt) * (dq_bota_joint + ddq_bota_joint * dt)
                     q_bota_joint = q_bota_joint + dq_bota_joint * dt
                     bota_delta_q_joint = np.clip(q_bota_joint - q_ref, -delta_max, delta_max)
-                    q_bota_joint = np.clip(
-                        q_ref + bota_delta_q_joint,
-                        system.arm_joint_limits_min[:n],
-                        system.arm_joint_limits_max[:n],
-                    )
+                    q_bota_joint = q_ref + bota_delta_q_joint
 
                     if bota_cart is not None:
                         bota_task_offset = bota_cart.step(bota_wrench_conditioned, dt)
@@ -1425,6 +2183,37 @@ def _run_leader_admittance_position_mode(
                         )
                         bota_delta_q_cartesian = np.clip(
                             bota_delta_q_cartesian,
+                            -delta_max,
+                            delta_max,
+                        )
+                    if bota_hfvc is not None:
+                        bota_task_offset_hfvc = bota_hfvc.step(bota_wrench_conditioned, dt)
+                        bota_delta_q_hfvc = _damped_least_squares_delta_q(
+                            jacobian_6d,
+                            bota_task_offset_hfvc,
+                            float(args.bota_dls_damping),
+                        )
+                        bota_delta_q_hfvc = np.clip(
+                            bota_delta_q_hfvc,
+                            -delta_max,
+                            delta_max,
+                        )
+                    if bota_se3 is not None:
+                        bota_task_offset_se3, bota_pose_error_se3 = bota_se3.step(
+                            pos_ref,
+                            rot_ref,
+                            pos_current,
+                            rot_current,
+                            bota_wrench_conditioned,
+                            dt,
+                        )
+                        bota_delta_q_se3 = _damped_least_squares_delta_q(
+                            jacobian_6d,
+                            bota_task_offset_se3,
+                            float(args.bota_dls_damping),
+                        )
+                        bota_delta_q_se3 = np.clip(
+                            bota_delta_q_se3,
                             -delta_max,
                             delta_max,
                         )
@@ -1463,18 +2252,57 @@ def _run_leader_admittance_position_mode(
                 delta = bota_delta_q_cartesian.copy()
                 q_c = q_ref + delta
                 dq_c = np.zeros(n, dtype=float)
+            elif admittance_source == "bota_hfvc":
+                contact_probability, contact_state = _bota_contact_probability(
+                    bota_wrench_conditioned,
+                    float(args.bota_contact_force_scale),
+                    float(args.bota_contact_torque_scale),
+                )
+                delta = bota_delta_q_hfvc.copy()
+                q_c = q_ref + delta
+                dq_c = np.zeros(n, dtype=float)
+                bota_task_offset = bota_task_offset_hfvc.copy()
+            elif admittance_source == "bota_se3":
+                contact_probability, contact_state = _bota_contact_probability(
+                    bota_wrench_conditioned,
+                    float(args.bota_contact_force_scale),
+                    float(args.bota_contact_torque_scale),
+                )
+                delta = bota_delta_q_se3.copy()
+                q_c = q_ref + delta
+                dq_c = np.zeros(n, dtype=float)
+                bota_task_offset = bota_task_offset_se3.copy()
             else:
                 raise ValueError(f"Unsupported admittance source: {admittance_source}")
 
             delta = np.clip(q_c - q_ref, -delta_max, delta_max)
             q_c = q_ref + delta
-            q_c = np.clip(q_c, system.arm_joint_limits_min[:n], system.arm_joint_limits_max[:n])
 
             target_hw = np.zeros(system.num_motors)
             target_hw[:n] = q_c * system.joint_signs[:n] + system.joint_offsets[:n]
             if system.num_motors > n:
                 target_hw[-1] = getattr(system, "leader_gripper_raw_rad", 0.0)
+
+            for i in range(n):
+                while target_hw[i] - last_sent_raw[i] > np.pi:
+                    target_hw[i] -= 2.0 * np.pi
+                while target_hw[i] - last_sent_raw[i] < -np.pi:
+                    target_hw[i] += 2.0 * np.pi
+
             system.driver.set_joints(target_hw.tolist())
+            last_sent_raw = target_hw.copy()
+
+            q_cmd_follower = np.full(n, np.nan)
+            if follower_cmd_state is not None and follower_cmd_lock is not None:
+                try:
+                    follower_action = system._build_follower_action(q_c, float(grip))
+                    q_cmd_follower = np.asarray(follower_action[:n], dtype=float)
+                    with follower_cmd_lock:
+                        follower_cmd_state["q"] = q_cmd_follower.copy()
+                except Exception as exc:
+                    if (t_mono - last_follower_cmd_warn) > 1.0:
+                        last_follower_cmd_warn = t_mono
+                        print(f"[WARN] follower command mapping failed: {exc}")
 
             tau_cmd = np.zeros(n, dtype=float)
             if observer_mode == "none":
@@ -1514,7 +2342,7 @@ def _run_leader_admittance_position_mode(
                 q_c_leader=q_c,
                 q_follower=q_follower,
                 dq_follower=dq_follower,
-                q_cmd_follower=np.full(n, np.nan),
+                q_cmd_follower=q_cmd_follower,
                 delta_corr=delta,
                 tau_cmd=tau_cmd,
                 tau_ext_shi=tau_ext,
@@ -1527,8 +2355,13 @@ def _run_leader_admittance_position_mode(
                 bota_wrench_conditioned=bota_wrench_conditioned,
                 bota_tau_joint=bota_tau_joint,
                 bota_delta_q_cartesian=bota_delta_q_cartesian,
+                bota_delta_q_hfvc=bota_delta_q_hfvc,
+                bota_delta_q_se3=bota_delta_q_se3,
                 bota_delta_q_joint=bota_delta_q_joint,
                 bota_task_offset=bota_task_offset,
+                bota_task_offset_hfvc=bota_task_offset_hfvc,
+                bota_task_offset_se3=bota_task_offset_se3,
+                bota_pose_error_se3=bota_pose_error_se3,
                 bota_status=bota_status,
                 contact_probability=contact_probability,
                 contact_state=contact_state,
@@ -1551,12 +2384,27 @@ def _run_leader_admittance_position_mode(
 
             _sleep_remaining(dt, loop_t0)
     finally:
+        if follower_cmd_stop is not None:
+            follower_cmd_stop.set()
+        if follower_cmd_thread is not None:
+            follower_cmd_thread.join(timeout=1.0)
+        if not args.no_follower and system._direct_follower_robot is not None:
+            try:
+                follower_robot = getattr(system._direct_follower_robot, "robot", None)
+                if follower_robot is not None and hasattr(follower_robot, "stopJ"):
+                    follower_robot.stopJ(2.0)
+            except Exception:
+                pass
         if bota_reader is not None:
             bota_reader.close()
         if system.driver is not None:
             try:
                 system.driver.set_torque_mode(False)
                 time.sleep(0.05)
+                restore = getattr(system, "_leader_position_handoff_restore", {})
+                if isinstance(restore, dict) and restore.get("current_limit"):
+                    system.driver.set_current_limits(restore["current_limit"])
+                    time.sleep(0.02)
                 system.driver.set_operating_mode(0)
                 time.sleep(0.05)
                 system.driver.set_torque_mode(True)
@@ -2074,7 +2922,7 @@ def main() -> int:
                 if arch_mode == "leader_admittance_position"
                 else "current"
             ),
-            "wrench_source": "none",
+            "wrench_source": ("bota" if str(args.admittance_source).startswith("bota_") else "none"),
             "test_mode": args.test_mode,
             "compensation": args.compensation,
             "joint_index": int(args.joint_index),
@@ -2100,11 +2948,26 @@ def main() -> int:
             "adm_delta_max": float(args.adm_delta_max),
             "admittance_source": str(args.admittance_source),
             "admittance_observer": str(args.admittance_observer),
+            "leader_position_operating_mode": int(args.leader_position_operating_mode),
+            "leader_position_handoff_settle_seconds": float(args.leader_position_handoff_settle_seconds),
+            "leader_position_arm_settle_seconds": float(args.leader_position_arm_settle_seconds),
+            "leader_position_recover_pre_handoff": bool(args.leader_position_recover_pre_handoff),
+            "leader_position_recover_seconds": float(args.leader_position_recover_seconds),
+            "leader_position_recover_max_delta": float(args.leader_position_recover_max_delta),
+            "leader_current_limit": _int_array_metadata(args.leader_current_limit),
+            "leader_goal_current": _int_array_metadata(args.leader_goal_current),
+            "leader_position_p_gains": _int_array_metadata(args.leader_position_p_gains),
+            "leader_position_i_gains": _int_array_metadata(args.leader_position_i_gains),
+            "leader_position_d_gains": _int_array_metadata(args.leader_position_d_gains),
+            "leader_velocity_p_gains": _int_array_metadata(args.leader_velocity_p_gains),
+            "leader_velocity_i_gains": _int_array_metadata(args.leader_velocity_i_gains),
             "bota_enable": bool(args.bota_enable or str(args.admittance_source).startswith("bota_")),
             "bota_config": str((REPO_ROOT / args.bota_config).resolve() if not Path(args.bota_config).is_absolute() else Path(args.bota_config).resolve()),
             "bota_driver_tare": bool(args.bota_driver_tare),
+            "bota_warmup_seconds": float(args.bota_warmup_seconds),
             "bota_bias_seconds": float(args.bota_bias_seconds),
             "bota_filter_cutoff": float(args.bota_filter_cutoff),
+            "bota_filter_alpha": float(args.bota_filter_alpha),
             "bota_deadband": _parse_float_list(args.bota_deadband),
             "bota_saturation": _parse_float_list(args.bota_saturation),
             "bota_gravity_comp": bool(args.bota_gravity_comp),
@@ -2117,6 +2980,11 @@ def main() -> int:
             "bota_cart_damp": _parse_float_list(args.bota_cart_damp),
             "bota_cart_stiff": _parse_float_list(args.bota_cart_stiff),
             "bota_cart_max": _parse_float_list(args.bota_cart_max),
+            "bota_hfvc_force_dims": int(args.bota_hfvc_force_dims),
+            "bota_hfvc_stiction": _parse_float_list(args.bota_hfvc_stiction),
+            "bota_wrench_sign": float(args.bota_wrench_sign),
+            "bota_se3_output_mode": str(args.bota_se3_output_mode),
+            "bota_se3_pose_feedback": bool(str(args.admittance_source).lower() == "bota_se3"),
             "bota_joint_gain": float(args.bota_joint_gain),
             "bota_dls_damping": float(args.bota_dls_damping),
             "bota_contact_force_scale": float(args.bota_contact_force_scale),
