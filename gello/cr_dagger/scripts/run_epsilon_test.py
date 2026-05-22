@@ -658,6 +658,89 @@ def _bota_contact_probability(wrench_base: np.ndarray, force_scale: float, torqu
     return probability, ContactGate.NO_CONTACT
 
 
+class DeltaResidualLimiter:
+    """Post-filter for bounded human residual corrections."""
+
+    def __init__(
+        self,
+        n: int,
+        delta_max: np.ndarray,
+        rate_max: np.ndarray,
+        release_rate_max: np.ndarray,
+        release_tau_s: float,
+        release_contact_threshold: float,
+    ):
+        self.n = int(n)
+        self.delta_max = np.maximum(np.asarray(delta_max, dtype=float).reshape(self.n), 1e-9)
+        self.rate_max = np.maximum(np.asarray(rate_max, dtype=float).reshape(self.n), 0.0)
+        self.release_rate_max = np.maximum(
+            np.asarray(release_rate_max, dtype=float).reshape(self.n),
+            0.0,
+        )
+        self.release_tau_s = max(float(release_tau_s), 0.0)
+        self.release_contact_threshold = max(float(release_contact_threshold), 0.0)
+        self.delta = np.zeros(self.n, dtype=float)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(
+            np.any(self.rate_max > 0.0)
+            or np.any(self.release_rate_max > 0.0)
+            or self.release_tau_s > 0.0
+        )
+
+    def reset(self, value: np.ndarray | None = None) -> None:
+        if value is None:
+            self.delta.fill(0.0)
+            return
+        self.delta = np.clip(
+            np.asarray(value, dtype=float).reshape(self.n),
+            -self.delta_max,
+            self.delta_max,
+        )
+
+    def step(self, raw_delta: np.ndarray, dt: float, contact_probability: float) -> np.ndarray:
+        target = np.clip(
+            np.asarray(raw_delta, dtype=float).reshape(self.n),
+            -self.delta_max,
+            self.delta_max,
+        )
+        dt_s = max(float(dt), 0.0)
+
+        if (
+            self.release_tau_s > 0.0
+            and float(contact_probability) < self.release_contact_threshold
+        ):
+            alpha = 1.0 - math.exp(-dt_s / max(self.release_tau_s, 1e-9))
+            target = (1.0 - alpha) * self.delta
+
+        if dt_s > 0.0:
+            delta_step = target - self.delta
+            rate = self.rate_max.copy()
+            if np.any(self.release_rate_max > 0.0):
+                relaxing = np.abs(target) < np.abs(self.delta)
+                release_rate = np.where(
+                    self.release_rate_max > 0.0,
+                    self.release_rate_max,
+                    rate,
+                )
+                rate = np.where(relaxing, release_rate, rate)
+            limited = rate > 0.0
+            if np.any(limited):
+                max_step = rate * dt_s
+                delta_step = np.where(
+                    limited,
+                    np.clip(delta_step, -max_step, max_step),
+                    delta_step,
+                )
+            self.delta = self.delta + delta_step
+        else:
+            self.delta = target
+
+        self.delta = np.clip(self.delta, -self.delta_max, self.delta_max)
+        return self.delta.copy()
+
+
 def _shi_torque_components(
     system: FACTRGravityCompensation,
     shi: Optional[MinimalistTorqueEstimator],
@@ -861,6 +944,33 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--adm-stiff", type=float, default=25.0)
     p.add_argument("--adm-leak", type=float, default=0.02)
     p.add_argument("--adm-delta-max", type=float, default=0.25)
+    p.add_argument(
+        "--adm-delta-rate-max",
+        type=str,
+        default="0",
+        help="Max residual delta slew rate [rad/s] as scalar or per-joint list. Set <=0 to disable.",
+    )
+    p.add_argument(
+        "--adm-delta-release-rate-max",
+        type=str,
+        default="0",
+        help=(
+            "Max residual return/release rate [rad/s] as scalar or per-joint list. "
+            "Set <=0 to reuse --adm-delta-rate-max."
+        ),
+    )
+    p.add_argument(
+        "--adm-delta-release-tau",
+        type=float,
+        default=0.0,
+        help="Optional exponential decay time constant toward zero when contact probability is below release threshold. Set <=0 to disable.",
+    )
+    p.add_argument(
+        "--adm-delta-release-contact-threshold",
+        type=float,
+        default=0.05,
+        help="Contact probability below which --adm-delta-release-tau decays the commanded residual toward zero.",
+    )
     p.add_argument(
         "--admittance-source",
         choices=["observer", "bota_cartesian", "bota_hfvc", "bota_se3", "bota_joint"],
@@ -1903,6 +2013,29 @@ def _run_leader_admittance_position_mode(
     stiff = np.full(n, max(float(args.adm_stiff), 0.0), dtype=float)
     leak = max(float(args.adm_leak), 0.0)
     delta_max = max(float(args.adm_delta_max), 1e-6)
+    delta_max_vec = np.full(n, delta_max, dtype=float)
+    delta_rate_max = _expand_list(_parse_float_list(args.adm_delta_rate_max), n, 0.0)
+    delta_release_rate_max = _expand_list(
+        _parse_float_list(args.adm_delta_release_rate_max),
+        n,
+        0.0,
+    )
+    delta_limiter = DeltaResidualLimiter(
+        n=n,
+        delta_max=delta_max_vec,
+        rate_max=delta_rate_max,
+        release_rate_max=delta_release_rate_max,
+        release_tau_s=float(args.adm_delta_release_tau),
+        release_contact_threshold=float(args.adm_delta_release_contact_threshold),
+    )
+    if delta_limiter.enabled:
+        print(
+            "[ADMITTANCE] residual delta limiter enabled "
+            f"rate_max={np.round(delta_rate_max, 4).tolist()} "
+            f"release_rate_max={np.round(delta_release_rate_max, 4).tolist()} "
+            f"release_tau={float(args.adm_delta_release_tau):.3f}s "
+            f"release_contact_threshold={float(args.adm_delta_release_contact_threshold):.3f}"
+        )
 
     admittance_source = str(args.admittance_source).lower()
     bota_enabled = bool(args.bota_enable or admittance_source.startswith("bota_"))
@@ -2275,7 +2408,8 @@ def _run_leader_admittance_position_mode(
             else:
                 raise ValueError(f"Unsupported admittance source: {admittance_source}")
 
-            delta = np.clip(q_c - q_ref, -delta_max, delta_max)
+            delta_raw = np.clip(q_c - q_ref, -delta_max, delta_max)
+            delta = delta_limiter.step(delta_raw, dt, contact_probability)
             q_c = q_ref + delta
 
             target_hw = np.zeros(system.num_motors)
@@ -2344,6 +2478,7 @@ def _run_leader_admittance_position_mode(
                 dq_follower=dq_follower,
                 q_cmd_follower=q_cmd_follower,
                 delta_corr=delta,
+                delta_corr_raw=delta_raw,
                 tau_cmd=tau_cmd,
                 tau_ext_shi=tau_ext,
                 tau_model=tau_components["tau_model"],
@@ -2961,6 +3096,10 @@ def main() -> int:
             "leader_position_d_gains": _int_array_metadata(args.leader_position_d_gains),
             "leader_velocity_p_gains": _int_array_metadata(args.leader_velocity_p_gains),
             "leader_velocity_i_gains": _int_array_metadata(args.leader_velocity_i_gains),
+            "adm_delta_rate_max": _parse_float_list(args.adm_delta_rate_max),
+            "adm_delta_release_rate_max": _parse_float_list(args.adm_delta_release_rate_max),
+            "adm_delta_release_tau": float(args.adm_delta_release_tau),
+            "adm_delta_release_contact_threshold": float(args.adm_delta_release_contact_threshold),
             "bota_enable": bool(args.bota_enable or str(args.admittance_source).startswith("bota_")),
             "bota_config": str((REPO_ROOT / args.bota_config).resolve() if not Path(args.bota_config).is_absolute() else Path(args.bota_config).resolve()),
             "bota_driver_tare": bool(args.bota_driver_tare),

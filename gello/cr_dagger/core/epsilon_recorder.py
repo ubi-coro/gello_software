@@ -35,6 +35,7 @@ class EpsilonRecorder:
             "dq_follower": np.zeros((self.max_steps, self.n_joints), dtype=float),
             "q_cmd_follower": np.zeros((self.max_steps, self.n_joints), dtype=float),
             "delta_corr": np.zeros((self.max_steps, self.n_joints), dtype=float),
+            "delta_corr_raw": np.zeros((self.max_steps, self.n_joints), dtype=float),
             "tau_cmd": np.zeros((self.max_steps, self.n_joints), dtype=float),
             "tau_ext_shi": np.zeros((self.max_steps, self.n_joints), dtype=float),
             "tau_model": np.zeros((self.max_steps, self.n_joints), dtype=float),
