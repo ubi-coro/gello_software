@@ -57,7 +57,11 @@ class EpsilonRecorder:
             "bota_status": np.zeros((self.max_steps, 4), dtype=float),
             "contact_probability": np.zeros(self.max_steps, dtype=float),
             "contact_state": np.zeros(self.max_steps, dtype=float),
+            "intervention_active": np.zeros(self.max_steps, dtype=float),
+            "intervention_source": np.zeros(self.max_steps, dtype=float),
             "epsilon": np.zeros((self.max_steps, self.n_joints), dtype=float),
+            "epsilon_leader": np.zeros((self.max_steps, self.n_joints), dtype=float),
+            "epsilon_follower": np.zeros((self.max_steps, self.n_joints), dtype=float),
         }
         self._idx = 0
         self._dropped = False

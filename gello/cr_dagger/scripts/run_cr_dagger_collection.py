@@ -15,6 +15,11 @@ from typing import Any, Optional
 import numpy as np
 
 try:
+    import yaml
+except ImportError:  # pragma: no cover - production env includes PyYAML
+    yaml = None
+
+try:
     from pynput import keyboard as kb
     _PYNPUT_AVAILABLE = True
 except ImportError:
@@ -33,6 +38,7 @@ from gello.cr_dagger.core.intervention_detector import (
     FusedInterventionDetector,
 )
 from gello.cr_dagger.core.lerobot_recorder import LeRobotCorrectionRecorder
+from gello.cr_dagger.core.bota_se3_residual import run_phase_b_bota_se3_loop
 from gello.cr_dagger.ipc.shared_observation_snapshot import SharedObservationSnapshot
 from gello.cr_dagger.ipc.shared_trajectory_buffer import SharedTrajectoryBuffer
 from gello.cr_dagger.policy.policy_worker import policy_worker
@@ -256,6 +262,12 @@ def _validate_repo_id(repo_id: str) -> str:
             f"        Use --lerobot-root for the local storage path."
         )
     return repo_id
+
+
+def _slug_filename_part(value: object, default: str = "run") -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[^a-zA-Z0-9_.-]+", "_", text).strip("_.-")
+    return text or default
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -656,11 +668,23 @@ def _run_recording_loop_phase_b(
             dq_leader = state_cache.get("dq_leader", np.zeros(n)).copy()
             tau_ext = state_cache.get("tau_ext", np.zeros(n)).copy()
             wrench_ur5e = state_cache.get("wrench_ur5e", np.zeros(6)).copy()
+            wrench_sensor_raw = state_cache.get("wrench_sensor_raw", np.zeros(6)).copy()
+            wrench_base_raw = state_cache.get("wrench_base_raw", np.zeros(6)).copy()
+            wrench_base = state_cache.get("wrench_base", wrench_ur5e).copy()
+            task_delta = state_cache.get("task_delta", np.zeros(6)).copy()
+            task_pose_error = state_cache.get("task_pose_error", np.zeros(6)).copy()
+            delta_leader = state_cache.get("delta_leader", np.zeros(n)).copy()
+            delta_leader_raw = state_cache.get("delta_leader_raw", np.zeros(n)).copy()
             gripper_follower = float(state_cache.get("gripper_follower", 0.0))
             is_corr = bool(state_cache.get("is_correction", False))
             diag = state_cache.get("detector_diag", {})
             policy_action = state_cache.get("policy_action", np.zeros(n + 1)).copy()
             compliant_action = state_cache.get("compliant_action", np.zeros(n + 1)).copy()
+            q_ref_leader = state_cache.get("q_ref", np.zeros(n)).copy()
+            q_cmd_leader = state_cache.get("q_cmd_leader", q_ref_leader + delta_leader).copy()
+            q_cmd_ur5e = state_cache.get("q_cmd_ur5e", compliant_action[:n]).copy()
+            epsilon_leader = state_cache.get("epsilon_leader", q_leader - q_cmd_leader).copy()
+            epsilon_ur5e = state_cache.get("epsilon_ur5e", q_follower - q_cmd_ur5e).copy()
 
             # Reset the updated flag to detect future updates and stale state.
             try:
@@ -693,6 +717,7 @@ def _run_recording_loop_phase_b(
                 tau_ext=tau_ext,
                 wrench=wrench_ur5e,
                 image=obs_image,
+                images=images,
             )
 
         if npz_recorder is not None:
@@ -708,6 +733,18 @@ def _run_recording_loop_phase_b(
                 wrench_ur5e=wrench_ur5e,
                 is_correction=bool(is_corr),
                 detector_diagnostics=diag,
+                q_ref_leader=q_ref_leader,
+                q_cmd_leader=q_cmd_leader,
+                q_cmd_ur5e=q_cmd_ur5e,
+                epsilon_leader=epsilon_leader,
+                epsilon_ur5e=epsilon_ur5e,
+                wrench_sensor_raw=wrench_sensor_raw,
+                wrench_base_raw=wrench_base_raw,
+                wrench_base=wrench_base,
+                task_delta=task_delta,
+                task_pose_error=task_pose_error,
+                delta_leader=delta_leader,
+                delta_leader_raw=delta_leader_raw,
             )
 
         votes = diag.get("votes", {})
@@ -726,7 +763,7 @@ def _run_recording_loop_phase_b(
             q=q_follower,
             dq=dq_follower,
             gripper=gripper_follower,
-            action=compliant_action,
+            action=policy_action,
             tau_ext=tau_ext,
             wrench_ur5e=wrench_ur5e,
             q_ref=policy_action,
@@ -820,6 +857,13 @@ def _build_shi(
             vel_threshold=0.05,
         )
     )
+
+
+def _load_default_config(path: Path) -> dict[str, Any]:
+    if yaml is None or not path.exists():
+        return {}
+    loaded = yaml.safe_load(path.read_text())
+    return loaded if isinstance(loaded, dict) else {}
 
 
 class MultiRealSenseRig:
@@ -955,10 +999,46 @@ def _parse_args() -> argparse.Namespace:
         help="Override 4-channel mirror source (default: config).",
     )
     p.add_argument("--config", type=str, default="configs/ur5e_gello_factr_hw_V3.yaml")
+    p.add_argument(
+        "--cr-dagger-defaults",
+        type=str,
+        default="gello/cr_dagger/config/cr_dagger_defaults.yaml",
+        help="YAML file containing validated CR-DAgger defaults, including the Phase-B BOTA-SE3 parameters.",
+    )
     p.add_argument("--mass", type=float, default=1.0)
     p.add_argument("--damping", type=float, default=5.0)
     p.add_argument("--stiffness", type=float, default=20.0)
-    p.add_argument("--policy-type", choices=["dummy_sine", "dummy_hold"], default="dummy_hold")
+    p.add_argument("--policy-type", choices=["dummy_sine", "dummy_hold", "lerobot_act", "act"], default="dummy_hold")
+    p.add_argument(
+        "--policy-path",
+        type=str,
+        default=None,
+        help="Path or Hub ID of a LeRobot ACT policy. Required for --policy-type lerobot_act/act.",
+    )
+    p.add_argument(
+        "--policy-device",
+        type=str,
+        default="cuda",
+        help="Torch device used by the LeRobot policy worker.",
+    )
+    p.add_argument(
+        "--policy-dataset-repo",
+        type=str,
+        default=None,
+        help="LeRobot dataset repo used to load policy feature metadata. Defaults to --lerobot-repo.",
+    )
+    p.add_argument(
+        "--policy-dataset-root",
+        type=str,
+        default=None,
+        help="Local root for --policy-dataset-repo metadata. Defaults to --lerobot-root.",
+    )
+    p.add_argument(
+        "--policy-robot-type",
+        type=str,
+        default="",
+        help="Optional robot_type string passed into LeRobot policy preprocessing.",
+    )
     p.add_argument("--amplitude", type=float, default=0.05)
     p.add_argument("--frequency", type=float, default=0.15)
     p.add_argument("--horizon", type=int, default=32)
@@ -1009,6 +1089,16 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
 
+    defaults_path = Path(args.cr_dagger_defaults)
+    if not defaults_path.is_absolute():
+        defaults_path = (REPO_ROOT / defaults_path).resolve()
+    defaults_cfg = _load_default_config(defaults_path)
+    phase_b_cfg = defaults_cfg.get("phase_b", {}) if isinstance(defaults_cfg.get("phase_b", {}), dict) else {}
+
+    if str(args.policy_type) in ("lerobot_act", "act") and not args.policy_path:
+        print("[ERROR] --policy-path is required for --policy-type lerobot_act/act")
+        return 2
+
     try:
         repo_id = _validate_repo_id(args.lerobot_repo)
     except ValueError as e:
@@ -1055,6 +1145,7 @@ def main() -> int:
     policy_proc: mp.Process | None = None
     stop_event: Any | None = None
     npz_recorder: CorrectionRecorder | None = None
+    npz_session_prefix: str | None = None
     camera_rig: MultiRealSenseRig | None = None
     traj_interp: TrajectoryInterpolator | None = None
     detector: FusedInterventionDetector | None = None
@@ -1065,6 +1156,7 @@ def main() -> int:
     state_cache: dict[str, Any] | None = None
     n = 6
     teleop_started = False
+    phase_b_runtime_stopped = False
 
     def _sig(*_: object) -> None:
         nonlocal running
@@ -1074,6 +1166,43 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
+
+    def _stop_phase_b_runtime(reason: str) -> None:
+        nonlocal unified_stop, unified_thread, stop_event, policy_proc, phase_b_runtime_stopped
+        if not args.interventions or phase_b_runtime_stopped:
+            return
+        phase_b_runtime_stopped = True
+        print(f"[PHASE B] stopping runtime before {reason}")
+        if unified_stop is not None:
+            unified_stop.set()
+        if unified_thread is not None:
+            try:
+                unified_thread.join(timeout=3.0)
+                if unified_thread.is_alive():
+                    print("[WARN] Phase-B control thread did not stop within 3s")
+            except Exception as exc:
+                print(f"[WARN] Phase-B control thread join failed: {exc}")
+            unified_thread = None
+        try:
+            follower = getattr(system, "_direct_follower_robot", None) if system is not None else None
+            robot = getattr(follower, "robot", None)
+            if robot is not None and hasattr(robot, "stopJ"):
+                robot.stopJ(2.0)
+                print("[FOLLOWER] stopJ confirmed before saving/finalize")
+        except Exception as exc:
+            print(f"[WARN] Follower stopJ before saving/finalize failed: {exc}")
+        if stop_event is not None:
+            stop_event.set()
+        if policy_proc is not None:
+            try:
+                policy_proc.join(timeout=2.0)
+                if policy_proc.is_alive():
+                    policy_proc.terminate()
+                    policy_proc.join(timeout=1.0)
+            except Exception as exc:
+                print(f"[WARN] Policy worker stop failed: {exc}")
+            policy_proc = None
+
 
     try:
         # ── Episode controller (keyboard + foot pedal) ────────────────────
@@ -1099,11 +1228,15 @@ def main() -> int:
                 n_joints=n,
                 create=True,
             )
+            obs_camera_names = list(args.camera_names or [])
+            if not obs_camera_names and args.camera_device_ids:
+                obs_camera_names = [f"cam{i}" for i in range(len(args.camera_device_ids))]
             obs_snap = SharedObservationSnapshot(
                 name="cr_dagger_obs",
                 n_joints=n,
                 img_height=480,
                 img_width=640,
+                camera_names=obs_camera_names,
                 create=True,
             )
             traj_buf.write(np.tile(q0, (int(args.horizon), 1)), time.monotonic())
@@ -1139,6 +1272,14 @@ def main() -> int:
                 "dq_follower": np.zeros(n),
                 "gripper_follower": 0.0,
                 "wrench_ur5e": np.zeros(6),
+                "wrench_sensor_raw": np.zeros(6),
+                "wrench_base_raw": np.zeros(6),
+                "wrench_base": np.zeros(6),
+                "task_delta": np.zeros(6),
+                "task_pose_error": np.zeros(6),
+                "delta_leader": np.zeros(n),
+                "delta_leader_raw": np.zeros(n),
+                "q_cmd_leader": np.zeros(n),
                 "tcp_joint_torques": np.zeros(n),
                 "delta_human": np.zeros(n),
                 "q_cmd_ur5e": np.zeros(n),
@@ -1150,6 +1291,13 @@ def main() -> int:
                 "tau_mirror": np.zeros(n),
                 "velocity_gate": 1.0,
                 "mirror_source": "cmd",
+                "phase_b_ready": False,
+                "phase_b_error": "",
+                "epsilon_leader": np.zeros(n),
+                "wrench_bota_raw": np.zeros(6),
+                "delta_human_raw": np.zeros(n),
+                "intervention_active": 0.0,
+                "intervention_source": 0.0,
             }
 
         camera_names, camera_device_ids, camera_flips = _resolve_camera_config(args)
@@ -1193,11 +1341,67 @@ def main() -> int:
         )
 
         if args.interventions and not args.no_npz:
+            task_label = _slug_filename_part(args.task_description, "task")
+            policy_label = _slug_filename_part(str(args.policy_type).replace("/", "_"), "policy")
+            timestamp = int(time.monotonic())
+            npz_session_prefix = f"crdagger_phaseB_{policy_label}_{task_label}_{timestamp}"
+            bota_cfg = phase_b_cfg.get("bota", {}) if isinstance(phase_b_cfg.get("bota", {}), dict) else {}
+            residual_cfg = phase_b_cfg.get("residual", {}) if isinstance(phase_b_cfg.get("residual", {}), dict) else {}
+            follower_cfg = phase_b_cfg.get("follower", {}) if isinstance(phase_b_cfg.get("follower", {}), dict) else {}
+            intervention_cfg = phase_b_cfg.get("intervention", {}) if isinstance(phase_b_cfg.get("intervention", {}), dict) else {}
+            npz_metadata = {
+                "mode": "phase_b_intervention_collection",
+                "architecture": "bota_se3_residual" if not bool(args.four_channel) else "four_channel",
+                "leader_command_mode": "position",
+                "wrench_source": "bota",
+                "repo_id": repo_id,
+                "dataset_root": str(dataset_root),
+                "task_description": str(args.task_description),
+                "policy_type": str(args.policy_type),
+                "policy_path": str(args.policy_path or ""),
+                "policy_output_frame": "follower" if str(args.policy_type) in ("lerobot_act", "act") else "leader",
+                "dataset_fps": int(dataset_fps),
+                "max_episode_duration": float(args.max_episode_duration),
+                "num_episodes": int(args.num_episodes),
+                "camera_names": list(camera_names),
+                "camera_device_ids": list(camera_device_ids),
+                "config": str(config_path),
+                "cr_dagger_defaults": str(defaults_path),
+                "bota_config": str((REPO_ROOT / str(bota_cfg.get("config", "configs/bota_binary.json"))).resolve()),
+                "bota_axis_mask": bota_cfg.get("axis_mask", []),
+                "bota_cart_mass": bota_cfg.get("cart_mass", []),
+                "bota_cart_damp": bota_cfg.get("cart_damp", []),
+                "bota_cart_stiff": bota_cfg.get("cart_stiff", []),
+                "bota_cart_max": bota_cfg.get("cart_max", []),
+                "bota_dls_damping": float(bota_cfg.get("dls_damping", 0.10)),
+                "bota_filter_cutoff": float(bota_cfg.get("filter_cutoff_hz", 25.0)),
+                "bota_deadband": bota_cfg.get("deadband", []),
+                "bota_saturation": bota_cfg.get("saturation", []),
+                "bota_wrench_sign": float(bota_cfg.get("wrench_sign", 1.0)),
+                "bota_se3_output_mode": str(bota_cfg.get("output_mode", "offset")),
+                "bota_contact_force_scale": float(bota_cfg.get("contact_force_scale", 8.0)),
+                "bota_contact_torque_scale": float(bota_cfg.get("contact_torque_scale", 0.35)),
+                "adm_delta_max": residual_cfg.get("delta_max", 0.0),
+                "adm_delta_rate_max": residual_cfg.get("delta_rate_max", []),
+                "adm_delta_release_rate_max": residual_cfg.get("delta_release_rate_max", []),
+                "adm_delta_release_tau": float(residual_cfg.get("delta_release_tau_s", 0.0)),
+                "adm_delta_release_contact_threshold": float(residual_cfg.get("delta_release_contact_threshold", 0.0)),
+                "intervention_contact_threshold": float(intervention_cfg.get("contact_threshold", 0.25)),
+                "intervention_delta_threshold": float(intervention_cfg.get("delta_threshold", 0.01)),
+                "intervention_source_encoding": "0=none,1=contact,2=delta,3=both",
+                "follower_kp": float(follower_cfg.get("kp", 190.0)),
+                "follower_kd": float(follower_cfg.get("kd", 15.0)),
+                "action_dt": float(args.action_dt),
+                "horizon": int(args.horizon),
+                "latency_compensation_s": 0.008,
+            }
             npz_recorder = CorrectionRecorder(
                 n_joints=n,
                 log_dir=str(args.log_dir),
                 latency_compensation_s=0.008,
+                metadata=npz_metadata,
             )
+            print(f"[NPZ] episode files: {args.log_dir}/{npz_session_prefix}_epXXXX.npz")
 
         shi.reset()
 
@@ -1211,11 +1415,25 @@ def main() -> int:
             time.sleep(0.05)
 
             stop_event = mp.Event()
+            policy_output_frame = (
+                "follower" if str(args.policy_type) in ("lerobot_act", "act") else "leader"
+            )
             policy_config = {
                 "center": q_now.tolist(),
                 "amplitude": [float(args.amplitude)] * n,
                 "frequency": [float(args.frequency)] * n,
                 "q_hold": q_now.tolist(),
+                # Dummy policies publish leader-frame q references. LeRobot ACT
+                # policies trained on Phase-A data publish follower-frame actions.
+                "output_frame": policy_output_frame,
+                "policy_path": args.policy_path,
+                "device": str(args.policy_device),
+                "task": str(args.task_description),
+                "robot_type": str(args.policy_robot_type),
+                "camera_names": camera_names if camera_names else list(args.camera_names or []),
+                "dataset_features": lerobot_recorder.features,
+                "dataset_repo": str(args.policy_dataset_repo or repo_id),
+                "dataset_root": str(args.policy_dataset_root or args.lerobot_root or ""),
             }
             if getattr(system, "map_index", None) is not None:
                 policy_config["map_index"] = np.asarray(system.map_index, dtype=int).tolist()
@@ -1255,9 +1473,9 @@ def main() -> int:
                 raise RuntimeError("Phase B state cache was not initialized")
 
             unified_stop = Event()
-            use_4ch = bool(args.four_channel) or bool(
-                system.config.get("teleop", {}).get("four_channel", {}).get("enable", False)
-            )
+            # The validated production Phase-B path is BOTA-SE3 residual control.
+            # The legacy 4-channel loop is kept only as an explicit debugging option.
+            use_4ch = bool(args.four_channel)
             if use_4ch:
                 if args.mirror_source:
                     four_ch_cfg = system.config.setdefault("teleop", {}).setdefault("four_channel", {})
@@ -1276,23 +1494,35 @@ def main() -> int:
                 )
             else:
                 unified_thread = Thread(
-                    target=system._phase_b_unified_loop,
+                    target=run_phase_b_bota_se3_loop,
                     args=(
+                        system,
                         traj_interp,
-                        shi,
-                        detector,
                         state_cache,
                         unified_stop,
-                        bool(args.enable_wrench or args.enable_wrench_feedback),
+                        phase_b_cfg,
+                        REPO_ROOT,
                     ),
                     daemon=True,
-                    name="phase-b-unified",
+                    name="phase-b-bota-se3",
                 )
             unified_thread.start()
             if use_4ch:
                 print("[PHASE B] 4-channel control thread started")
             else:
-                print("[PHASE B] Unified control thread started")
+                print("[PHASE B] BOTA-SE3 residual control thread started")
+                t_ready = time.perf_counter()
+                while time.perf_counter() - t_ready < 30.0:
+                    with state_cache["lock"]:
+                        ready = bool(state_cache.get("phase_b_ready", False))
+                        error = str(state_cache.get("phase_b_error", ""))
+                    if ready:
+                        break
+                    if error:
+                        raise RuntimeError(f"Phase B BOTA-SE3 loop failed during startup: {error}")
+                    time.sleep(0.05)
+                else:
+                    raise TimeoutError("Phase B BOTA-SE3 loop did not arm within 30s")
         elif system.teleop_enabled and not teleop_started:
             teleop_started = _start_prepared_teleop(system)
             if not teleop_started:
@@ -1342,7 +1572,12 @@ def main() -> int:
 
             lerobot_recorder.start_episode(task_description=str(args.task_description))
             if npz_recorder is not None:
-                npz_recorder.start_episode(f"episode_{ep:04d}")
+                episode_npz_id = (
+                    f"{npz_session_prefix}_ep{ep:04d}"
+                    if npz_session_prefix
+                    else f"episode_{ep:04d}"
+                )
+                npz_recorder.start_episode(episode_npz_id)
 
             ep_start = time.perf_counter()
             ep_steps = 0
@@ -1411,6 +1646,10 @@ def main() -> int:
                 continue  # ep NOT incremented
 
             # ── Save episode ──────────────────────────────────────────────
+            final_episode = (ep >= num_episodes - 1) or (not running)
+            if final_episode:
+                _stop_phase_b_runtime("final episode save")
+
             if ep_recorded_frames > 0:
                 ep_idx = lerobot_recorder.end_episode()
             else:
@@ -1454,6 +1693,7 @@ def main() -> int:
                 # the actual waiting. We just set the state here.
 
         # ── Finalize dataset ──────────────────────────────────────────────
+        _stop_phase_b_runtime("dataset finalize")
         local_path = lerobot_recorder.finalize()
         print(f"\nDataset finalized at: {local_path}")
         print(f"  repo_id   : {repo_id}")
@@ -1478,6 +1718,11 @@ def main() -> int:
         traceback.print_exc()
         return 1
     finally:
+        try:
+            _stop_phase_b_runtime("process shutdown")
+        except Exception:
+            pass
+
         if ctrl is not None:
             ctrl.stop()
 

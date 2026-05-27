@@ -3,9 +3,184 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import time
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+
+
+class LeRobotACTPolicy:
+    """LeRobot ACT rollout adapter that publishes follower-frame joint targets."""
+
+    def __init__(
+        self,
+        policy_config: dict,
+        horizon: int,
+        n_joints: int,
+    ) -> None:
+        self.horizon = int(horizon)
+        self.n_joints = int(n_joints)
+        self.task = str(policy_config.get("task", ""))
+        self.robot_type = str(policy_config.get("robot_type", ""))
+        self.camera_names = list(policy_config.get("camera_names") or [])
+        self.dataset_features = dict(policy_config.get("dataset_features") or {})
+        self._last_missing_print_t = 0.0
+        self._last_action: np.ndarray | None = None
+
+        policy_path = str(policy_config.get("policy_path") or "")
+        if not policy_path:
+            raise ValueError("lerobot_act requires policy_config['policy_path']")
+
+        from lerobot.configs.policies import PreTrainedConfig
+        from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+        from lerobot.policies.factory import make_policy, make_pre_post_processors
+        from lerobot.utils.control_utils import predict_action
+
+        import torch
+
+        self._torch = torch
+        self._predict_action = predict_action
+
+        self.policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
+        self.policy_cfg.pretrained_path = policy_path
+        if policy_config.get("device"):
+            self.policy_cfg.device = str(policy_config["device"])
+
+        dataset_repo = str(policy_config.get("dataset_repo") or "")
+        dataset_root = policy_config.get("dataset_root")
+        ds_meta = None
+        if dataset_repo:
+            try:
+                ds_meta = LeRobotDatasetMetadata(
+                    dataset_repo,
+                    root=Path(dataset_root) if dataset_root else None,
+                )
+                print(f"[PolicyWorker] Loaded LeRobot metadata from {dataset_repo}")
+            except Exception as exc:
+                print(
+                    f"[PolicyWorker] Could not load dataset metadata '{dataset_repo}': {exc}. "
+                    "Falling back to runtime dataset features."
+                )
+        if ds_meta is None:
+            if not self.dataset_features:
+                raise RuntimeError(
+                    "No LeRobot dataset metadata available. Pass --policy-dataset-repo "
+                    "or provide runtime dataset features."
+                )
+            ds_meta = SimpleNamespace(features=self.dataset_features, stats={})
+
+        self.policy = make_policy(self.policy_cfg, ds_meta=ds_meta)
+        self.policy = self.policy.eval()
+        dataset_stats = getattr(ds_meta, "stats", None)
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            policy_cfg=self.policy_cfg,
+            pretrained_path=self.policy_cfg.pretrained_path,
+            dataset_stats=dataset_stats,
+            preprocessor_overrides={
+                "device_processor": {"device": self.policy_cfg.device},
+            },
+        )
+
+        for obj in (self.policy, self.preprocessor, self.postprocessor):
+            reset = getattr(obj, "reset", None)
+            if callable(reset):
+                reset()
+
+        self.input_keys = list(getattr(self.policy_cfg, "input_features", {}) or [])
+        if not self.input_keys:
+            self.input_keys = [
+                key for key in getattr(ds_meta, "features", {})
+                if str(key).startswith("observation.")
+            ]
+        print(
+            f"[PolicyWorker] LeRobot ACT loaded from {policy_path} "
+            f"device={self.policy_cfg.device} inputs={self.input_keys}"
+        )
+
+    def _build_observation(self, obs: dict) -> dict[str, np.ndarray] | None:
+        images = obs.get("images") or {}
+        state = np.concatenate(
+            [
+                np.asarray(obs["q"][: self.n_joints], dtype=np.float32),
+                np.asarray(obs["dq"][: self.n_joints], dtype=np.float32),
+                np.asarray([obs.get("grip", 0.0)], dtype=np.float32),
+            ]
+        )
+        frame: dict[str, np.ndarray] = {}
+        missing: list[str] = []
+
+        for key in self.input_keys:
+            if key == "observation.state":
+                frame[key] = state
+            elif key == "observation.effort":
+                frame[key] = np.asarray(obs.get("tau_ext", np.zeros(self.n_joints))[: self.n_joints], dtype=np.float32)
+            elif key == "observation.wrench":
+                frame[key] = np.asarray(obs.get("wrench", np.zeros(6))[:6], dtype=np.float32)
+            elif key == "observation.delta_q":
+                frame[key] = np.zeros(self.n_joints, dtype=np.float32)
+            elif key == "observation.is_correction":
+                frame[key] = np.zeros(1, dtype=np.float32)
+            elif key == "observation.detector_votes":
+                frame[key] = np.zeros(4, dtype=np.float32)
+            elif key.startswith("observation.images."):
+                cam_name = key.rsplit(".", 1)[-1]
+                img = images.get(cam_name)
+                if img is None and len(images) == 1:
+                    img = next(iter(images.values()))
+                if img is None:
+                    missing.append(key)
+                    continue
+                frame[key] = np.asarray(img, dtype=np.uint8)
+            else:
+                # Unknown optional observation feature: supply zeros if the shape is known.
+                feature = self.dataset_features.get(key, {})
+                shape = tuple(feature.get("shape", (1,))) if isinstance(feature, dict) else (1,)
+                frame[key] = np.zeros(shape, dtype=np.float32)
+
+        if missing:
+            now = time.monotonic()
+            if now - self._last_missing_print_t > 2.0:
+                self._last_missing_print_t = now
+                print(f"[PolicyWorker] Waiting for observation keys: {missing}")
+            return None
+        return frame
+
+    def _action_to_trajectory(self, action: Any) -> np.ndarray:
+        if hasattr(action, "detach"):
+            action_arr = action.detach().cpu().numpy()
+        else:
+            action_arr = np.asarray(action)
+        action_arr = np.asarray(action_arr, dtype=float).squeeze()
+        if action_arr.ndim == 0:
+            raise ValueError(f"Policy returned scalar action {action_arr}")
+        if action_arr.ndim == 1:
+            q = action_arr[: self.n_joints]
+            return np.tile(q, (self.horizon, 1))
+        traj = action_arr[:, : self.n_joints]
+        if traj.shape[0] >= self.horizon:
+            return traj[: self.horizon].copy()
+        pad = np.tile(traj[-1], (self.horizon - traj.shape[0], 1))
+        return np.vstack([traj, pad])
+
+    def predict(self, obs: dict | None) -> np.ndarray | None:
+        if obs is None:
+            return self._last_action
+        frame = self._build_observation(obs)
+        if frame is None:
+            return self._last_action
+        action = self._predict_action(
+            observation=frame,
+            policy=self.policy,
+            device=self._torch.device(self.policy_cfg.device),
+            preprocessor=self.preprocessor,
+            postprocessor=self.postprocessor,
+            use_amp=bool(getattr(self.policy_cfg, "use_amp", False)),
+            task=self.task,
+            robot_type=self.robot_type,
+        )
+        self._last_action = self._action_to_trajectory(action)
+        return self._last_action
 
 
 class InverseMapBridge:
@@ -71,10 +246,19 @@ def policy_worker(
         n_joints=n_joints, create=False,
     )
     obs_snap = SharedObservationSnapshot(
-        name=obs_shm_name, n_joints=n_joints, create=False,
+        name=obs_shm_name,
+        n_joints=n_joints,
+        camera_names=policy_config.get("camera_names"),
+        create=False,
     )
 
-    if policy_type == "dummy_sine":
+    if policy_type in ("lerobot_act", "act"):
+        policy = LeRobotACTPolicy(
+            policy_config=policy_config,
+            horizon=horizon,
+            n_joints=n_joints,
+        )
+    elif policy_type == "dummy_sine":
         from gello.cr_dagger.policy.dummy_policy import DummySinePolicy
         center = np.array(policy_config.get("center", [0.0] * n_joints))
         policy = DummySinePolicy(
@@ -149,9 +333,19 @@ def policy_worker(
     else:
         raise ValueError(f"Unknown policy_type: {policy_type}")
 
-    inverse_bridge = _maybe_build_inverse_bridge(policy_config)
+    output_frame = str(policy_config.get("output_frame", "leader")).strip().lower()
+    if output_frame not in ("leader", "follower"):
+        raise ValueError(f"output_frame must be 'leader' or 'follower', got {output_frame!r}")
+    inverse_bridge = None
+    if output_frame == "follower":
+        inverse_bridge = _maybe_build_inverse_bridge(policy_config)
+        if inverse_bridge is None:
+            raise ValueError("follower-frame policy output requires map_index/map_signs/map_offsets")
 
-    print(f"[PolicyWorker] Policy '{policy_type}' loaded. Running inference loop.")
+    print(
+        f"[PolicyWorker] Policy '{policy_type}' loaded "
+        f"(output_frame={output_frame}). Running inference loop."
+    )
 
     while not stop_event.is_set():
         t_loop_start = time.monotonic()
@@ -159,7 +353,15 @@ def policy_worker(
         obs = obs_snap.read()
         t_now = time.monotonic()
         
-        actions_follower = np.asarray(policy.predict(t_now), dtype=float)
+        if isinstance(policy, LeRobotACTPolicy):
+            actions_pred = policy.predict(obs)
+        else:
+            actions_pred = policy.predict(t_now)
+        if actions_pred is None:
+            time.sleep(min(float(action_dt), 0.01))
+            continue
+
+        actions_follower = np.asarray(actions_pred, dtype=float)
         if inverse_bridge is not None:
             actions_leader = np.zeros_like(actions_follower)
             for i in range(actions_follower.shape[0]):

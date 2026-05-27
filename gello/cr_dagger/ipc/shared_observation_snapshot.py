@@ -14,12 +14,15 @@ class SharedObservationSnapshot:
         n_joints: int = 6,
         img_height: int = 480,
         img_width: int = 640,
+        camera_names: list[str] | None = None,
         create: bool = False,
     ):
         self.name = name
         self.n_joints = n_joints
         self.img_height = img_height
         self.img_width = img_width
+        self.camera_names = list(camera_names or [])
+        self.n_images = max(1, len(self.camera_names))
         
         self.offsets = {}
         curr = 0
@@ -32,8 +35,9 @@ class SharedObservationSnapshot:
         self.offsets['tau_ext'] = curr; curr += 8 * n_joints
         self.offsets['wrench'] = curr; curr += 48
         
-        self.img_size = img_height * img_width * 3
+        self.img_size = self.n_images * img_height * img_width * 3
         self._image_shape = (self.img_height, self.img_width, 3)
+        self._image_stack_shape = (self.n_images, self.img_height, self.img_width, 3)
         self.offsets['image'] = curr; curr += self.img_size
         
         self.total_bytes = curr
@@ -81,6 +85,7 @@ class SharedObservationSnapshot:
         tau_ext: np.ndarray,
         wrench: np.ndarray,
         image: np.ndarray | None = None,
+        images: dict[str, np.ndarray] | None = None,
     ) -> None:
         buf = self.shm.buf
         
@@ -100,13 +105,30 @@ class SharedObservationSnapshot:
         buf[self.offsets['wrench']:self.offsets['wrench']+48] = np.array(wrench[:6], dtype=np.float64).tobytes()
 
         img_view = np.ndarray(
-            self._image_shape,
+            self._image_stack_shape,
             dtype=np.uint8,
             buffer=buf,
             offset=self.offsets['image'],
         )
-        if image is None:
+        if image is None and images is None:
             img_view.fill(0)
+            return
+
+        img_view.fill(0)
+        if images is not None:
+            if self.camera_names:
+                items = [(name, images.get(name)) for name in self.camera_names]
+            else:
+                items = list(images.items())[: self.n_images]
+            for idx, (name, img) in enumerate(items):
+                if img is None:
+                    continue
+                image_arr = np.asarray(img, dtype=np.uint8)
+                if image_arr.shape != self._image_shape:
+                    raise ValueError(
+                        f"image '{name}' must have shape {self._image_shape}, got {image_arr.shape}"
+                    )
+                np.copyto(img_view[idx], image_arr)
             return
 
         image_arr = np.asarray(image, dtype=np.uint8)
@@ -114,7 +136,7 @@ class SharedObservationSnapshot:
             raise ValueError(
                 f"image must have shape {self._image_shape}, got {image_arr.shape}"
             )
-        np.copyto(img_view, image_arr)
+        np.copyto(img_view[0], image_arr)
 
     def read(self) -> dict | None:
         buf = self.shm.buf
@@ -125,7 +147,7 @@ class SharedObservationSnapshot:
             )[0]
         )
         
-        if version == self.last_read_version:
+        if version == 0 or version == self.last_read_version:
             return None
             
         self.last_read_version = version
@@ -137,12 +159,19 @@ class SharedObservationSnapshot:
         tau_ext = np.frombuffer(buf[self.offsets['tau_ext']:self.offsets['tau_ext']+(8*self.n_joints)], dtype=np.float64).copy()
         wrench = np.frombuffer(buf[self.offsets['wrench']:self.offsets['wrench']+48], dtype=np.float64).copy()
         
-        image = np.ndarray(
-            self._image_shape,
+        image_stack = np.ndarray(
+            self._image_stack_shape,
             dtype=np.uint8,
             buffer=buf,
             offset=self.offsets['image'],
         ).copy()
+        if self.camera_names:
+            images = {
+                name: image_stack[idx].copy()
+                for idx, name in enumerate(self.camera_names)
+            }
+        else:
+            images = {"image": image_stack[0].copy()}
         
         return {
             'timestamp': float(timestamp),
@@ -151,7 +180,9 @@ class SharedObservationSnapshot:
             'grip': float(grip),
             'tau_ext': tau_ext,
             'wrench': wrench,
-            'image': image,
+            'image': image_stack[0].copy(),
+            'images': images,
+            'image_stack': image_stack,
         }
 
     def close(self) -> None:

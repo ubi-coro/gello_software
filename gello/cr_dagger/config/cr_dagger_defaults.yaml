@@ -66,3 +66,70 @@ lerobot:
   # action:                 q_ref(6) + gripper_ref(1)       = 7 dims
   # action.compliant:       q_c(6) + gripper_c(1)           = 7 dims
 
+
+phase_b:
+  # Validated Phase-B architecture (2026-05-26): BOTA SE(3) admittance
+  # generates bounded joint residuals; the UR5e command is q_ref_policy + delta_human.
+  mode: "bota_se3_residual"
+
+  follower:
+    # UR5e direct-torque impedance gains used during the final pre-collection tests.
+    kp: 190.0
+    kd: 15.0
+    # Ramp from the measured UR5e pose to q_ref before recording to avoid torque steps at arming.
+    handoff_ramp_s: 0.60
+
+  leader_position:
+    # Position mode avoids using high-friction Dynamixel currents as the correction signal.
+    operating_mode: 3
+    handoff_settle_s: 0.50       # Unrecorded settle after torque is enabled in position mode.
+    recover_pre_handoff: true    # Recover synthetic handoff sag before arming collection.
+    recover_s: 0.80
+    recover_max_delta: 0.35      # Safety guard: skip recovery if any wrapped joint delta is larger.
+    arm_settle_s: 0.50           # Unrecorded settle after follower command thread starts.
+    current_limit: [910, 1193, 1193, 910, 910, 910, 910]
+    goal_current: [910, 1193, 1193, 910, 910, 910, 910]
+    position_p_gains: [1200, 800, 800, 1200, 1200, 1200, 1200]
+    position_i_gains: [0, 0, 0, 0, 0, 0, 0]
+    position_d_gains: [0, 0, 0, 0, 0, 300, 0]
+    velocity_p_gains: [50, 100, 100, 50, 50, 50, 50]
+    velocity_i_gains: [1800, 1920, 1920, 1800, 1800, 1800, 1800]
+
+  bota:
+    config: "configs/bota_binary.json"
+    driver_tare: false
+    warmup_s: 1.0
+    bias_s: 2.0
+    filter_cutoff_hz: 25.0
+    filter_alpha: 0.0
+    deadband: [0.25, 0.25, 0.25, 0.01, 0.01, 0.01]
+    saturation: [25.0, 25.0, 25.0, 1.5, 1.5, 1.5]
+    gravity_comp: false
+    payload_mass_kg: 0.070
+    payload_com_sensor_m: [0.0, 0.0, 0.0146]
+    gravity_sign: 1.0
+    frame: ""                    # Empty means the final Pinocchio frame from the leader URDF.
+    output_mode: "offset"         # Validated mode: no-force SE(3) offset decays toward zero.
+    axis_mask: [1, 1, 1, 0, 0, 0]
+    cart_mass: [2.0, 2.0, 2.0, 0.5, 0.5, 0.5]
+    cart_damp: [18.0, 18.0, 18.0, 5.0, 5.0, 5.0]
+    cart_stiff: [8.0, 8.0, 8.0, 10.0, 10.0, 10.0]
+    cart_max: [0.03, 0.03, 0.03, 0.025, 0.025, 0.025]
+    dls_damping: 0.10
+    stiction: [0, 0, 0, 0, 0, 0]
+    wrench_sign: 1.0
+    contact_force_scale: 8.0
+    contact_torque_scale: 0.35
+
+  residual:
+    # Slew limits keep correction labels smooth and reduce follower acceleration spikes.
+    delta_max: 0.06
+    delta_rate_max: [0.16, 0.22, 0.22, 0.28, 0.28, 0.28]
+    delta_release_rate_max: [0.12, 0.18, 0.18, 0.22, 0.22, 0.22]
+    delta_release_tau_s: 0.35
+    delta_release_contact_threshold: 0.05
+
+  intervention:
+    # Logged intervention flag: source bit 1 = BOTA contact, bit 2 = residual delta.
+    contact_threshold: 0.25
+    delta_threshold: 0.01

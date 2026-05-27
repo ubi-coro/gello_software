@@ -219,6 +219,28 @@ class ContactGate:
         return probability, state
 
 
+def _intervention_flags(
+    contact_probability: float,
+    delta: np.ndarray,
+    contact_threshold: float,
+    delta_threshold: float,
+) -> tuple[float, float]:
+    contact_thr = float(contact_threshold)
+    delta_thr = float(delta_threshold)
+    contact_active = contact_thr > 0.0 and float(contact_probability) >= contact_thr
+    delta_active = (
+        delta_thr > 0.0
+        and float(np.linalg.norm(np.asarray(delta, dtype=float))) >= delta_thr
+    )
+    source = 0.0
+    if contact_active:
+        source += 1.0
+    if delta_active:
+        source += 2.0
+    active = 1.0 if source > 0.0 else 0.0
+    return active, source
+
+
 class BotaMiniOneReader:
     """Thin lifecycle wrapper around bota_driver for optional Phase-B wrench input."""
 
@@ -972,6 +994,18 @@ def _parse_args() -> argparse.Namespace:
         help="Contact probability below which --adm-delta-release-tau decays the commanded residual toward zero.",
     )
     p.add_argument(
+        "--intervention-contact-threshold",
+        type=float,
+        default=0.25,
+        help="Contact probability threshold for the logged intervention_active flag. Set <=0 to disable this criterion.",
+    )
+    p.add_argument(
+        "--intervention-delta-threshold",
+        type=float,
+        default=0.01,
+        help="Residual norm threshold [rad] for the logged intervention_active flag. Set <=0 to disable this criterion.",
+    )
+    p.add_argument(
         "--admittance-source",
         choices=["observer", "bota_cartesian", "bota_hfvc", "bota_se3", "bota_joint"],
         default="observer",
@@ -1604,6 +1638,12 @@ def _run_leader_mode(
             tau_components["tau_residual"],
             ddq_ref,
         )
+        intervention_active, intervention_source = _intervention_flags(
+            contact_probability,
+            np.zeros(n, dtype=float),
+            float(args.intervention_contact_threshold),
+            float(args.intervention_delta_threshold),
+        )
 
         q_follower = np.zeros(n)
         dq_follower = np.zeros(n)
@@ -1634,7 +1674,11 @@ def _run_leader_mode(
             tau_residual=tau_components["tau_residual"],
             contact_probability=contact_probability,
             contact_state=contact_state,
+            intervention_active=intervention_active,
+            intervention_source=intervention_source,
             epsilon=epsilon,
+            epsilon_leader=epsilon,
+            epsilon_follower=np.full(n, np.nan),
         )
 
         obs_snap.write(
@@ -1746,7 +1790,11 @@ def _run_follower_mode(
             tau_residual=tau_components["tau_residual"],
             contact_probability=0.0,
             contact_state=ContactGate.NO_CONTACT,
+            intervention_active=0.0,
+            intervention_source=0.0,
             epsilon=epsilon,
+            epsilon_leader=np.full(n, np.nan),
+            epsilon_follower=epsilon,
         )
 
         obs_snap.write(
@@ -1911,6 +1959,12 @@ def _run_leader_admittance_mode(
                 tau_model=tau_cmd,
             )
         last_tau_residual = tau_components["tau_residual"].copy()
+        intervention_active, intervention_source = _intervention_flags(
+            contact_probability,
+            delta,
+            float(args.intervention_contact_threshold),
+            float(args.intervention_delta_threshold),
+        )
 
         q_follower = np.zeros(n)
         dq_follower = np.zeros(n)
@@ -1941,7 +1995,11 @@ def _run_leader_admittance_mode(
             tau_residual=tau_components["tau_residual"],
             contact_probability=contact_probability,
             contact_state=contact_state,
+            intervention_active=intervention_active,
+            intervention_source=intervention_source,
             epsilon=epsilon,
+            epsilon_leader=epsilon,
+            epsilon_follower=np.full(n, np.nan),
         )
 
         obs_snap.write(
@@ -2411,6 +2469,12 @@ def _run_leader_admittance_position_mode(
             delta_raw = np.clip(q_c - q_ref, -delta_max, delta_max)
             delta = delta_limiter.step(delta_raw, dt, contact_probability)
             q_c = q_ref + delta
+            intervention_active, intervention_source = _intervention_flags(
+                contact_probability,
+                delta,
+                float(args.intervention_contact_threshold),
+                float(args.intervention_delta_threshold),
+            )
 
             target_hw = np.zeros(system.num_motors)
             target_hw[:n] = q_c * system.joint_signs[:n] + system.joint_offsets[:n]
@@ -2465,6 +2529,7 @@ def _run_leader_admittance_position_mode(
                     pass
 
             epsilon = q - q_c
+            epsilon_follower = q_follower - q_cmd_follower
             recorder.record(
                 t_mono=t_mono,
                 q_ref=q_ref,
@@ -2500,7 +2565,11 @@ def _run_leader_admittance_position_mode(
                 bota_status=bota_status,
                 contact_probability=contact_probability,
                 contact_state=contact_state,
+                intervention_active=intervention_active,
+                intervention_source=intervention_source,
                 epsilon=epsilon,
+                epsilon_leader=epsilon,
+                epsilon_follower=epsilon_follower,
             )
 
             tau_obs = bota_tau_joint if admittance_source.startswith("bota_") else tau_components["tau_residual"]
@@ -2838,6 +2907,18 @@ def _run_four_channel_mode(
         dq_follower = np.asarray(dq_follower[:n], dtype=float)
 
         epsilon = q_follower - q_cmd_ur5e
+        contact_probability = float(np.clip(np.linalg.norm(tau_ext_gated) / 0.45, 0.0, 1.0))
+        contact_state = (
+            ContactGate.CORRECTION_ACTIVE
+            if np.linalg.norm(delta_follower) > 1e-6
+            else ContactGate.NO_CONTACT
+        )
+        intervention_active, intervention_source = _intervention_flags(
+            contact_probability,
+            delta_follower,
+            float(args.intervention_contact_threshold),
+            float(args.intervention_delta_threshold),
+        )
         recorder.record(
             t_mono=t_mono,
             q_ref=q_cmd_ur5e,
@@ -2856,13 +2937,13 @@ def _run_four_channel_mode(
             tau_model=tau_components["tau_model"],
             tau_meas=tau_components["tau_meas"],
             tau_residual=tau_components["tau_residual"],
-            contact_probability=float(np.clip(np.linalg.norm(tau_ext_gated) / 0.45, 0.0, 1.0)),
-            contact_state=(
-                ContactGate.CORRECTION_ACTIVE
-                if np.linalg.norm(delta_follower) > 1e-6
-                else ContactGate.NO_CONTACT
-            ),
+            contact_probability=contact_probability,
+            contact_state=contact_state,
+            intervention_active=intervention_active,
+            intervention_source=intervention_source,
             epsilon=epsilon,
+            epsilon_leader=np.full(n, np.nan),
+            epsilon_follower=epsilon,
         )
 
         obs_snap.write(
@@ -3100,6 +3181,9 @@ def main() -> int:
             "adm_delta_release_rate_max": _parse_float_list(args.adm_delta_release_rate_max),
             "adm_delta_release_tau": float(args.adm_delta_release_tau),
             "adm_delta_release_contact_threshold": float(args.adm_delta_release_contact_threshold),
+            "intervention_contact_threshold": float(args.intervention_contact_threshold),
+            "intervention_delta_threshold": float(args.intervention_delta_threshold),
+            "intervention_source_encoding": "0=none,1=contact,2=delta,3=both",
             "bota_enable": bool(args.bota_enable or str(args.admittance_source).startswith("bota_")),
             "bota_config": str((REPO_ROOT / args.bota_config).resolve() if not Path(args.bota_config).is_absolute() else Path(args.bota_config).resolve()),
             "bota_driver_tare": bool(args.bota_driver_tare),
