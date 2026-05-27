@@ -119,6 +119,8 @@ class BotaWrenchConditioner:
         payload_mass_kg: float,
         payload_com_sensor: np.ndarray,
         gravity_sign: float,
+        base_axis_map: np.ndarray | None = None,
+        base_axis_signs: np.ndarray | None = None,
     ):
         self.cutoff_hz = max(float(cutoff_hz), 0.0)
         self.alpha = float(np.clip(float(alpha), 0.0, 1.0))
@@ -128,10 +130,36 @@ class BotaWrenchConditioner:
         self.payload_mass_kg = max(float(payload_mass_kg), 0.0)
         self.payload_com_sensor = np.asarray(payload_com_sensor, dtype=float).reshape(3)
         self.gravity_sign = float(gravity_sign)
+        self.base_axis_map = self._validate_axis_map(base_axis_map)
+        self.base_axis_signs = self._validate_axis_signs(base_axis_signs)
         self.bias_sensor = np.zeros(6, dtype=float)
         self.filtered_base = np.zeros(6, dtype=float)
         self.initialized = False
         self.last_filter_timestamp_us: int | None = None
+
+    @staticmethod
+    def _validate_axis_map(axis_map: np.ndarray | None) -> np.ndarray:
+        if axis_map is None:
+            return np.arange(6, dtype=int)
+        arr = np.asarray(axis_map, dtype=int).reshape(-1)
+        if arr.size != 6 or sorted(arr.tolist()) != list(range(6)):
+            raise ValueError("bota.base_axis_map must be a permutation of [0,1,2,3,4,5]")
+        return arr
+
+    @staticmethod
+    def _validate_axis_signs(axis_signs: np.ndarray | None) -> np.ndarray:
+        if axis_signs is None:
+            return np.ones(6, dtype=float)
+        arr = np.asarray(axis_signs, dtype=float).reshape(-1)
+        if arr.size != 6:
+            raise ValueError("bota.base_axis_signs must contain 6 values")
+        signs = np.sign(arr)
+        signs[signs == 0.0] = 1.0
+        return signs
+
+    def _apply_base_axis_correction(self, wrench_base: np.ndarray) -> np.ndarray:
+        wrench = np.asarray(wrench_base, dtype=float).reshape(6)
+        return self.base_axis_signs * wrench[self.base_axis_map]
 
     def _filter_alpha(self, dt_s: float) -> float:
         if self.cutoff_hz > 0.0:
@@ -158,7 +186,7 @@ class BotaWrenchConditioner:
         wrench_sensor = np.asarray(wrench_sensor_raw, dtype=float).reshape(6) - self.bias_sensor
         force_base = r_base_sensor @ wrench_sensor[:3]
         torque_base = r_base_sensor @ wrench_sensor[3:]
-        wrench_base = np.concatenate([force_base, torque_base])
+        wrench_base = self._apply_base_axis_correction(np.concatenate([force_base, torque_base]))
 
         if self.gravity_comp and self.payload_mass_kg > 0.0:
             g_base = np.array([0.0, 0.0, -9.80665], dtype=float)
@@ -782,6 +810,12 @@ def run_phase_b_bota_se3_loop(
             payload_mass_kg=float(bota_cfg.get("payload_mass_kg", 0.070)),
             payload_com_sensor=_as_list(bota_cfg.get("payload_com_sensor_m"), 3, 0.0),
             gravity_sign=float(bota_cfg.get("gravity_sign", 1.0)),
+            base_axis_map=_as_int_list(bota_cfg.get("base_axis_map"), 6),
+            base_axis_signs=_as_list(bota_cfg.get("base_axis_signs"), 6, 1.0),
+        )
+        print(
+            "[BOTA] base-frame axis correction "
+            f"map={conditioner.base_axis_map.tolist()} signs={conditioner.base_axis_signs.tolist()}"
         )
 
         bota_reader = BotaMiniOneReader(bota_path, driver_tare=bool(bota_cfg.get("driver_tare", False)))
@@ -838,8 +872,11 @@ def run_phase_b_bota_se3_loop(
         print("[PHASE B] BOTA-SE3 residual loop armed")
 
         last_warn = 0.0
+        last_loop_t0: float | None = None
         while not stop_event.is_set():
             loop_t0 = time.perf_counter()
+            phase_b_loop_dt_s = float("nan") if last_loop_t0 is None else loop_t0 - last_loop_t0
+            last_loop_t0 = loop_t0
             t_mono = time.monotonic()
 
             try:
@@ -918,12 +955,29 @@ def run_phase_b_bota_se3_loop(
                 delta_threshold=float(intervention_cfg.get("delta_threshold", 0.01)),
             )
             tau_ext = jac_cur.T @ wrench_base
+            phase_b_compute_dt_s = time.perf_counter() - loop_t0
+            phase_b_sleep_s = max(0.0, dt - phase_b_compute_dt_s)
+            phase_b_overrun = phase_b_compute_dt_s > dt
+            policy_action_age_s = float(getattr(traj_interp, "last_action_age_s", float("nan")))
+            policy_trajectory_t_write = float(getattr(traj_interp, "last_t_write", 0.0))
+            policy_trajectory_is_new = bool(getattr(traj_interp, "last_is_new", False))
             diag = {
                 "votes": {
                     "wrench": bool(source in (1.0, 3.0)),
                     "delta_q": bool(source in (2.0, 3.0)),
                     "energy": False,
                     "torque": False,
+                },
+                "timing": {
+                    "phase_b_loop_dt_s": float(phase_b_loop_dt_s),
+                    "phase_b_compute_dt_s": float(phase_b_compute_dt_s),
+                    "phase_b_sleep_s": float(phase_b_sleep_s),
+                    "phase_b_overrun": bool(phase_b_overrun),
+                    "phase_b_target_dt_s": float(dt),
+                    "policy_action_age_s": float(policy_action_age_s),
+                    "policy_trajectory_t_write": float(policy_trajectory_t_write),
+                    "policy_trajectory_is_new": bool(policy_trajectory_is_new),
+                    "reference_stale": bool(is_stale),
                 },
                 "contact_probability": float(contact_prob),
                 "contact_gate": float(contact_gate),
@@ -967,8 +1021,15 @@ def run_phase_b_bota_se3_loop(
                         "delta_human": delta_leader.copy(),
                         "delta_human_raw": delta_raw.copy(),
                         "q_cmd_ur5e": compliant_action[:n].copy(),
-                        "epsilon_leader": q_leader - q_cmd_leader,
+                        "epsilon_leader": wrap_angle_delta(q_leader - q_cmd_leader),
                         "epsilon_ur5e": q_follower - compliant_action[:n],
+                        "phase_b_loop_dt_s": float(phase_b_loop_dt_s),
+                        "phase_b_compute_dt_s": float(phase_b_compute_dt_s),
+                        "phase_b_sleep_s": float(phase_b_sleep_s),
+                        "phase_b_overrun": bool(phase_b_overrun),
+                        "policy_action_age_s": float(policy_action_age_s),
+                        "policy_trajectory_t_write": float(policy_trajectory_t_write),
+                        "policy_trajectory_is_new": bool(policy_trajectory_is_new),
                     }
                 )
 

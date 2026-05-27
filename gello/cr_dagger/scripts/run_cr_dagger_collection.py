@@ -610,9 +610,12 @@ def _run_recording_loop_phase_b(
     ep_overruns = 0
     corr_steps = 0
     cache_lock = state_cache["lock"]
+    last_frame_start: float | None = None
 
     while True:
         frame_start = time.perf_counter()
+        recording_frame_dt_s = float("nan") if last_frame_start is None else frame_start - last_frame_start
+        last_frame_start = frame_start
 
         if frame_start - ep_start > max_duration:
             print(f"[REC] Time limit reached ({max_duration}s)")
@@ -683,8 +686,20 @@ def _run_recording_loop_phase_b(
             q_ref_leader = state_cache.get("q_ref", np.zeros(n)).copy()
             q_cmd_leader = state_cache.get("q_cmd_leader", q_ref_leader + delta_leader).copy()
             q_cmd_ur5e = state_cache.get("q_cmd_ur5e", compliant_action[:n]).copy()
-            epsilon_leader = state_cache.get("epsilon_leader", q_leader - q_cmd_leader).copy()
+            epsilon_leader = state_cache.get(
+                "epsilon_leader",
+                (q_leader - q_cmd_leader + np.pi) % (2.0 * np.pi) - np.pi,
+            ).copy()
             epsilon_ur5e = state_cache.get("epsilon_ur5e", q_follower - q_cmd_ur5e).copy()
+
+            phase_b_loop_dt_s = float(state_cache.get("phase_b_loop_dt_s", float("nan")))
+            phase_b_compute_dt_s = float(state_cache.get("phase_b_compute_dt_s", float("nan")))
+            phase_b_sleep_s = float(state_cache.get("phase_b_sleep_s", float("nan")))
+            phase_b_overrun = bool(state_cache.get("phase_b_overrun", False))
+            policy_action_age_s = float(state_cache.get("policy_action_age_s", float("nan")))
+            policy_trajectory_t_write = float(state_cache.get("policy_trajectory_t_write", 0.0))
+            policy_trajectory_is_new = bool(state_cache.get("policy_trajectory_is_new", False))
+            unified_cache_age_s = float(t_mono - cache_t)
 
             # Reset the updated flag to detect future updates and stale state.
             try:
@@ -694,6 +709,24 @@ def _run_recording_loop_phase_b(
 
         if is_corr:
             corr_steps += 1
+
+        if isinstance(diag, dict):
+            timing_diag = dict(diag.get("timing", {}) or {})
+            timing_diag.update(
+                {
+                    "recording_frame_dt_s": float(recording_frame_dt_s),
+                    "unified_cache_age_s": float(unified_cache_age_s),
+                    "phase_b_loop_dt_s": float(phase_b_loop_dt_s),
+                    "phase_b_compute_dt_s": float(phase_b_compute_dt_s),
+                    "phase_b_sleep_s": float(phase_b_sleep_s),
+                    "phase_b_overrun": bool(phase_b_overrun),
+                    "policy_action_age_s": float(policy_action_age_s),
+                    "policy_trajectory_t_write": float(policy_trajectory_t_write),
+                    "policy_trajectory_is_new": bool(policy_trajectory_is_new),
+                }
+            )
+            diag = dict(diag)
+            diag["timing"] = timing_diag
 
         images = None
         if camera_rig is not None:
@@ -1378,6 +1411,8 @@ def main() -> int:
                 "bota_deadband": bota_cfg.get("deadband", []),
                 "bota_saturation": bota_cfg.get("saturation", []),
                 "bota_wrench_sign": float(bota_cfg.get("wrench_sign", 1.0)),
+                "bota_base_axis_map": bota_cfg.get("base_axis_map", []),
+                "bota_base_axis_signs": bota_cfg.get("base_axis_signs", []),
                 "bota_se3_output_mode": str(bota_cfg.get("output_mode", "offset")),
                 "bota_contact_force_scale": float(bota_cfg.get("contact_force_scale", 8.0)),
                 "bota_contact_torque_scale": float(bota_cfg.get("contact_torque_scale", 0.35)),
@@ -1394,6 +1429,7 @@ def main() -> int:
                 "action_dt": float(args.action_dt),
                 "horizon": int(args.horizon),
                 "latency_compensation_s": 0.008,
+                "epsilon_leader_wrapped": True,
             }
             npz_recorder = CorrectionRecorder(
                 n_joints=n,

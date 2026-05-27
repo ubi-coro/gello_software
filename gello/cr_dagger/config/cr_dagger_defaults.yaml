@@ -108,6 +108,11 @@ phase_b:
     payload_mass_kg: 0.070
     payload_com_sensor_m: [0.0, 0.0, 0.0146]
     gravity_sign: 1.0
+    # Correction applied after the nominal sensor-to-base rotation. 
+    # Current test candidate swaps X and Z axes (0=X, 1=Y, 2=Z, 3=Rx, 4=Ry, 5=Rz).
+    # Thus [2, 1, 0, 5, 4, 3] maps: X->Z, Y->Y, Z->X, Rx->Rz, Ry->Ry, Rz->Rx.
+    base_axis_map: [2, 1, 0, 5, 4, 3]
+    base_axis_signs: [-1, 1, 1, -1, 1, 1]
     frame: ""                    # Empty means the final Pinocchio frame from the leader URDF.
     output_mode: "offset"         # Validated mode: no-force SE(3) offset decays toward zero.
     axis_mask: [1, 1, 1, 0, 0, 0]

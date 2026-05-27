@@ -32,7 +32,7 @@ class CorrectionFrame:
     q_ref_leader: np.ndarray | None = None         # Policy reference in leader joint frame.
     q_cmd_leader: np.ndarray | None = None         # Leader command q_ref_leader + delta_leader.
     q_cmd_ur5e: np.ndarray | None = None           # Final UR5e command in follower joint frame.
-    epsilon_leader: np.ndarray | None = None       # Leader tracking error q_actual - q_cmd_leader.
+    epsilon_leader: np.ndarray | None = None       # Wrapped leader tracking error q_actual - q_cmd_leader.
     epsilon_ur5e: np.ndarray | None = None         # Follower tracking error q_follower - q_cmd_ur5e.
     wrench_sensor_raw: np.ndarray | None = None    # Raw BOTA sensor-frame wrench before software bias.
     wrench_base_raw: np.ndarray | None = None      # Base-frame wrench before LPF/deadband/saturation.
@@ -180,6 +180,16 @@ class CorrectionRecorder:
         intervention_source = np.zeros(T, dtype=np.float32)
         bota_temperature_c = np.zeros(T, dtype=np.float32)
         bota_status_flags = np.zeros((T, 8), dtype=np.float32)
+        recording_frame_dt_s = np.full(T, np.nan, dtype=np.float32)
+        unified_cache_age_s = np.full(T, np.nan, dtype=np.float32)
+        phase_b_loop_dt_s = np.full(T, np.nan, dtype=np.float32)
+        phase_b_compute_dt_s = np.full(T, np.nan, dtype=np.float32)
+        phase_b_sleep_s = np.full(T, np.nan, dtype=np.float32)
+        phase_b_overrun = np.zeros(T, dtype=bool)
+        policy_action_age_s = np.full(T, np.nan, dtype=np.float32)
+        policy_trajectory_t_write = np.full(T, np.nan, dtype=np.float64)
+        policy_trajectory_is_new = np.zeros(T, dtype=bool)
+        reference_stale = np.zeros(T, dtype=bool)
         for i, f in enumerate(self.frames):
             diag = f.detector_diagnostics or {}
             v = diag.get("votes", {})
@@ -196,6 +206,17 @@ class CorrectionRecorder:
             flags = np.asarray(diag.get("bota_status_flags", []), dtype=np.float32).ravel()
             if flags.size:
                 bota_status_flags[i, : min(flags.size, bota_status_flags.shape[1])] = flags[: bota_status_flags.shape[1]]
+            timing = diag.get("timing", {}) or {}
+            recording_frame_dt_s[i] = float(timing.get("recording_frame_dt_s", np.nan))
+            unified_cache_age_s[i] = float(timing.get("unified_cache_age_s", np.nan))
+            phase_b_loop_dt_s[i] = float(timing.get("phase_b_loop_dt_s", np.nan))
+            phase_b_compute_dt_s[i] = float(timing.get("phase_b_compute_dt_s", np.nan))
+            phase_b_sleep_s[i] = float(timing.get("phase_b_sleep_s", np.nan))
+            phase_b_overrun[i] = bool(timing.get("phase_b_overrun", False))
+            policy_action_age_s[i] = float(timing.get("policy_action_age_s", np.nan))
+            policy_trajectory_t_write[i] = float(timing.get("policy_trajectory_t_write", np.nan))
+            policy_trajectory_is_new[i] = bool(timing.get("policy_trajectory_is_new", False))
+            reference_stale[i] = bool(timing.get("reference_stale", False))
 
         metadata_json = json.dumps(self.metadata, sort_keys=True, default=self._metadata_json_default)
         filename = self.log_dir / f"{self.episode_id}.npz"
@@ -252,6 +273,16 @@ class CorrectionRecorder:
             bota_temperature_c=bota_temperature_c,
             bota_status_flags=bota_status_flags,
             bota_status=bota_status_flags[:, :4],
+            recording_frame_dt_s=recording_frame_dt_s,
+            unified_cache_age_s=unified_cache_age_s,
+            phase_b_loop_dt_s=phase_b_loop_dt_s,
+            phase_b_compute_dt_s=phase_b_compute_dt_s,
+            phase_b_sleep_s=phase_b_sleep_s,
+            phase_b_overrun=phase_b_overrun,
+            policy_action_age_s=policy_action_age_s,
+            policy_trajectory_t_write=policy_trajectory_t_write,
+            policy_trajectory_is_new=policy_trajectory_is_new,
+            reference_stale=reference_stale,
             metadata_json=metadata_json,
         )
         print(f"[CorrectionRecorder] Episode saved: {filename}")
