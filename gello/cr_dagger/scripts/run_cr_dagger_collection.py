@@ -549,6 +549,7 @@ def _run_recording_loop_phase_a(
                 ep_steps += 1
                 continue
 
+        gripper_action = float(action[-1]) if action.shape[0] > n else 0.0
         lerobot_recorder.add_frame(
             timestamp=t_mono,
             q=q_follower,
@@ -557,9 +558,11 @@ def _run_recording_loop_phase_a(
             action=action,
             tau_ext=np.zeros(n, dtype=float),
             wrench_ur5e=np.zeros(6, dtype=float),
-            q_ref=q_follower,
-            q_compliant=q_follower,
+            q_ref=action[:n],
+            q_compliant=action[:n],
             dq_compliant=dq_follower,
+            gripper_ref=gripper_action,
+            gripper_compliant=gripper_action,
             is_correction=False,
             images=images,
             detector_votes=np.zeros(4, dtype=np.float32),
@@ -654,6 +657,25 @@ def _run_recording_loop_phase_b(
 
         t_mono = time.monotonic()
         with cache_lock:
+            phase_b_fatal = bool(state_cache.get("phase_b_fatal", False))
+            phase_b_error = str(
+                state_cache.get("phase_b_fatal_reason", "")
+                or state_cache.get("phase_b_error", "")
+            )
+            if phase_b_fatal or phase_b_error:
+                reason = phase_b_error or "Phase-B runtime failure"
+                print(f"[ABORT] Phase-B runtime failure during recording: {reason}")
+                return {
+                    "rerecord": True,
+                    "success": False,
+                    "running": False,
+                    "steps": ep_recorded_frames,
+                    "overruns": ep_overruns,
+                    "frames": ep_recorded_frames,
+                    "corr_steps": corr_steps,
+                    "abort_reason": reason,
+                }
+
             if not state_cache.get("updated", False):
                 time.sleep(0.001)
                 continue
@@ -674,6 +696,8 @@ def _run_recording_loop_phase_b(
             wrench_sensor_raw = state_cache.get("wrench_sensor_raw", np.zeros(6)).copy()
             wrench_base_raw = state_cache.get("wrench_base_raw", np.zeros(6)).copy()
             wrench_base = state_cache.get("wrench_base", wrench_ur5e).copy()
+            wrench_base_calibrated = state_cache.get("wrench_base_calibrated", np.full(6, np.nan)).copy()
+            wrench_calibration_prediction = state_cache.get("wrench_calibration_prediction", np.full(6, np.nan)).copy()
             task_delta = state_cache.get("task_delta", np.zeros(6)).copy()
             task_pose_error = state_cache.get("task_pose_error", np.zeros(6)).copy()
             delta_leader = state_cache.get("delta_leader", np.zeros(n)).copy()
@@ -685,6 +709,9 @@ def _run_recording_loop_phase_b(
             compliant_action = state_cache.get("compliant_action", np.zeros(n + 1)).copy()
             q_ref_leader = state_cache.get("q_ref", np.zeros(n)).copy()
             q_cmd_leader = state_cache.get("q_cmd_leader", q_ref_leader + delta_leader).copy()
+            q_cmd_leader_raw = state_cache.get("q_cmd_leader_raw", q_ref_leader + delta_leader).copy()
+            leader_mirror_safety_delta = state_cache.get("leader_mirror_safety_delta", np.zeros(n)).copy()
+            leader_mirror_safety_active = state_cache.get("leader_mirror_safety_active", np.zeros(n, dtype=bool)).copy()
             q_cmd_ur5e = state_cache.get("q_cmd_ur5e", compliant_action[:n]).copy()
             epsilon_leader = state_cache.get(
                 "epsilon_leader",
@@ -697,6 +724,8 @@ def _run_recording_loop_phase_b(
             phase_b_sleep_s = float(state_cache.get("phase_b_sleep_s", float("nan")))
             phase_b_overrun = bool(state_cache.get("phase_b_overrun", False))
             policy_action_age_s = float(state_cache.get("policy_action_age_s", float("nan")))
+            policy_inference_dt_s = float(state_cache.get("policy_inference_dt_s", float("nan")))
+            control_loop_hz = float(state_cache.get("control_loop_hz", float("nan")))
             policy_trajectory_t_write = float(state_cache.get("policy_trajectory_t_write", 0.0))
             policy_trajectory_is_new = bool(state_cache.get("policy_trajectory_is_new", False))
             unified_cache_age_s = float(t_mono - cache_t)
@@ -721,6 +750,8 @@ def _run_recording_loop_phase_b(
                     "phase_b_sleep_s": float(phase_b_sleep_s),
                     "phase_b_overrun": bool(phase_b_overrun),
                     "policy_action_age_s": float(policy_action_age_s),
+                    "policy_inference_dt_s": float(policy_inference_dt_s),
+                    "control_loop_hz": float(control_loop_hz),
                     "policy_trajectory_t_write": float(policy_trajectory_t_write),
                     "policy_trajectory_is_new": bool(policy_trajectory_is_new),
                 }
@@ -768,12 +799,17 @@ def _run_recording_loop_phase_b(
                 detector_diagnostics=diag,
                 q_ref_leader=q_ref_leader,
                 q_cmd_leader=q_cmd_leader,
+                q_cmd_leader_raw=q_cmd_leader_raw,
+                leader_mirror_safety_delta=leader_mirror_safety_delta,
+                leader_mirror_safety_active=leader_mirror_safety_active,
                 q_cmd_ur5e=q_cmd_ur5e,
                 epsilon_leader=epsilon_leader,
                 epsilon_ur5e=epsilon_ur5e,
                 wrench_sensor_raw=wrench_sensor_raw,
                 wrench_base_raw=wrench_base_raw,
                 wrench_base=wrench_base,
+                wrench_base_calibrated=wrench_base_calibrated,
+                wrench_calibration_prediction=wrench_calibration_prediction,
                 task_delta=task_delta,
                 task_pose_error=task_pose_error,
                 delta_leader=delta_leader,
@@ -817,6 +853,9 @@ def _run_recording_loop_phase_b(
                 f"  [ep {ep+1:03d} {elapsed_s:5.1f}s] "
                 f"INT={'YES' if is_corr else 'no '} "
                 f"|Δ|={delta_norm:.4f} "
+                f"ctrl={control_loop_hz:5.1f}Hz "
+                f"pol={policy_inference_dt_s * 1000.0:5.1f}ms "
+                f"age={policy_action_age_s * 1000.0:5.0f}ms "
                 f"frames={ep_recorded_frames}"
             )
 
@@ -1249,6 +1288,12 @@ def main() -> int:
         n = int(system.num_arm_joints)
         if system.driver is None:
             raise RuntimeError("Dynamixel driver is not available")
+        if args.interventions and bool(getattr(system.driver, "_is_fake", False)):
+            raise RuntimeError(
+                "Refusing Phase-B intervention run with FakeDynamixelDriver. "
+                "/dev/ttyDXL_gello is missing or the GELLO Dynamixel bus did not initialize; "
+                "fix the device/udev connection before commanding the UR follower."
+            )
         if not system.teleop_enabled:
             print("[WARN] teleop is disabled in config.")
         shi = _build_shi(system, config_path, n)
@@ -1308,6 +1353,8 @@ def main() -> int:
                 "wrench_sensor_raw": np.zeros(6),
                 "wrench_base_raw": np.zeros(6),
                 "wrench_base": np.zeros(6),
+                "wrench_base_calibrated": np.full(6, np.nan),
+                "wrench_calibration_prediction": np.full(6, np.nan),
                 "task_delta": np.zeros(6),
                 "task_pose_error": np.zeros(6),
                 "delta_leader": np.zeros(n),
@@ -1331,6 +1378,15 @@ def main() -> int:
                 "delta_human_raw": np.zeros(n),
                 "intervention_active": 0.0,
                 "intervention_source": 0.0,
+                "phase_b_loop_dt_s": float("nan"),
+                "phase_b_compute_dt_s": float("nan"),
+                "phase_b_sleep_s": float("nan"),
+                "phase_b_overrun": False,
+                "policy_action_age_s": float("nan"),
+                "policy_inference_dt_s": float("nan"),
+                "control_loop_hz": float("nan"),
+                "policy_trajectory_t_write": 0.0,
+                "policy_trajectory_is_new": False,
             }
 
         camera_names, camera_device_ids, camera_flips = _resolve_camera_config(args)
@@ -1369,7 +1425,7 @@ def main() -> int:
             fps=dataset_fps,
             task_description=str(args.task_description),
             n_joints=n,
-            include_gripper_action=(bool(args.interventions) and has_gripper),
+            include_gripper_action=bool(has_gripper),
             camera_names=camera_names if camera_names else None,
         )
 
@@ -1430,6 +1486,7 @@ def main() -> int:
                 "horizon": int(args.horizon),
                 "latency_compensation_s": 0.008,
                 "epsilon_leader_wrapped": True,
+                "leader_mirror_safety": "nearest_turn_then_limit_if_current_branch_is_valid",
             }
             npz_recorder = CorrectionRecorder(
                 n_joints=n,
@@ -1665,7 +1722,11 @@ def main() -> int:
 
             if rerecord:
                 _discard_episode(lerobot_recorder, npz_recorder)
-                print(f"[DISCARD] Episode {ep + 1} discarded — will re-record.\n")
+                abort_reason = str(result.get("abort_reason", ""))
+                if abort_reason:
+                    print(f"[ABORT] Episode {ep + 1} aborted and discarded: {abort_reason}\n")
+                else:
+                    print(f"[DISCARD] Episode {ep + 1} discarded — will re-record.\n")
 
                 # ── RESET STATE (even after discard) ──────────────────────
                 # Teleop stays active so user can reposition!

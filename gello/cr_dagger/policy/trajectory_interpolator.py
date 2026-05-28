@@ -25,12 +25,16 @@ class TrajectoryInterpolator:
         self.last_t_write: float = 0.0
         self.last_action_age_s: float = float("nan")
         self.last_is_new: bool = False
+        self.last_policy_inference_dt_s: float = float("nan")
 
     def get_reference(self, t_now: float) -> tuple[np.ndarray, np.ndarray, bool]:
         traj, t_write, is_new = self.traj_buf.read()
         self.last_t_write = float(t_write)
         self.last_action_age_s = float(t_now - t_write)
         self.last_is_new = bool(is_new)
+        self.last_policy_inference_dt_s = float(
+            getattr(self.traj_buf, "last_policy_inference_dt_s", float("nan"))
+        )
         
         is_stale = (t_now - t_write > self.stale_threshold_s)
         

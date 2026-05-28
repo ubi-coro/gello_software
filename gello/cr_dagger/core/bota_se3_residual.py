@@ -8,6 +8,11 @@ from typing import Any
 
 import numpy as np
 
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
+
 from gello.cr_dagger.policy.trajectory_interpolator import TrajectoryInterpolator
 from gello.dynamixel.driver import (
     ADDR_CURRENT_LIMIT,
@@ -106,8 +111,50 @@ class BotaMiniOneReader:
             print(f"[WARN] Bota shutdown failed: {exc}")
 
 
+class BotaLinearWrenchCalibration:
+    """Linear orientation-based BOTA residual compensation loaded from YAML."""
+
+    def __init__(self, path: Path, payload: dict[str, Any]) -> None:
+        self.path = path
+        self.payload = payload
+        self.feature_mode = str(payload.get("feature_mode", "relative_rotation"))
+        self.target_field = str(payload.get("target_field", "wrench_base_static_ema"))
+        self.coefficients = np.asarray(payload["coefficients"], dtype=float)
+        if self.coefficients.shape != (10, 6):
+            raise ValueError(
+                f"Expected BOTA calibration coefficients shape (10, 6), got {self.coefficients.shape}"
+            )
+
+    def features(self, r_base_sensor: np.ndarray, r_ref_runtime: np.ndarray) -> np.ndarray:
+        rot = np.asarray(r_base_sensor, dtype=float).reshape(3, 3)
+        if self.feature_mode == "relative_rotation":
+            body = (rot - np.asarray(r_ref_runtime, dtype=float).reshape(3, 3)).reshape(9)
+        elif self.feature_mode == "absolute_rotation":
+            body = rot.reshape(9)
+        else:
+            raise ValueError(f"Unsupported BOTA calibration feature_mode: {self.feature_mode}")
+        return np.concatenate([[1.0], body])
+
+    def predict(self, r_base_sensor: np.ndarray, r_ref_runtime: np.ndarray) -> np.ndarray:
+        return self.features(r_base_sensor, r_ref_runtime) @ self.coefficients
+
+
+def load_bota_wrench_calibration(path: Path) -> BotaLinearWrenchCalibration:
+    if yaml is None:
+        raise RuntimeError("PyYAML is required for BOTA wrench calibration")
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"BOTA wrench calibration not found: {resolved}")
+    payload = yaml.safe_load(resolved.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid BOTA wrench calibration YAML: {resolved}")
+    if payload.get("kind") != "bota_minione_linear_wrench_compensation":
+        raise ValueError(f"Unsupported BOTA wrench calibration kind: {payload.get('kind')!r}")
+    return BotaLinearWrenchCalibration(resolved, payload)
+
+
 class BotaWrenchConditioner:
-    """Apply software bias, frame transform, optional gravity compensation, LPF, deadband, and saturation."""
+    """Apply software bias, frame transform, calibrated compensation, LPF, deadband, and saturation."""
 
     def __init__(
         self,
@@ -121,6 +168,7 @@ class BotaWrenchConditioner:
         gravity_sign: float,
         base_axis_map: np.ndarray | None = None,
         base_axis_signs: np.ndarray | None = None,
+        wrench_calibration: BotaLinearWrenchCalibration | None = None,
     ):
         self.cutoff_hz = max(float(cutoff_hz), 0.0)
         self.alpha = float(np.clip(float(alpha), 0.0, 1.0))
@@ -134,6 +182,10 @@ class BotaWrenchConditioner:
         self.base_axis_signs = self._validate_axis_signs(base_axis_signs)
         self.bias_sensor = np.zeros(6, dtype=float)
         self.filtered_base = np.zeros(6, dtype=float)
+        self.wrench_calibration = wrench_calibration
+        self.calibration_reference_r_base_sensor = np.eye(3, dtype=float)
+        self.last_calibration_prediction = np.zeros(6, dtype=float)
+        self.last_calibrated_base = np.zeros(6, dtype=float)
         self.initialized = False
         self.last_filter_timestamp_us: int | None = None
 
@@ -175,6 +227,24 @@ class BotaWrenchConditioner:
             self.bias_sensor = np.mean(np.asarray(samples_sensor, dtype=float), axis=0)
             print(f"[BOTA] software bias: {np.array2string(self.bias_sensor, precision=4)}")
 
+    def set_calibration_reference(self, r_base_sensor: np.ndarray) -> None:
+        self.calibration_reference_r_base_sensor = np.asarray(r_base_sensor, dtype=float).reshape(3, 3).copy()
+        if self.wrench_calibration is not None:
+            print(
+                "[BOTA] calibrated wrench compensation reference set "
+                f"feature_mode={self.wrench_calibration.feature_mode} "
+                f"target={self.wrench_calibration.target_field}"
+            )
+
+    def _condition(self, wrench_base: np.ndarray) -> np.ndarray:
+        conditioned = np.asarray(wrench_base, dtype=float).reshape(6).copy()
+        conditioned = np.where(
+            np.abs(conditioned) > self.deadband,
+            conditioned - np.sign(conditioned) * self.deadband,
+            0.0,
+        )
+        return np.clip(conditioned, -self.saturation, self.saturation)
+
     def update(
         self,
         wrench_sensor_raw: np.ndarray,
@@ -182,7 +252,7 @@ class BotaWrenchConditioner:
         dt: float,
         timestamp_us: int | None = None,
         is_new_frame: bool = True,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         wrench_sensor = np.asarray(wrench_sensor_raw, dtype=float).reshape(6) - self.bias_sensor
         force_base = r_base_sensor @ wrench_sensor[:3]
         torque_base = r_base_sensor @ wrench_sensor[3:]
@@ -213,14 +283,17 @@ class BotaWrenchConditioner:
                 alpha = self._filter_alpha(filter_dt_s)
                 self.filtered_base = self.filtered_base + alpha * (wrench_base - self.filtered_base)
 
-        conditioned = self.filtered_base.copy()
-        conditioned = np.where(
-            np.abs(conditioned) > self.deadband,
-            conditioned - np.sign(conditioned) * self.deadband,
-            0.0,
-        )
-        conditioned = np.clip(conditioned, -self.saturation, self.saturation)
-        return wrench_base, conditioned
+        calibration_prediction = np.zeros(6, dtype=float)
+        calibrated_base = self.filtered_base.copy()
+        if self.wrench_calibration is not None:
+            calibration_prediction = self.wrench_calibration.predict(
+                r_base_sensor, self.calibration_reference_r_base_sensor
+            )
+            calibrated_base = self.filtered_base - calibration_prediction
+        self.last_calibration_prediction = calibration_prediction.copy()
+        self.last_calibrated_base = calibrated_base.copy()
+        conditioned = self._condition(calibrated_base)
+        return wrench_base, conditioned, calibrated_base, calibration_prediction
 
 
 class GelloTaskspaceKinematics:
@@ -452,6 +525,50 @@ def map_leader_delta_to_follower_delta(system: Any, delta_leader: np.ndarray, n:
             delta_follower[follower_idx] = float(system.map_signs[follower_idx]) * delta[leader_idx]
     return delta_follower
 
+def make_safe_leader_mirror_target(
+    system: Any,
+    q_cmd_leader_raw: np.ndarray,
+    q_leader: np.ndarray,
+    n: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return a turn-safe, limit-aware GELLO mirror target.
+
+    The UR command path remains independent. This only prevents the haptic
+    mirror from chasing an equivalent but bad GELLO turn branch. Limits are
+    applied only when the current decoded joint is already plausibly inside
+    that configured limit interval; this avoids clamping joints whose static
+    limits are on a different 2pi branch than the current boot calibration.
+    """
+    target_raw = np.asarray(q_cmd_leader_raw[:n], dtype=float)
+    reference = np.asarray(q_leader[:n], dtype=float)
+    target_safe = reference + wrap_angle_delta(target_raw - reference)
+
+    active = np.zeros(n, dtype=bool)
+    lower = getattr(system, "arm_joint_limits_min", None)
+    upper = getattr(system, "arm_joint_limits_max", None)
+    margin = float(getattr(system, "safety_margin", 0.0) or 0.0)
+    if lower is not None and upper is not None:
+        lo_arr = np.asarray(lower, dtype=float).reshape(-1)
+        hi_arr = np.asarray(upper, dtype=float).reshape(-1)
+        lim = min(n, lo_arr.size, hi_arr.size)
+        for i in range(lim):
+            lo = float(lo_arr[i]) + margin
+            hi = float(hi_arr[i]) - margin
+            if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi:
+                continue
+            # Only trust the static limit interval if the current decoded
+            # joint is on the same configured branch. Some GELLO limits are
+            # intentionally broader/multi-turn and not all are branch-aligned.
+            if lo - margin <= reference[i] <= hi + margin:
+                clipped = float(np.clip(target_safe[i], lo, hi))
+                if abs(clipped - target_safe[i]) > 1e-9:
+                    active[i] = True
+                target_safe[i] = clipped
+
+    safety_delta = target_safe - target_raw
+    active |= np.abs(safety_delta) > 1e-6
+    return target_safe, safety_delta, active
+
 def _as_list(value: Any, n: int, fill: float = 0.0) -> np.ndarray:
     if value is None:
         return np.full(n, fill, dtype=float)
@@ -675,7 +792,7 @@ def _start_phase_b_follower_command_thread(
     kp: float,
     kd: float,
     handoff_ramp_s: float = 0.0,
-) -> tuple[Event, Lock, dict[str, np.ndarray], Thread]:
+) -> tuple[Event, Lock, dict[str, Any], Thread]:
     if not system.teleop_enabled or system._direct_follower_robot is None:
         raise RuntimeError("Phase B requires teleop.enable=true with direct RTDE follower control")
 
@@ -686,7 +803,12 @@ def _start_phase_b_follower_command_thread(
     q_start = q_target_initial.copy()
     q_error = np.zeros_like(q_target_initial)
     can_ramp = False
-    state: dict[str, np.ndarray] = {"q": q_target_initial.copy()}
+    state: dict[str, Any] = {
+        "q": q_target_initial.copy(),
+        "failed": False,
+        "failure_reason": "",
+        "failures": 0,
+    }
 
     try:
         q_follower_now, _ = system.get_follower_arm_state()
@@ -720,16 +842,28 @@ def _start_phase_b_follower_command_thread(
                 )
                 if ok is False:
                     failures += 1
+                    with state_lock:
+                        state["failed"] = True
+                        state["failure_reason"] = "directTorque returned False"
+                        state["failures"] = int(failures)
                     now = time.monotonic()
                     if now - last_warn > 1.0:
                         last_warn = now
                         print(f"[FOLLOWER] directTorque returned False ({failures} total)")
+                    stop_event.set()
+                    break
             except Exception as exc:
                 failures += 1
+                with state_lock:
+                    state["failed"] = True
+                    state["failure_reason"] = f"follower command failed: {exc}"
+                    state["failures"] = int(failures)
                 now = time.monotonic()
                 if now - last_warn > 1.0:
                     last_warn = now
                     print(f"[FOLLOWER] command failed ({failures} total): {exc}")
+                stop_event.set()
+                break
             sleep_s = dt_thread - (time.perf_counter() - loop_t0)
             if sleep_s > 0.0:
                 time.sleep(sleep_s)
@@ -775,6 +909,16 @@ def run_phase_b_bota_se3_loop(
     if not bota_path.is_absolute():
         bota_path = (repo_root / bota_path).resolve()
 
+    wrench_calibration: BotaLinearWrenchCalibration | None = None
+    if bool(bota_cfg.get("wrench_calibration_enable", False)):
+        calibration_path = Path(str(bota_cfg.get("wrench_calibration", "")))
+        if not str(calibration_path):
+            raise ValueError("phase_b.bota.wrench_calibration_enable requires bota.wrench_calibration")
+        if not calibration_path.is_absolute():
+            calibration_path = (repo_root / calibration_path).resolve()
+        wrench_calibration = load_bota_wrench_calibration(calibration_path)
+        print(f"[BOTA] loaded calibrated wrench compensation: {wrench_calibration.path}")
+
     bota_reader: BotaMiniOneReader | None = None
     follower_stop: Event | None = None
     follower_thread: Thread | None = None
@@ -812,6 +956,7 @@ def run_phase_b_bota_se3_loop(
             gravity_sign=float(bota_cfg.get("gravity_sign", 1.0)),
             base_axis_map=_as_int_list(bota_cfg.get("base_axis_map"), 6),
             base_axis_signs=_as_list(bota_cfg.get("base_axis_signs"), 6, 1.0),
+            wrench_calibration=wrench_calibration,
         )
         print(
             "[BOTA] base-frame axis correction "
@@ -841,6 +986,13 @@ def run_phase_b_bota_se3_loop(
                 time.sleep(min(dt, 0.0025))
             conditioner.set_bias(samples)
 
+        if wrench_calibration is not None:
+            pos_ref_calib, _vel_ref_calib, _cur_ref_calib = system.driver.get_positions_velocities_and_currents()
+            q_raw_ref_calib = np.asarray(pos_ref_calib[:n], dtype=float)
+            q_ref_calib = (q_raw_ref_calib - system.joint_offsets[:n]) * system.joint_signs[:n]
+            _pos_calib, rot_calib, _jac_calib = kin.pose_and_jacobian(q_ref_calib)
+            conditioner.set_calibration_reference(rot_calib)
+
         raw_hold = _switch_leader_to_position_hold(system, phase_b_cfg)
         if bool(phase_b_cfg.get("leader_position", {}).get("recover_pre_handoff", False)):
             pre = getattr(system, "_leader_position_pre_handoff_raw", raw_hold)
@@ -866,6 +1018,21 @@ def run_phase_b_bota_se3_loop(
             t_arm = time.perf_counter()
             while not stop_event.is_set() and time.perf_counter() - t_arm < arm_settle_s:
                 time.sleep(0.01)
+
+        with follower_lock:
+            follower_failed = bool(follower_state.get("failed", False))
+            follower_failure_reason = str(follower_state.get("failure_reason", ""))
+            follower_failures = int(follower_state.get("failures", 0))
+        if follower_failed:
+            reason = follower_failure_reason or "follower directTorque command failed during arming"
+            with state_cache["lock"]:
+                state_cache["phase_b_error"] = reason
+                state_cache["phase_b_fatal"] = True
+                state_cache["phase_b_fatal_reason"] = reason
+                state_cache["follower_command_failures"] = int(follower_failures)
+            print(f"[PHASE B] fatal follower command failure before arming: {reason}")
+            stop_event.set()
+            return
 
         with state_cache["lock"]:
             state_cache["phase_b_ready"] = True
@@ -903,7 +1070,7 @@ def run_phase_b_bota_se3_loop(
             pos_ref, rot_ref, _ = kin.pose_and_jacobian(q_ref)
             pos_cur, rot_cur, jac_cur = kin.pose_and_jacobian(q_leader)
             wrench_raw, status_flags, timestamp_us, temp_c, _, is_new = bota_reader.read_latest()
-            wrench_base_raw, wrench_base = conditioner.update(
+            wrench_base_raw, wrench_base, wrench_base_calibrated, wrench_calibration_prediction = conditioner.update(
                 wrench_raw,
                 rot_cur,
                 dt,
@@ -920,7 +1087,10 @@ def run_phase_b_bota_se3_loop(
             delta_raw = np.clip(delta_raw[:n], -limiter.delta_max, limiter.delta_max)
             delta_leader = limiter.step(delta_raw, dt, contact_prob)
 
-            q_cmd_leader = q_ref + delta_leader
+            q_cmd_leader_raw = q_ref + delta_leader
+            q_cmd_leader, leader_mirror_safety_delta, leader_mirror_safety_active = make_safe_leader_mirror_target(
+                system, q_cmd_leader_raw, q_leader, n
+            )
             target_hw = latest_raw.copy()
             target_hw[:n] = q_cmd_leader / system.joint_signs[:n] + system.joint_offsets[:n]
             if target_hw.shape[0] > n:
@@ -939,6 +1109,20 @@ def run_phase_b_bota_se3_loop(
             compliant_action[:n] = np.asarray(policy_action[:n], dtype=float) + delta_follower
             with follower_lock:
                 follower_state["q"] = compliant_action[:n].copy()
+                follower_failed = bool(follower_state.get("failed", False))
+                follower_failure_reason = str(follower_state.get("failure_reason", ""))
+                follower_failures = int(follower_state.get("failures", 0))
+
+            if follower_failed:
+                reason = follower_failure_reason or "follower directTorque command failed"
+                with state_cache["lock"]:
+                    state_cache["phase_b_error"] = reason
+                    state_cache["phase_b_fatal"] = True
+                    state_cache["phase_b_fatal_reason"] = reason
+                    state_cache["follower_command_failures"] = int(follower_failures)
+                print(f"[PHASE B] fatal follower command failure: {reason}")
+                stop_event.set()
+                break
 
             try:
                 q_follower, dq_follower = system.get_follower_arm_state()
@@ -959,6 +1143,7 @@ def run_phase_b_bota_se3_loop(
             phase_b_sleep_s = max(0.0, dt - phase_b_compute_dt_s)
             phase_b_overrun = phase_b_compute_dt_s > dt
             policy_action_age_s = float(getattr(traj_interp, "last_action_age_s", float("nan")))
+            policy_inference_dt_s = float(getattr(traj_interp, "last_policy_inference_dt_s", float("nan")))
             policy_trajectory_t_write = float(getattr(traj_interp, "last_t_write", 0.0))
             policy_trajectory_is_new = bool(getattr(traj_interp, "last_is_new", False))
             diag = {
@@ -975,15 +1160,19 @@ def run_phase_b_bota_se3_loop(
                     "phase_b_overrun": bool(phase_b_overrun),
                     "phase_b_target_dt_s": float(dt),
                     "policy_action_age_s": float(policy_action_age_s),
+                    "policy_inference_dt_s": float(policy_inference_dt_s),
+                    "control_loop_hz": float(1.0 / phase_b_loop_dt_s) if phase_b_loop_dt_s > 0.0 else float("nan"),
                     "policy_trajectory_t_write": float(policy_trajectory_t_write),
                     "policy_trajectory_is_new": bool(policy_trajectory_is_new),
                     "reference_stale": bool(is_stale),
+                    "leader_mirror_safety_any": bool(np.any(leader_mirror_safety_active)),
                 },
                 "contact_probability": float(contact_prob),
                 "contact_gate": float(contact_gate),
                 "intervention_source": float(source),
                 "bota_status_flags": status_flags.copy(),
                 "bota_temperature_c": float(temp_c),
+                "bota_wrench_calibrated": bool(wrench_calibration is not None),
             }
 
             with state_cache["lock"]:
@@ -1012,12 +1201,17 @@ def run_phase_b_bota_se3_loop(
                         "wrench_sensor_raw": wrench_raw.copy(),
                         "wrench_base_raw": wrench_base_raw.copy(),
                         "wrench_base": wrench_base.copy(),
+                        "wrench_base_calibrated": wrench_base_calibrated.copy(),
+                        "wrench_calibration_prediction": wrench_calibration_prediction.copy(),
                         "wrench_bota_raw": wrench_base_raw.copy(),
                         "task_delta": task_delta.copy(),
                         "task_pose_error": pose_error.copy(),
                         "delta_leader": delta_leader.copy(),
                         "delta_leader_raw": delta_raw.copy(),
                         "q_cmd_leader": q_cmd_leader.copy(),
+                        "q_cmd_leader_raw": q_cmd_leader_raw.copy(),
+                        "leader_mirror_safety_delta": leader_mirror_safety_delta.copy(),
+                        "leader_mirror_safety_active": leader_mirror_safety_active.copy(),
                         "delta_human": delta_leader.copy(),
                         "delta_human_raw": delta_raw.copy(),
                         "q_cmd_ur5e": compliant_action[:n].copy(),
@@ -1028,6 +1222,8 @@ def run_phase_b_bota_se3_loop(
                         "phase_b_sleep_s": float(phase_b_sleep_s),
                         "phase_b_overrun": bool(phase_b_overrun),
                         "policy_action_age_s": float(policy_action_age_s),
+                        "policy_inference_dt_s": float(policy_inference_dt_s),
+                        "control_loop_hz": float(1.0 / phase_b_loop_dt_s) if phase_b_loop_dt_s > 0.0 else float("nan"),
                         "policy_trajectory_t_write": float(policy_trajectory_t_write),
                         "policy_trajectory_is_new": bool(policy_trajectory_is_new),
                     }

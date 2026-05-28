@@ -20,8 +20,8 @@ arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
   leader_urdf: "gello/factr/urdf/gello_urdf_minione/robot.urdf"
   num_arm_joints: 6
-  arm_joint_limits_max: [6.28318, 3.14159, 7.0, 4.53786, 6.28318, 2.0]
-  arm_joint_limits_min: [3.14159, -1.571, 3.4, 0.0, 3.14159, -1.0]
+  arm_joint_limits_max: [6.28318, 3.14159, 7.0, -1.745, 6.28318, 2.0]
+  arm_joint_limits_min: [3.14159, -1.571, 3.4, -6.283, 3.14159, -1.0]
   arm_joint_limits_safety_margin: 0.1
   initialization:
     # These are your start positions (URDF coordinates) - offsets will be auto-calculated
@@ -140,7 +140,7 @@ teleop:
   robot:
     _target_: gello.robots.ur5e.URRobot
     robot_ip: "172.22.22.2"
-    no_gripper: true # "true" disables the gripper, but you also need to comment out "gripper_config" below to avoid errors
+    no_gripper: false # "true" disables the gripper, but you also need to comment out "gripper_config" below to avoid errors
     # Torque Filter Configuration (for get_joint_torques_jacobian_calcualted)
     filter_type: "one_euro"
     filter_min_cutoff: 1.5  # Lower = more stable when still (anti-jitter)
@@ -164,7 +164,7 @@ teleop:
     # Set true + alignment_mode=legacy_auto_align to restore previous startup auto_align behavior.
     auto_align: false
   # Explicit gripper config for teleop normalization: [id, open_deg, close_deg]
-  #gripper_config: [7, 197, 155] 
+  gripper_config: [7, 197, 155] 
 
 
 logging:

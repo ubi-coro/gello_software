@@ -18,7 +18,7 @@ dynamixel:
 
 arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
-  leader_urdf: "gello/factr/urdf/gello_urdf_minione/robot.urdf"
+  leader_urdf: "gello/factr/urdf/gello_urdf_minione_sensorFrame/robot.urdf"
   num_arm_joints: 6
   arm_joint_limits_max: [6.28318, 3.14159, 7.0, 4.53786, 6.28318, 2.0]
   arm_joint_limits_min: [3.14159, -1.571, 3.4, 0.0, 3.14159, -1.0]

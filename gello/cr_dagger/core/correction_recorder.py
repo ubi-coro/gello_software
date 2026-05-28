@@ -30,13 +30,18 @@ class CorrectionFrame:
     is_correction: bool             # Fused detector output.
     detector_diagnostics: dict      # Per-detector votes and scalar diagnostics.
     q_ref_leader: np.ndarray | None = None         # Policy reference in leader joint frame.
-    q_cmd_leader: np.ndarray | None = None         # Leader command q_ref_leader + delta_leader.
+    q_cmd_leader: np.ndarray | None = None         # Safe leader mirror command.
+    q_cmd_leader_raw: np.ndarray | None = None     # Raw leader command q_ref_leader + delta_leader before mirror safety.
+    leader_mirror_safety_delta: np.ndarray | None = None
+    leader_mirror_safety_active: np.ndarray | None = None
     q_cmd_ur5e: np.ndarray | None = None           # Final UR5e command in follower joint frame.
     epsilon_leader: np.ndarray | None = None       # Wrapped leader tracking error q_actual - q_cmd_leader.
     epsilon_ur5e: np.ndarray | None = None         # Follower tracking error q_follower - q_cmd_ur5e.
     wrench_sensor_raw: np.ndarray | None = None    # Raw BOTA sensor-frame wrench before software bias.
     wrench_base_raw: np.ndarray | None = None      # Base-frame wrench before LPF/deadband/saturation.
     wrench_base: np.ndarray | None = None          # Conditioned base-frame wrench used by admittance.
+    wrench_base_calibrated: np.ndarray | None = None       # Calibrated base-frame wrench before deadband/saturation.
+    wrench_calibration_prediction: np.ndarray | None = None # Learned orientation-dependent wrench prediction.
     task_delta: np.ndarray | None = None           # SE(3) admittance command before joint projection.
     task_pose_error: np.ndarray | None = None      # SE(3) pose error used by admittance.
     delta_leader: np.ndarray | None = None         # Limited human residual in leader joint frame.
@@ -84,12 +89,17 @@ class CorrectionRecorder:
         images: dict[str, np.ndarray] | None = None,
         q_ref_leader: np.ndarray | None = None,
         q_cmd_leader: np.ndarray | None = None,
+        q_cmd_leader_raw: np.ndarray | None = None,
+        leader_mirror_safety_delta: np.ndarray | None = None,
+        leader_mirror_safety_active: np.ndarray | None = None,
         q_cmd_ur5e: np.ndarray | None = None,
         epsilon_leader: np.ndarray | None = None,
         epsilon_ur5e: np.ndarray | None = None,
         wrench_sensor_raw: np.ndarray | None = None,
         wrench_base_raw: np.ndarray | None = None,
         wrench_base: np.ndarray | None = None,
+        wrench_base_calibrated: np.ndarray | None = None,
+        wrench_calibration_prediction: np.ndarray | None = None,
         task_delta: np.ndarray | None = None,
         task_pose_error: np.ndarray | None = None,
         delta_leader: np.ndarray | None = None,
@@ -128,12 +138,17 @@ class CorrectionRecorder:
             detector_diagnostics=dict(detector_diagnostics or {}),
             q_ref_leader=self._copy_optional(q_ref_leader),
             q_cmd_leader=self._copy_optional(q_cmd_leader),
+            q_cmd_leader_raw=self._copy_optional(q_cmd_leader_raw),
+            leader_mirror_safety_delta=self._copy_optional(leader_mirror_safety_delta),
+            leader_mirror_safety_active=self._copy_optional(leader_mirror_safety_active),
             q_cmd_ur5e=self._copy_optional(q_cmd_ur5e),
             epsilon_leader=self._copy_optional(epsilon_leader),
             epsilon_ur5e=self._copy_optional(epsilon_ur5e),
             wrench_sensor_raw=self._copy_optional(wrench_sensor_raw),
             wrench_base_raw=self._copy_optional(wrench_base_raw),
             wrench_base=self._copy_optional(wrench_base),
+            wrench_base_calibrated=self._copy_optional(wrench_base_calibrated),
+            wrench_calibration_prediction=self._copy_optional(wrench_calibration_prediction),
             task_delta=self._copy_optional(task_delta),
             task_pose_error=self._copy_optional(task_pose_error),
             delta_leader=self._copy_optional(delta_leader),
@@ -163,12 +178,17 @@ class CorrectionRecorder:
 
         q_ref_leader = self._stack_optional("q_ref_leader", self.n_joints)
         q_cmd_leader = self._stack_optional("q_cmd_leader", self.n_joints)
+        q_cmd_leader_raw = self._stack_optional("q_cmd_leader_raw", self.n_joints)
+        leader_mirror_safety_delta = self._stack_optional("leader_mirror_safety_delta", self.n_joints)
+        leader_mirror_safety_active = self._stack_optional("leader_mirror_safety_active", self.n_joints)
         q_cmd_ur5e = self._stack_optional("q_cmd_ur5e", self.n_joints)
         epsilon_leader = self._stack_optional("epsilon_leader", self.n_joints)
         epsilon_ur5e = self._stack_optional("epsilon_ur5e", self.n_joints)
         wrench_sensor_raw = self._stack_optional("wrench_sensor_raw", 6)
         wrench_base_raw = self._stack_optional("wrench_base_raw", 6)
         wrench_base = self._stack_optional("wrench_base", 6)
+        wrench_base_calibrated = self._stack_optional("wrench_base_calibrated", 6)
+        wrench_calibration_prediction = self._stack_optional("wrench_calibration_prediction", 6)
         task_delta = self._stack_optional("task_delta", 6)
         task_pose_error = self._stack_optional("task_pose_error", 6)
         delta_leader = self._stack_optional("delta_leader", self.n_joints)
@@ -187,6 +207,8 @@ class CorrectionRecorder:
         phase_b_sleep_s = np.full(T, np.nan, dtype=np.float32)
         phase_b_overrun = np.zeros(T, dtype=bool)
         policy_action_age_s = np.full(T, np.nan, dtype=np.float32)
+        policy_inference_dt_s = np.full(T, np.nan, dtype=np.float32)
+        control_loop_hz = np.full(T, np.nan, dtype=np.float32)
         policy_trajectory_t_write = np.full(T, np.nan, dtype=np.float64)
         policy_trajectory_is_new = np.zeros(T, dtype=bool)
         reference_stale = np.zeros(T, dtype=bool)
@@ -214,6 +236,8 @@ class CorrectionRecorder:
             phase_b_sleep_s[i] = float(timing.get("phase_b_sleep_s", np.nan))
             phase_b_overrun[i] = bool(timing.get("phase_b_overrun", False))
             policy_action_age_s[i] = float(timing.get("policy_action_age_s", np.nan))
+            policy_inference_dt_s[i] = float(timing.get("policy_inference_dt_s", np.nan))
+            control_loop_hz[i] = float(timing.get("control_loop_hz", np.nan))
             policy_trajectory_t_write[i] = float(timing.get("policy_trajectory_t_write", np.nan))
             policy_trajectory_is_new[i] = bool(timing.get("policy_trajectory_is_new", False))
             reference_stale[i] = bool(timing.get("reference_stale", False))
@@ -238,6 +262,9 @@ class CorrectionRecorder:
             q_cmd_ur5e=q_cmd_ur5e,
             q_cmd_follower=q_cmd_ur5e,
             q_cmd_leader=q_cmd_leader,
+            q_cmd_leader_raw=q_cmd_leader_raw,
+            leader_mirror_safety_delta=leader_mirror_safety_delta,
+            leader_mirror_safety_active=leader_mirror_safety_active,
             dq_compliant=dq_compliant,
             delta_q=delta_q,
             delta_q_raw=delta_q_raw,
@@ -254,9 +281,13 @@ class CorrectionRecorder:
             wrench_sensor_raw=wrench_sensor_raw,
             wrench_base_raw=wrench_base_raw,
             wrench_base=wrench_base,
+            wrench_base_calibrated=wrench_base_calibrated,
+            wrench_calibration_prediction=wrench_calibration_prediction,
             bota_wrench_raw=wrench_sensor_raw,
             bota_wrench_base=wrench_base_raw,
             bota_wrench_conditioned=wrench_base,
+            bota_wrench_calibrated=wrench_base_calibrated,
+            bota_wrench_calibration_prediction=wrench_calibration_prediction,
             task_delta=task_delta,
             task_pose_error=task_pose_error,
             bota_task_offset_se3=task_delta,
@@ -280,6 +311,8 @@ class CorrectionRecorder:
             phase_b_sleep_s=phase_b_sleep_s,
             phase_b_overrun=phase_b_overrun,
             policy_action_age_s=policy_action_age_s,
+            policy_inference_dt_s=policy_inference_dt_s,
+            control_loop_hz=control_loop_hz,
             policy_trajectory_t_write=policy_trajectory_t_write,
             policy_trajectory_is_new=policy_trajectory_is_new,
             reference_stale=reference_stale,

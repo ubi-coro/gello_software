@@ -1062,6 +1062,9 @@ class FACTRGravityCompensation:
         velocity_filter_alpha = float(
             self.config["dynamixel"].get("velocity_filter_alpha", 0.5)
         )
+        use_fake_fallback = bool(self.config["dynamixel"].get("use_fake_fallback", False))
+        if use_fake_fallback:
+            print("[WARN] Dynamixel fake fallback explicitly enabled by config. Do not use this for hardware runs.")
         try:
             self.driver = DynamixelDriver(
                 joint_ids,
@@ -1069,6 +1072,7 @@ class FACTRGravityCompensation:
                 self.dynamixel_port,
                 baudrate=baudrate,
                 velocity_filter_alpha=velocity_filter_alpha,
+                use_fake_fallback=use_fake_fallback,
             )
             print(
                 f"Connected to Dynamixel servos on {self.dynamixel_port} "

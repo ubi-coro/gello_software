@@ -42,13 +42,13 @@ recording:
   log_dir: "cr_dagger_data"
 
 policy:
-  action_dt: 0.1                  # Seconds between waypoints
+  action_dt: 0.05                  # Seconds between waypoints
   horizon: 32                     # Number of waypoints per prediction
 
 ipc:
   trajectory_shm_name: "cr_dagger_traj"
   observation_shm_name: "cr_dagger_obs"
-  obs_write_decimation: 33        # Write obs every N control steps (~10 Hz)
+  obs_write_decimation: 15        # Write obs every N control steps (~10 Hz)
 
 lerobot:
   default_fps: 330                        # Control loop frequency
@@ -108,14 +108,16 @@ phase_b:
     payload_mass_kg: 0.070
     payload_com_sensor_m: [0.0, 0.0, 0.0146]
     gravity_sign: 1.0
+    wrench_calibration_enable: true
+    wrench_calibration: "gello/cr_dagger/config/bota_minione_wrench_calibration.yaml"
     # Correction applied after the nominal sensor-to-base rotation. 
     # Current test candidate swaps X and Z axes (0=X, 1=Y, 2=Z, 3=Rx, 4=Ry, 5=Rz).
     # Thus [2, 1, 0, 5, 4, 3] maps: X->Z, Y->Y, Z->X, Rx->Rz, Ry->Ry, Rz->Rx.
     base_axis_map: [2, 1, 0, 5, 4, 3]
     base_axis_signs: [-1, 1, 1, -1, 1, 1]
-    frame: ""                    # Empty means the final Pinocchio frame from the leader URDF.
+    frame: "bota_sensor_frame"    # Requires sensor-frame URDF; see gello_urdf_minione_sensorFrame.
     output_mode: "offset"         # Validated mode: no-force SE(3) offset decays toward zero.
-    axis_mask: [1, 1, 1, 0, 0, 0]
+    axis_mask: [1, 1, 1, 1, 1, 1]
     cart_mass: [2.0, 2.0, 2.0, 0.5, 0.5, 0.5]
     cart_damp: [18.0, 18.0, 18.0, 5.0, 5.0, 5.0]
     cart_stiff: [8.0, 8.0, 8.0, 10.0, 10.0, 10.0]
@@ -128,7 +130,7 @@ phase_b:
 
   residual:
     # Slew limits keep correction labels smooth and reduce follower acceleration spikes.
-    delta_max: 0.06
+    delta_max: 0.08
     delta_rate_max: [0.16, 0.22, 0.22, 0.28, 0.28, 0.28]
     delta_release_rate_max: [0.12, 0.18, 0.18, 0.22, 0.22, 0.22]
     delta_release_tau_s: 0.35

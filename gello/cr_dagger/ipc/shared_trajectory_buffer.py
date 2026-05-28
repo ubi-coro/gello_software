@@ -6,7 +6,7 @@ from multiprocessing import shared_memory
 import numpy as np
 
 class SharedTrajectoryBuffer:
-    HEADER_BYTES = 8 + 8 + 8  # version(int64), active_slot(int64), t_write(float64)
+    HEADER_BYTES = 8 + 8 + 8 + 8  # version, active_slot, t_write, policy_inference_dt_s
 
     def __init__(
         self,
@@ -36,6 +36,7 @@ class SharedTrajectoryBuffer:
                 )
 
         self._last_version = -1
+        self.last_policy_inference_dt_s: float = float("nan")
 
     def _create_fresh_segment(self) -> shared_memory.SharedMemory:
         """Create a clean shared-memory segment, replacing stale leftovers."""
@@ -57,7 +58,12 @@ class SharedTrajectoryBuffer:
         shm.buf[:] = b"\x00" * self.total_bytes
         return shm
 
-    def write(self, trajectory: np.ndarray, t_write: float) -> None:
+    def write(
+        self,
+        trajectory: np.ndarray,
+        t_write: float,
+        policy_inference_dt_s: float = float("nan"),
+    ) -> None:
         traj = np.asarray(trajectory, dtype=np.float64)
         expected_shape = (self.horizon, self.n_joints)
         if traj.shape != expected_shape:
@@ -75,12 +81,14 @@ class SharedTrajectoryBuffer:
 
         version = int(np.frombuffer(self.shm.buf[0:8], dtype=np.int64)[0]) + 1
         t_w = np.array([t_write], dtype=np.float64)
+        inf_dt = np.array([policy_inference_dt_s], dtype=np.float64)
 
         # Write inactive slot first, then atomically switch active slot index.
         self.shm.buf[offset:offset + 8] = np.array([version], dtype=np.int64).tobytes()
         self.shm.buf[offset + 8:offset + 16] = np.array([next_slot], dtype=np.int64).tobytes()
         self.shm.buf[offset + 16:offset + 24] = t_w.tobytes()
-        self.shm.buf[offset + 24:offset + self.slot_bytes] = traj.tobytes(order="C")
+        self.shm.buf[offset + 24:offset + 32] = inf_dt.tobytes()
+        self.shm.buf[offset + self.HEADER_BYTES:offset + self.slot_bytes] = traj.tobytes(order="C")
 
         self.shm.buf[0:8] = np.array([version], dtype=np.int64).tobytes()
         self.shm.buf[8:16] = np.array([next_slot], dtype=np.int64).tobytes()
@@ -93,8 +101,11 @@ class SharedTrajectoryBuffer:
         offset = active_slot * self.slot_bytes
         version = int(np.frombuffer(self.shm.buf[offset:offset + 8], dtype=np.int64)[0])
         t_write = np.frombuffer(self.shm.buf[offset + 16:offset + 24], dtype=np.float64)[0]
+        policy_inference_dt_s = np.frombuffer(
+            self.shm.buf[offset + 24:offset + 32], dtype=np.float64
+        )[0]
         traj_data = np.frombuffer(
-            self.shm.buf[offset + 24:offset + self.slot_bytes],
+            self.shm.buf[offset + self.HEADER_BYTES:offset + self.slot_bytes],
             dtype=np.float64,
             count=self.horizon * self.n_joints,
         )
@@ -102,6 +113,7 @@ class SharedTrajectoryBuffer:
         traj = traj_data.reshape((self.horizon, self.n_joints)).copy()
         is_new = version != self._last_version
         self._last_version = version
+        self.last_policy_inference_dt_s = float(policy_inference_dt_s)
 
         return traj, float(t_write), is_new
 

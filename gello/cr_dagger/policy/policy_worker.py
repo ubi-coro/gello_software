@@ -353,10 +353,12 @@ def policy_worker(
         obs = obs_snap.read()
         t_now = time.monotonic()
         
+        t_predict_start = time.perf_counter()
         if isinstance(policy, LeRobotACTPolicy):
             actions_pred = policy.predict(obs)
         else:
             actions_pred = policy.predict(t_now)
+        policy_inference_dt_s = time.perf_counter() - t_predict_start
         if actions_pred is None:
             time.sleep(min(float(action_dt), 0.01))
             continue
@@ -369,7 +371,11 @@ def policy_worker(
         else:
             actions_leader = actions_follower
 
-        traj_buf.write(trajectory=actions_leader, t_write=t_now)
+        traj_buf.write(
+            trajectory=actions_leader,
+            t_write=t_now,
+            policy_inference_dt_s=policy_inference_dt_s,
+        )
 
         inference_time = time.monotonic() - t_loop_start
         sleep_time = max(0.0, float(action_dt) - inference_time)
