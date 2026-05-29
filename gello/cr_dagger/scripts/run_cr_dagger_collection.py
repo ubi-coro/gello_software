@@ -307,6 +307,7 @@ class EpisodeController:
         self.success_requested = Event()   # RECORDING → mark success
         self.discard_requested = Event()   # RECORDING → discard & retry
         self.stop_requested = Event()      # any state → save & quit
+        self.reset_teleop_toggle_requested = Event()  # IDLE/RESET → toggle direct GELLO teleop
 
         # ── Foot pedal key configuration ──────────────────────────────────
         self._pedal_key = self._resolve_key(foot_pedal_key)
@@ -348,6 +349,7 @@ class EpisodeController:
         self.start_requested.clear()
         self.success_requested.clear()
         self.discard_requested.clear()
+        self.reset_teleop_toggle_requested.clear()
         # NOTE: stop_requested is intentionally NOT cleared
 
     # ── Keyboard / pedal listener ─────────────────────────────────────────
@@ -365,10 +367,12 @@ class EpisodeController:
         print(f"[CONTROLS] Foot pedal key: '{self._pedal_key_name}'")
         print(f"[CONTROLS] Key bindings (context-dependent):")
         print(f"  IDLE/RESET:  Pedal/Enter → start recording")
+        print(f"  IDLE/RESET:  ↑ Up        → toggle direct GELLO teleop for reset")
         print(f"  RECORDING:   Pedal       → mark SUCCESS & save")
         print(f"  RECORDING:   ← Left      → DISCARD & retry")
         print(f"  RECORDING:   → Right     → STOP collection & save")
         print(f"  ANY:         Ctrl+C      → emergency stop")
+        print(f"[RESET TELEOP] When enabled, GELLO directly commands the follower; move carefully.")
 
     def _on_press(self, key: Any) -> None:
         state = self.state
@@ -384,16 +388,17 @@ class EpisodeController:
                 self.success_requested.set()
             return
 
-        # ── Arrow keys (recording-only) ──────────────────────────────────
+        # ── Arrow keys ───────────────────────────────────────────────────
         if state == EpisodeState.RECORDING:
             if key == kb.Key.left:
                 self.discard_requested.set()
             elif key == kb.Key.right:
                 self.stop_requested.set()
 
-        # ── Right arrow in IDLE/RESET → quit ──────────────────────────────
         if state in (EpisodeState.IDLE, EpisodeState.RESET):
-            if key == kb.Key.right:
+            if key == kb.Key.up:
+                self.reset_teleop_toggle_requested.set()
+            elif key == kb.Key.right:
                 self.stop_requested.set()
 
     def stop(self) -> None:
@@ -406,7 +411,7 @@ class EpisodeController:
 
     # ── Blocking wait helpers (fallback when pynput unavailable) ──────────
 
-    def wait_for_start(self, timeout: float | None = None) -> bool:
+    def wait_for_start(self, timeout: float | None = None, on_reset_teleop_toggle: Optional[Any] = None) -> bool:
         """
         Wait for user to request episode start.
 
@@ -418,6 +423,10 @@ class EpisodeController:
             while True:
                 if self.stop_requested.is_set():
                     return False
+                if self.reset_teleop_toggle_requested.is_set():
+                    self.reset_teleop_toggle_requested.clear()
+                    if on_reset_teleop_toggle is not None:
+                        on_reset_teleop_toggle()
                 if self.start_requested.wait(timeout=0.1):
                     self.start_requested.clear()
                     return True
@@ -1405,7 +1414,42 @@ def main() -> int:
                 "control_loop_hz": float("nan"),
                 "policy_trajectory_t_write": 0.0,
                 "policy_trajectory_is_new": False,
+                "reset_teleop_active": False,
+                "reset_teleop_hold_active": False,
+                "reset_teleop_hold_q_leader": np.zeros(n),
             }
+
+        def _set_reset_teleop_active(active: bool) -> None:
+            if state_cache is None:
+                return
+            with state_cache["lock"]:
+                was_active = bool(state_cache.get("reset_teleop_active", False))
+                was_hold = bool(state_cache.get("reset_teleop_hold_active", False))
+                state_cache["reset_teleop_active"] = bool(active)
+                if active:
+                    state_cache["reset_teleop_hold_active"] = False
+                else:
+                    state_cache["reset_teleop_hold_active"] = False
+            if was_active != bool(active) or was_hold:
+                status = "ENABLED" if active else "disabled"
+                print(f"[RESET TELEOP] {status}: GELLO leader directly commands follower until recording starts.")
+
+        def _toggle_reset_teleop() -> None:
+            if not args.interventions or state_cache is None:
+                print("[RESET TELEOP] unavailable outside Phase B interventions")
+                return
+            with state_cache["lock"]:
+                currently_active = bool(state_cache.get("reset_teleop_active", False))
+                if currently_active:
+                    hold_q = np.asarray(state_cache.get("q_leader", np.zeros(n)), dtype=float)[:n].copy()
+                    state_cache["reset_teleop_active"] = False
+                    state_cache["reset_teleop_hold_active"] = True
+                    state_cache["reset_teleop_hold_q_leader"] = hold_q
+                    print("[RESET TELEOP] disabled: holding current teleop pose until Enter/Pedal starts recording.")
+                    return
+                state_cache["reset_teleop_active"] = True
+                state_cache["reset_teleop_hold_active"] = False
+            print("[RESET TELEOP] ENABLED: GELLO leader directly commands follower. Press ↑ to hold current pose, Enter/Pedal to start recording.")
 
         camera_names, camera_device_ids, camera_flips = _resolve_camera_config(args)
         if camera_names:
@@ -1663,17 +1707,21 @@ def main() -> int:
                 f"\n{'=' * 50}\n"
                 f"  Episode {ep + 1}/{num_episodes} — READY\n"
                 f"  Press foot pedal or Enter to start recording.\n"
+                f"  Press ↑ to toggle direct GELLO reset teleop.\n"
                 f"  Press → to end collection.\n"
                 f"{'=' * 50}"
             )
 
-            if not ctrl.wait_for_start():
+            if not ctrl.wait_for_start(on_reset_teleop_toggle=_toggle_reset_teleop):
                 # stop_requested was set
+                _set_reset_teleop_active(False)
                 print("[CTRL] Collection stopped by user.")
                 break
 
             if not running:
                 break
+
+            _set_reset_teleop_active(False)
 
             # ── RECORDING STATE ───────────────────────────────────────────
             ctrl.state = EpisodeState.RECORDING
@@ -1757,7 +1805,7 @@ def main() -> int:
                 ctrl.reset_events()
                 print(
                     "  [RESET] Teleop still active — reposition robot.\n"
-                    "  Press foot pedal or Enter when ready to re-record."
+                    "  Press ↑ for direct GELLO reset teleop; Enter/Pedal when ready to re-record."
                 )
                 # Don't wait here; the IDLE wait at loop top handles it.
                 # But we DO stay here briefly so user sees the message.
@@ -1807,7 +1855,7 @@ def main() -> int:
                 ctrl.reset_events()
                 print(
                     f"\n  [RESET] Teleop still active — reposition for next episode.\n"
-                    f"  Press foot pedal or Enter when ready."
+                    f"  Press ↑ for direct GELLO reset teleop; Enter/Pedal when ready."
                 )
                 # The wait_for_start() at the top of the while loop handles
                 # the actual waiting. We just set the state here.

@@ -1067,6 +1067,13 @@ def run_phase_b_bota_se3_loop(
             q_ref = np.asarray(q_ref[:n], dtype=float)
             dq_ref = np.asarray(dq_ref[:n], dtype=float)
 
+            with state_cache["lock"]:
+                reset_teleop_active = bool(state_cache.get("reset_teleop_active", False))
+                reset_teleop_hold_active = bool(state_cache.get("reset_teleop_hold_active", False))
+                reset_teleop_hold_q = np.asarray(
+                    state_cache.get("reset_teleop_hold_q_leader", q_leader), dtype=float
+                )[:n].copy()
+
             pos_ref, rot_ref, _ = kin.pose_and_jacobian(q_ref)
             pos_cur, rot_cur, jac_cur = kin.pose_and_jacobian(q_leader)
             wrench_raw, status_flags, timestamp_us, temp_c, _, is_new = bota_reader.read_latest()
@@ -1082,19 +1089,42 @@ def run_phase_b_bota_se3_loop(
                 force_scale=float(bota_cfg.get("contact_force_scale", 8.0)),
                 torque_scale=float(bota_cfg.get("contact_torque_scale", 0.35)),
             )
-            task_delta, pose_error = admittance.step(pos_ref, rot_ref, pos_cur, rot_cur, wrench_base, dt)
-            delta_raw = damped_least_squares_delta_q(jac_cur, task_delta, float(bota_cfg.get("dls_damping", 0.10)))
-            delta_raw = np.clip(delta_raw[:n], -limiter.delta_max, limiter.delta_max)
-            delta_leader = limiter.step(delta_raw, dt, contact_prob)
 
-            q_cmd_leader_raw = q_ref + delta_leader
-            q_cmd_leader, leader_mirror_safety_delta, leader_mirror_safety_active = make_safe_leader_mirror_target(
-                system, q_cmd_leader_raw, q_leader, n
-            )
-            target_hw = latest_raw.copy()
-            target_hw[:n] = q_cmd_leader / system.joint_signs[:n] + system.joint_offsets[:n]
-            if target_hw.shape[0] > n:
-                target_hw[n] = gripper_raw
+            if reset_teleop_active or reset_teleop_hold_active:
+                q_reset_target = q_leader.copy() if reset_teleop_active else reset_teleop_hold_q.copy()
+                task_delta = np.zeros(6, dtype=float)
+                pose_error = np.zeros(6, dtype=float)
+                delta_raw = np.zeros(n, dtype=float)
+                delta_leader = np.zeros(n, dtype=float)
+                q_cmd_leader_raw = q_reset_target.copy()
+                q_cmd_leader = q_reset_target.copy()
+                leader_mirror_safety_delta = np.zeros(n, dtype=float)
+                leader_mirror_safety_active = np.zeros(n, dtype=bool)
+                target_hw = latest_raw.copy()
+                target_hw[:n] = q_cmd_leader / system.joint_signs[:n] + system.joint_offsets[:n]
+                if target_hw.shape[0] > n:
+                    target_hw[n] = gripper_raw
+                policy_action = system._build_follower_action(q_reset_target, gripper)
+                compliant_action = np.asarray(policy_action, dtype=float).copy()
+            else:
+                task_delta, pose_error = admittance.step(pos_ref, rot_ref, pos_cur, rot_cur, wrench_base, dt)
+                delta_raw = damped_least_squares_delta_q(jac_cur, task_delta, float(bota_cfg.get("dls_damping", 0.10)))
+                delta_raw = np.clip(delta_raw[:n], -limiter.delta_max, limiter.delta_max)
+                delta_leader = limiter.step(delta_raw, dt, contact_prob)
+
+                q_cmd_leader_raw = q_ref + delta_leader
+                q_cmd_leader, leader_mirror_safety_delta, leader_mirror_safety_active = make_safe_leader_mirror_target(
+                    system, q_cmd_leader_raw, q_leader, n
+                )
+                target_hw = latest_raw.copy()
+                target_hw[:n] = q_cmd_leader / system.joint_signs[:n] + system.joint_offsets[:n]
+                if target_hw.shape[0] > n:
+                    target_hw[n] = gripper_raw
+                policy_action = system._build_follower_action(q_ref, gripper)
+                compliant_action = np.asarray(policy_action, dtype=float).copy()
+                delta_follower = map_leader_delta_to_follower_delta(system, delta_leader, n)
+                compliant_action[:n] = np.asarray(policy_action[:n], dtype=float) + delta_follower
+
             try:
                 system.driver.set_joints(target_hw.tolist())
             except Exception as exc:
@@ -1103,10 +1133,6 @@ def run_phase_b_bota_se3_loop(
                     last_warn = now
                     print(f"[DXL] leader position command failed: {exc}")
 
-            policy_action = system._build_follower_action(q_ref, gripper)
-            compliant_action = np.asarray(policy_action, dtype=float).copy()
-            delta_follower = map_leader_delta_to_follower_delta(system, delta_leader, n)
-            compliant_action[:n] = np.asarray(policy_action[:n], dtype=float) + delta_follower
             with follower_lock:
                 follower_state["q"] = compliant_action[:n].copy()
                 follower_failed = bool(follower_state.get("failed", False))
@@ -1166,6 +1192,8 @@ def run_phase_b_bota_se3_loop(
                     "policy_trajectory_is_new": bool(policy_trajectory_is_new),
                     "reference_stale": bool(is_stale),
                     "leader_mirror_safety_any": bool(np.any(leader_mirror_safety_active)),
+                    "reset_teleop_active": bool(reset_teleop_active),
+                    "reset_teleop_hold_active": bool(reset_teleop_hold_active),
                 },
                 "contact_probability": float(contact_prob),
                 "contact_gate": float(contact_gate),
@@ -1226,6 +1254,9 @@ def run_phase_b_bota_se3_loop(
                         "control_loop_hz": float(1.0 / phase_b_loop_dt_s) if phase_b_loop_dt_s > 0.0 else float("nan"),
                         "policy_trajectory_t_write": float(policy_trajectory_t_write),
                         "policy_trajectory_is_new": bool(policy_trajectory_is_new),
+                        "reset_teleop_active": bool(reset_teleop_active),
+                        "reset_teleop_hold_active": bool(reset_teleop_hold_active),
+                        "reset_teleop_hold_q_leader": reset_teleop_hold_q.copy(),
                     }
                 )
 
