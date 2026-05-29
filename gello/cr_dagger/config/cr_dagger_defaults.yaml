@@ -74,8 +74,8 @@ phase_b:
 
   follower:
     # UR5e direct-torque impedance gains used during the final pre-collection tests.
-    kp: 190.0
-    kd: 15.0
+    kp: 220.0
+    kd: 18.0
     # Ramp from the measured UR5e pose to q_ref before recording to avoid torque steps at arming.
     handoff_ramp_s: 0.60
 
@@ -102,26 +102,26 @@ phase_b:
     bias_s: 2.0
     filter_cutoff_hz: 25.0
     filter_alpha: 0.0
-    deadband: [0.25, 0.25, 0.25, 0.01, 0.01, 0.01]
+    deadband: [0.18, 0.18, 0.18, 0.01, 0.01, 0.01]
     saturation: [25.0, 25.0, 25.0, 1.5, 1.5, 1.5]
     gravity_comp: false
     payload_mass_kg: 0.070
     payload_com_sensor_m: [0.0, 0.0, 0.0146]
     gravity_sign: 1.0
     wrench_calibration_enable: true
-    wrench_calibration: "gello/cr_dagger/config/bota_minione_wrench_calibration.yaml"
-    # Correction applied after the nominal sensor-to-base rotation. 
-    # Current test candidate swaps X and Z axes (0=X, 1=Y, 2=Z, 3=Rx, 4=Ry, 5=Rz).
-    # Thus [2, 1, 0, 5, 4, 3] maps: X->Z, Y->Y, Z->X, Rx->Rz, Ry->Ry, Rz->Rx.
-    base_axis_map: [2, 1, 0, 5, 4, 3]
-    base_axis_signs: [-1, 1, 1, -1, 1, 1]
+    wrench_calibration: "gello/cr_dagger/config/bota_minione_wrench_calibration_identity.yaml"
+    # The sensor-frame URDF already aligns bota_sensor_frame with the real MiniOne frame.
+    # After sensor-to-base rotation the controller expects true [Fx,Fy,Fz,Tx,Ty,Tz]_base.
+    # Keep legacy mapped calibration separate; do not feed mapped axes into Cartesian/SE(3) admittance.
+    base_axis_map: [0, 1, 2, 3, 4, 5]
+    base_axis_signs: [1, 1, 1, 1, 1, 1]
     frame: "bota_sensor_frame"    # Requires sensor-frame URDF; see gello_urdf_minione_sensorFrame.
     output_mode: "offset"         # Validated mode: no-force SE(3) offset decays toward zero.
-    axis_mask: [1, 1, 1, 1, 1, 1]
+    axis_mask: [1, 1, 1, 0, 0, 0]
     cart_mass: [2.0, 2.0, 2.0, 0.5, 0.5, 0.5]
-    cart_damp: [18.0, 18.0, 18.0, 5.0, 5.0, 5.0]
-    cart_stiff: [8.0, 8.0, 8.0, 10.0, 10.0, 10.0]
-    cart_max: [0.03, 0.03, 0.03, 0.025, 0.025, 0.025]
+    cart_damp: [14.0, 14.0, 14.0, 5.0, 5.0, 5.0]
+    cart_stiff: [6.0, 6.0, 6.0, 10.0, 10.0, 10.0]
+    cart_max: [0.035, 0.035, 0.035, 0.0, 0.0, 0.0]
     dls_damping: 0.10
     stiction: [0, 0, 0, 0, 0, 0]
     wrench_sign: 1.0

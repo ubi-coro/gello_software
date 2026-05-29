@@ -122,8 +122,8 @@ teleop:
 
   impedance:
     enable: True           # Use impedance instead of position control
-    kp: 190.0               # Position stiffness (Nm/rad)
-    kd: 15.0                # Velocity damping (Nm*s/rad)
+    kp: 220.0               # Position stiffness (Nm/rad)
+    kd: 18.0                # Velocity damping (Nm*s/rad)
     use_leader_velocity: false  # Use leader velocity in feedforward
 
   four_channel:

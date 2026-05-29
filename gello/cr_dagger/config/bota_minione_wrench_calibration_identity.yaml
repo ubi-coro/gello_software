@@ -1,0 +1,408 @@
+kind: bota_minione_linear_wrench_compensation
+version: 1
+target_field: wrench_base_static_ema
+feature_mode: relative_rotation
+feature_order:
+- intercept
+- R00_delta
+- R01_delta
+- R02_delta
+- R10_delta
+- R11_delta
+- R12_delta
+- R20_delta
+- R21_delta
+- R22_delta
+usage: predicted_wrench = phi(R_base_sensor, R_ref_runtime) @ coefficients; corrected
+  = wrench_base_static_ema - predicted_wrench
+ridge: 1.0e-06
+trim_start_s: 1.0
+trim_end_s: 0.0
+stride: 1
+calibration_npz: /media/internal/nvme/jstranghoener/data/bota_minione_npz/gello_raw_identity_pose_sweep_calib_20260529_115854.npz
+validation_npz: /media/internal/nvme/jstranghoener/data/bota_minione_npz/gello_raw_identity_pose_sweep_val_20260529_120408.npz
+samples_calibration: 70457
+samples_validation: 70455
+r_ref_calibration:
+- - -0.08984546363353729
+  - 0.995832622051239
+  - -0.015658818185329437
+- - 0.9928961992263794
+  - 0.0907898098230362
+  - 0.07690492272377014
+- - 0.0780060887336731
+  - -0.008638022467494011
+  - -0.9969154596328735
+coefficients:
+- - -0.03446591043412832
+  - 0.03417152614483967
+  - 0.023746656910581986
+  - -0.0003827351895207773
+  - 0.00024255183314113117
+  - 0.00034318288542718885
+- - 0.04770570328223233
+  - 0.02217778410862486
+  - 0.033365734693663704
+  - -0.0018326460274144228
+  - -6.526011585650535e-05
+  - 0.0023521151267316366
+- - -0.01696127271652484
+  - 0.11222246142946439
+  - 0.007726008241775724
+  - 0.0003895381928090316
+  - 0.0006766222326678046
+  - -0.0014312257045370994
+- - -0.7071635858851791
+  - 0.00805988305428364
+  - 0.003247034763307579
+  - -0.0007916078642953215
+  - 0.017808864023922524
+  - -0.004248405537404034
+- - -0.04319157929924645
+  - -0.015446823658359633
+  - -0.027466581794283403
+  - 0.00047442776588197045
+  - -0.0023722298437886696
+  - -0.0013572886051541717
+- - 0.020798988337324412
+  - -0.019104800271573123
+  - -0.0008549622432464295
+  - -0.0019912931378038108
+  - 0.001884286239655885
+  - 0.0010915840773474085
+- - 0.00026392817090042334
+  - -0.6391949960610351
+  - 0.005003261848684797
+  - -0.01762618310053459
+  - -0.00019139965575005203
+  - -0.0009879626574052802
+- - 0.005410988714702551
+  - -0.018046169904199435
+  - 0.0034861182803008262
+  - -0.00017470229921373614
+  - 0.00014284657534868823
+  - 0.00014470306893764364
+- - 0.0549500633765871
+  - -0.011737271171886032
+  - -0.004795553778594627
+  - 0.00017460652202731523
+  - -0.0007118439451268804
+  - 0.004397597292308684
+- - -0.03745796060004921
+  - -0.007391676709083844
+  - -0.695345874805408
+  - -1.781239349650823e-05
+  - -0.0015368276845070363
+  - -0.0015532426665274997
+metrics_calibration:
+  raw:
+    mean:
+    - -0.07685758489586225
+    - -0.029068211552597104
+    - -0.42141294189353085
+    - -0.0010914495510639794
+    - 0.0005690966255694322
+    - 0.0006533395232577949
+    rms_axis:
+    - 0.3360385565766361
+    - 0.34029354925393857
+    - 0.6147341868395596
+    - 0.008787182611503843
+    - 0.008385085365496139
+    - 0.0036405695603719712
+    p95_abs_axis:
+    - 0.7191864609718321
+    - 0.6848197102546691
+    - 1.4114595890045165
+    - 0.01774698868393898
+    - 0.01632773205637932
+    - 0.0029359141364693636
+    max_abs_axis:
+    - 1.0433274507522583
+    - 0.9070092439651489
+    - 1.552069902420044
+    - 0.02616182528436184
+    - 0.021907394751906395
+    - 0.06910617649555206
+    force_mag_mean: 0.6391177305244563
+    force_mag_rms: 0.7788579662809
+    force_mag_p95: 1.4569992621117822
+    force_mag_max: 1.583970873585092
+    torque_mag_mean: 0.010682400753053732
+    torque_mag_rms: 0.012679825770036153
+    torque_mag_p95: 0.01907401780349816
+    torque_mag_max: 0.07476493907533029
+  corrected:
+    mean:
+    - -3.604025468207347e-17
+    - -1.98740904354213e-17
+    - 8.318675776148753e-17
+    - -7.86887921600675e-20
+    - -3.7982853462245344e-19
+    - -3.0096124003961986e-20
+    rms_axis:
+    - 0.0739557855444828
+    - 0.060557878804353454
+    - 0.0682924398506765
+    - 0.0011529540870948499
+    - 0.001806209175274261
+    - 0.0032020757888599526
+    p95_abs_axis:
+    - 0.11586408362347346
+    - 0.0974237052812151
+    - 0.12257604028382273
+    - 0.0021908119171959646
+    - 0.0025098314526702517
+    - 0.0033713805703614453
+    max_abs_axis:
+    - 1.013795164701297
+    - 0.7792339696713904
+    - 0.5246801995051069
+    - 0.00887795158825239
+    - 0.019512876417414646
+    - 0.06022059336457544
+    force_mag_mean: 0.09109909846166776
+    force_mag_rms: 0.11747583684121007
+    force_mag_p95: 0.16335823211002176
+    force_mag_max: 1.2833579324741897
+    torque_mag_mean: 0.002097644670750861
+    torque_mag_rms: 0.0038529189025201167
+    torque_mag_p95: 0.004393676086151327
+    torque_mag_max: 0.06326133699731584
+  improvement:
+    force_rms_ratio: 0.15083088563909183
+    torque_rms_ratio: 0.30386213283978986
+metrics_validation:
+  raw:
+    mean:
+    - -0.060349150173805086
+    - -0.06570282417254296
+    - -0.5198338276250587
+    - -0.001022394368029733
+    - -0.00012182918693966106
+    - 0.0005037710444129027
+    rms_axis:
+    - 0.36896655390206723
+    - 0.355603278983137
+    - 0.7149939729653022
+    - 0.008245635805355417
+    - 0.009139269289066125
+    - 0.006295367491800285
+    p95_abs_axis:
+    - 0.7198560178279877
+    - 0.7123231649398805
+    - 1.4557631373405457
+    - 0.017514968104660515
+    - 0.01767216045409441
+    - 0.003299872251227499
+    max_abs_axis:
+    - 1.6153535842895508
+    - 1.4759564399719238
+    - 1.5880070924758911
+    - 0.032838743180036545
+    - 0.02599574439227581
+    - 0.10794788599014282
+    force_mag_mean: 0.730818562192023
+    force_mag_rms: 0.8796626576697466
+    force_mag_p95: 1.512341935728994
+    force_mag_max: 1.9640111554925679
+    torque_mag_mean: 0.011117485349070191
+    torque_mag_rms: 0.013825643016852188
+    torque_mag_p95: 0.01995533094693226
+    torque_mag_max: 0.11143872463314307
+  corrected:
+    mean:
+    - 0.07278990914483092
+    - 0.0019009372629491587
+    - -0.009139267610909958
+    - 0.0005890844764852853
+    - -0.0017224327024350995
+    - 3.5734880943287956e-05
+    rms_axis:
+    - 0.13920929780638666
+    - 0.09536985156865578
+    - 0.073361406051803
+    - 0.0017501028025333045
+    - 0.0028123638561284997
+    - 0.005843647363098784
+    p95_abs_axis:
+    - 0.19722232857201033
+    - 0.13206631209104988
+    - 0.14074694616573558
+    - 0.002985713332200551
+    - 0.0038742007146577617
+    - 0.005333511963476095
+    max_abs_axis:
+    - 1.644565197029588
+    - 1.3431842214420546
+    - 0.5505216493813098
+    - 0.021996771052680858
+    - 0.028684016622815688
+    - 0.09873166653961862
+    force_mag_mean: 0.13526505388115245
+    force_mag_rms: 0.18400144858634054
+    force_mag_p95: 0.27059775668561137
+    force_mag_max: 2.1260646702766284
+    torque_mag_mean: 0.003516610116893625
+    torque_mag_rms: 0.0067171768461865055
+    torque_mag_p95: 0.006714886405900714
+    torque_mag_max: 0.10273162598348654
+  improvement:
+    force_rms_ratio: 0.20917274023404156
+    torque_rms_ratio: 0.48584914553333136
+metadata_calibration:
+  script: /home/jstranghoener/PyCharmProjects/gello_software/scripts/bota_minione.py
+  config: /home/jstranghoener/PyCharmProjects/gello_software/configs/bota_binary.json
+  use_gello: true
+  gello_config: /home/jstranghoener/PyCharmProjects/gello_software/configs/ur5e_gello_factr_hw_V3_PhaseA.yaml
+  sensor_urdf: /home/jstranghoener/PyCharmProjects/gello_software/gello/factr/urdf/gello_urdf_minione_sensorFrame/robot.urdf
+  bota_frame: bota_sensor_frame
+  compensation_mode_display: static
+  hardware_tare: true
+  bias_seconds: 2.0
+  bias_samples: 789
+  bias_sensor:
+  - -0.01259943087442444
+  - -0.014874138306302263
+  - -0.022140830264194233
+  - -0.001040450010462859
+  - -0.00018950433060715708
+  - -8.935089599629168e-05
+  payload_mass_kg: 0.07
+  payload_com_sensor_m:
+  - 0.0
+  - 0.0
+  - 0.0146
+  gravity_sign: 1.0
+  model_gravity_initial_base:
+  - 0.0
+  - 0.0
+  - -0.6864655000000004
+  - -0.000780590967271248
+  - -0.00035609852687551924
+  - 0.0
+  wrench_calibration: ''
+  wrench_calibration_feature_mode: ''
+  wrench_calibration_target_field: ''
+  calibration_r_ref_runtime:
+  - - 1.0
+    - 0.0
+    - 0.0
+  - - 0.0
+    - 1.0
+    - 0.0
+  - - 0.0
+    - 0.0
+    - 1.0
+  ema_alpha: 0.0
+  ema_cutoff: 25.0
+  deadband:
+  - 0.25
+  - 0.25
+  - 0.25
+  - 0.01
+  - 0.01
+  - 0.01
+  saturation:
+  - 25.0
+  - 25.0
+  - 25.0
+  - 1.5
+  - 1.5
+  - 1.5
+  base_axis_map:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  base_axis_signs:
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  conditioned_fields_match_phase_b_order: true
+  poll: false
+  poll_rate: 500.0
+  expected_hz: 0.0
+metadata_validation:
+  script: /home/jstranghoener/PyCharmProjects/gello_software/scripts/bota_minione.py
+  config: /home/jstranghoener/PyCharmProjects/gello_software/configs/bota_binary.json
+  use_gello: true
+  gello_config: /home/jstranghoener/PyCharmProjects/gello_software/configs/ur5e_gello_factr_hw_V3_PhaseA.yaml
+  sensor_urdf: /home/jstranghoener/PyCharmProjects/gello_software/gello/factr/urdf/gello_urdf_minione_sensorFrame/robot.urdf
+  bota_frame: bota_sensor_frame
+  compensation_mode_display: static
+  hardware_tare: true
+  bias_seconds: 2.0
+  bias_samples: 789
+  bias_sensor:
+  - 0.011729009081202314
+  - 0.003683203375687013
+  - -0.018600562037321702
+  - -0.0008283890335241047
+  - -0.00022051908212733965
+  - -1.0616222162777027e-05
+  payload_mass_kg: 0.07
+  payload_com_sensor_m:
+  - 0.0
+  - 0.0
+  - 0.0146
+  gravity_sign: 1.0
+  model_gravity_initial_base:
+  - 0.0
+  - 0.0
+  - -0.6864655000000004
+  - -0.00017460508493505962
+  - -0.0012223383682837656
+  - 0.0
+  wrench_calibration: ''
+  wrench_calibration_feature_mode: ''
+  wrench_calibration_target_field: ''
+  calibration_r_ref_runtime:
+  - - 1.0
+    - 0.0
+    - 0.0
+  - - 0.0
+    - 1.0
+    - 0.0
+  - - 0.0
+    - 0.0
+    - 1.0
+  ema_alpha: 0.0
+  ema_cutoff: 25.0
+  deadband:
+  - 0.25
+  - 0.25
+  - 0.25
+  - 0.01
+  - 0.01
+  - 0.01
+  saturation:
+  - 25.0
+  - 25.0
+  - 25.0
+  - 1.5
+  - 1.5
+  - 1.5
+  base_axis_map:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  base_axis_signs:
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  conditioned_fields_match_phase_b_order: true
+  poll: false
+  poll_rate: 500.0
+  expected_hz: 0.0

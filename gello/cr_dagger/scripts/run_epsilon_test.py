@@ -13,6 +13,11 @@ from typing import Any, Optional
 
 import numpy as np
 
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
+
 from gello.bilat_4ch.gello_ur5e_observer_shi import (
     MinimalistEstimatorConfig,
     MinimalistTorqueEstimator,
@@ -326,8 +331,51 @@ class BotaMiniOneReader:
             print(f"[WARN] Bota shutdown failed: {exc}")
 
 
+
+class BotaLinearWrenchCalibration:
+    """Linear orientation-based BOTA residual compensation loaded from YAML."""
+
+    def __init__(self, path: Path, payload: dict[str, Any]) -> None:
+        self.path = path
+        self.payload = payload
+        self.feature_mode = str(payload.get("feature_mode", "relative_rotation"))
+        self.target_field = str(payload.get("target_field", "wrench_base_static_ema"))
+        self.coefficients = np.asarray(payload["coefficients"], dtype=float)
+        if self.coefficients.shape != (10, 6):
+            raise ValueError(
+                f"Expected BOTA calibration coefficients shape (10, 6), got {self.coefficients.shape}"
+            )
+
+    def features(self, r_base_sensor: np.ndarray, r_ref_runtime: np.ndarray) -> np.ndarray:
+        rot = np.asarray(r_base_sensor, dtype=float).reshape(3, 3)
+        if self.feature_mode == "relative_rotation":
+            body = (rot - np.asarray(r_ref_runtime, dtype=float).reshape(3, 3)).reshape(9)
+        elif self.feature_mode == "absolute_rotation":
+            body = rot.reshape(9)
+        else:
+            raise ValueError(f"Unsupported BOTA calibration feature_mode: {self.feature_mode}")
+        return np.concatenate([[1.0], body])
+
+    def predict(self, r_base_sensor: np.ndarray, r_ref_runtime: np.ndarray) -> np.ndarray:
+        return self.features(r_base_sensor, r_ref_runtime) @ self.coefficients
+
+
+def load_bota_wrench_calibration(path: Path) -> BotaLinearWrenchCalibration:
+    if yaml is None:
+        raise RuntimeError("PyYAML is required for BOTA wrench calibration")
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"BOTA wrench calibration not found: {resolved}")
+    payload = yaml.safe_load(resolved.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid BOTA wrench calibration YAML: {resolved}")
+    if payload.get("kind") != "bota_minione_linear_wrench_compensation":
+        raise ValueError(f"Unsupported BOTA wrench calibration kind: {payload.get('kind')!r}")
+    return BotaLinearWrenchCalibration(resolved, payload)
+
+
 class BotaWrenchConditioner:
-    """raw -> bias -> frame transform -> gravity -> low-pass -> deadband -> saturation."""
+    """raw -> bias -> frame transform -> gravity -> axis map -> low-pass -> calibrated compensation."""
 
     def __init__(
         self,
@@ -339,6 +387,9 @@ class BotaWrenchConditioner:
         payload_mass_kg: float,
         payload_com_sensor: np.ndarray,
         gravity_sign: float,
+        base_axis_map: np.ndarray | None = None,
+        base_axis_signs: np.ndarray | None = None,
+        wrench_calibration: BotaLinearWrenchCalibration | None = None,
     ):
         self.cutoff_hz = max(float(cutoff_hz), 0.0)
         self.alpha = float(np.clip(float(alpha), 0.0, 1.0))
@@ -348,6 +399,12 @@ class BotaWrenchConditioner:
         self.payload_mass_kg = max(float(payload_mass_kg), 0.0)
         self.payload_com_sensor = np.asarray(payload_com_sensor, dtype=float).reshape(3)
         self.gravity_sign = float(gravity_sign)
+        self.base_axis_map = self._validate_axis_map(base_axis_map)
+        self.base_axis_signs = self._validate_axis_signs(base_axis_signs)
+        self.wrench_calibration = wrench_calibration
+        self.calibration_reference_r_base_sensor = np.eye(3, dtype=float)
+        self.last_calibration_prediction = np.zeros(6, dtype=float)
+        self.last_calibrated_base = np.zeros(6, dtype=float)
         self.bias_sensor = np.zeros(6, dtype=float)
         self.filtered_base = np.zeros(6, dtype=float)
         self.initialized = False
@@ -361,6 +418,33 @@ class BotaWrenchConditioner:
         if self.alpha > 0.0:
             return self.alpha
         return 1.0
+
+    @staticmethod
+    def _validate_axis_map(base_axis_map: np.ndarray | None) -> np.ndarray | None:
+        if base_axis_map is None:
+            return None
+        arr = np.asarray(base_axis_map, dtype=int).reshape(-1)
+        if arr.size != 6 or sorted(arr.tolist()) != list(range(6)):
+            raise ValueError("BOTA base_axis_map must be a permutation of [0, 1, 2, 3, 4, 5]")
+        return arr
+
+    @staticmethod
+    def _validate_axis_signs(base_axis_signs: np.ndarray | None) -> np.ndarray | None:
+        if base_axis_signs is None:
+            return None
+        arr = np.asarray(base_axis_signs, dtype=float).reshape(-1)
+        if arr.size != 6:
+            raise ValueError("BOTA base_axis_signs must contain 6 values")
+        return arr
+
+    def set_calibration_reference(self, r_base_sensor: np.ndarray) -> None:
+        self.calibration_reference_r_base_sensor = np.asarray(r_base_sensor, dtype=float).reshape(3, 3).copy()
+        if self.wrench_calibration is not None:
+            print(
+                "[BOTA] calibrated wrench compensation reference set "
+                f"feature_mode={self.wrench_calibration.feature_mode} "
+                f"target={self.wrench_calibration.target_field}"
+            )
 
     def set_bias(self, samples_sensor: list[np.ndarray]) -> None:
         if samples_sensor:
@@ -387,6 +471,11 @@ class BotaWrenchConditioner:
             torque_g_base = np.cross(r_com_base, force_g_base)
             wrench_base = wrench_base - self.gravity_sign * np.concatenate([force_g_base, torque_g_base])
 
+        if self.base_axis_map is not None:
+            wrench_base = wrench_base[self.base_axis_map]
+        if self.base_axis_signs is not None:
+            wrench_base = wrench_base * self.base_axis_signs
+
         if not self.initialized:
             self.filtered_base = wrench_base.copy()
             self.initialized = True
@@ -405,7 +494,17 @@ class BotaWrenchConditioner:
                 alpha = self._filter_alpha(filter_dt_s)
                 self.filtered_base = self.filtered_base + alpha * (wrench_base - self.filtered_base)
 
-        conditioned = self.filtered_base.copy()
+        calibration_prediction = np.zeros(6, dtype=float)
+        calibrated_base = self.filtered_base.copy()
+        if self.wrench_calibration is not None:
+            calibration_prediction = self.wrench_calibration.predict(
+                r_base_sensor, self.calibration_reference_r_base_sensor
+            )
+            calibrated_base = self.filtered_base - calibration_prediction
+        self.last_calibration_prediction = calibration_prediction.copy()
+        self.last_calibrated_base = calibrated_base.copy()
+
+        conditioned = calibrated_base.copy()
         conditioned = np.where(
             np.abs(conditioned) > self.deadband,
             conditioned - np.sign(conditioned) * self.deadband,
@@ -1024,6 +1123,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--bota-payload-mass", type=float, default=0.070, help="Distal payload mass seen by the sensor [kg].")
     p.add_argument("--bota-payload-com", type=str, default="0,0,0.0146", help="Payload COM in sensor frame [m].")
     p.add_argument("--bota-gravity-sign", type=float, default=1.0, help="Flip to -1 if static gravity compensation has wrong sign.")
+    p.add_argument("--bota-wrench-calibration-enable", action="store_true", default=True, help="Apply linear orientation-based BOTA wrench calibration before deadband/saturation.")
+    p.add_argument("--no-bota-wrench-calibration", dest="bota_wrench_calibration_enable", action="store_false", help="Disable calibrated BOTA wrench compensation.")
+    p.add_argument("--bota-wrench-calibration", type=str, default="gello/cr_dagger/config/bota_minione_wrench_calibration.yaml")
+    p.add_argument("--bota-base-axis-map", type=str, default="2,1,0,5,4,3", help="Permutation applied after sensor-to-base transform.")
+    p.add_argument("--bota-base-axis-signs", type=str, default="-1,1,1,-1,1,1", help="Axis signs applied after --bota-base-axis-map.")
     p.add_argument("--bota-frame", type=str, default="", help="Pinocchio end-effector frame. Empty uses the last URDF frame.")
     p.add_argument("--bota-axis-mask", type=str, default="1,1,1,1,1,1", help="6D mask for Cartesian admittance axes.")
     p.add_argument("--bota-cart-mass", type=str, default="4,4,4,0.25,0.25,0.25")
@@ -2113,6 +2217,13 @@ def _run_leader_admittance_position_mode(
             n,
             frame_name=str(args.bota_frame).strip() or None,
         )
+        wrench_calibration = None
+        if bool(args.bota_wrench_calibration_enable):
+            calibration_path = Path(str(args.bota_wrench_calibration))
+            if not calibration_path.is_absolute():
+                calibration_path = (REPO_ROOT / calibration_path).resolve()
+            wrench_calibration = load_bota_wrench_calibration(calibration_path)
+            print(f"[BOTA] loaded calibrated wrench compensation: {wrench_calibration.path}")
         bota_conditioner = BotaWrenchConditioner(
             cutoff_hz=float(args.bota_filter_cutoff),
             alpha=float(args.bota_filter_alpha),
@@ -2122,6 +2233,9 @@ def _run_leader_admittance_position_mode(
             payload_mass_kg=float(args.bota_payload_mass),
             payload_com_sensor=_expand_list(_parse_float_list(args.bota_payload_com), 3, 0.0),
             gravity_sign=float(args.bota_gravity_sign),
+            base_axis_map=_expand_list(_parse_float_list(args.bota_base_axis_map), 6, 0).astype(int),
+            base_axis_signs=_expand_list(_parse_float_list(args.bota_base_axis_signs), 6, 1.0),
+            wrench_calibration=wrench_calibration,
         )
         bota_cart = CartesianAdmittance6D(
             mass=_expand_list(_parse_float_list(args.bota_cart_mass), 6, 1.0),
@@ -2196,12 +2310,25 @@ def _run_leader_admittance_position_mode(
                 _leader_gravity_hold(system, dt)
             print(f"[BOTA] bias frames new={bias_new} duplicate={bias_dup}")
             bota_conditioner.set_bias(bias_samples)
+        if bota_conditioner is not None and bota_kin is not None:
+            try:
+                pos_ref_calib, _vel_ref_calib, _cur_ref_calib = system.driver.get_positions_velocities_and_currents()
+                q_ref_calib = (
+                    np.asarray(pos_ref_calib[:n], dtype=float) - system.joint_offsets[:n]
+                ) * system.joint_signs[:n]
+                _pos_calib, rot_calib, _jac_calib = bota_kin.pose_and_jacobian(q_ref_calib)
+                bota_conditioner.set_calibration_reference(rot_calib)
+            except Exception as exc:
+                print(f"[WARN] BOTA calibration reference setup failed: {exc}")
         print(
             "[BOTA] enabled "
             f"source={admittance_source} frame={bota_kin.frame_name} "
             f"gravity_comp={bool(args.bota_gravity_comp)} "
             f"filter_cutoff={float(args.bota_filter_cutoff):.2f}Hz "
-            f"filter_alpha={float(args.bota_filter_alpha):.3f}"
+            f"filter_alpha={float(args.bota_filter_alpha):.3f} "
+            f"calibrated={bool(args.bota_wrench_calibration_enable)} "
+            f"axis_map={_parse_float_list(args.bota_base_axis_map)} "
+            f"axis_signs={_parse_float_list(args.bota_base_axis_signs)}"
         )
 
     print(f"[ADMITTANCE] position mode observer={observer_mode} source={admittance_source}")
@@ -2344,7 +2471,9 @@ def _run_leader_admittance_position_mode(
                     bota_wrench_raw, bota_status, bota_timestamp_us, _, _, bota_is_new = bota_reader.read_latest()
                     pos_ref, rot_ref, jacobian_6d = bota_kin.pose_and_jacobian(q_ref)
                     pos_current, rot_current, _ = bota_kin.pose_and_jacobian(q)
-                    r_base_sensor = rot_current if admittance_source == "bota_se3" else rot_ref
+                    # The BOTA wrench is measured in the physical sensor frame, so
+                    # transform it with the current sensor pose for every admittance variant.
+                    r_base_sensor = rot_current
                     bota_wrench_base, bota_wrench_conditioned = bota_conditioner.update(
                         bota_wrench_raw,
                         r_base_sensor,
@@ -3197,6 +3326,10 @@ def main() -> int:
             "bota_payload_mass": float(args.bota_payload_mass),
             "bota_payload_com": _parse_float_list(args.bota_payload_com),
             "bota_gravity_sign": float(args.bota_gravity_sign),
+            "bota_wrench_calibration_enable": bool(args.bota_wrench_calibration_enable),
+            "bota_wrench_calibration": str(args.bota_wrench_calibration),
+            "bota_base_axis_map": _parse_float_list(args.bota_base_axis_map),
+            "bota_base_axis_signs": _parse_float_list(args.bota_base_axis_signs),
             "bota_frame": str(args.bota_frame),
             "bota_axis_mask": _parse_float_list(args.bota_axis_mask),
             "bota_cart_mass": _parse_float_list(args.bota_cart_mass),

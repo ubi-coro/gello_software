@@ -340,6 +340,17 @@ def _apply_axis_correction(wrench_base: np.ndarray, axis_map: np.ndarray, axis_s
     return np.asarray(axis_signs, dtype=float).reshape(6) * wrench[np.asarray(axis_map, dtype=int).reshape(6)]
 
 
+def _axis_corrected_labels(axis_map: np.ndarray, axis_signs: np.ndarray) -> tuple[tuple[str, str, str], tuple[str, str, str]]:
+    source_labels = ("Fx_base", "Fy_base", "Fz_base", "Tx_base", "Ty_base", "Tz_base")
+    mapped = np.asarray(axis_map, dtype=int).reshape(6)
+    signs = np.asarray(axis_signs, dtype=float).reshape(6)
+    labels = []
+    for src_idx, sign in zip(mapped, signs):
+        prefix = "-" if sign < 0 else ""
+        labels.append(f"{prefix}{source_labels[int(src_idx)]}")
+    return tuple(labels[:3]), tuple(labels[3:])
+
+
 def _condition_wrench(wrench: np.ndarray, deadband: np.ndarray, saturation: np.ndarray) -> np.ndarray:
     arr = np.asarray(wrench, dtype=float).reshape(6)
     db = np.asarray(deadband, dtype=float).reshape(6)
@@ -654,7 +665,12 @@ def _filtered_sample(
 
 
 class LiveWrenchPlot:
-    def __init__(self, buffer_seconds: float) -> None:
+    def __init__(
+        self,
+        buffer_seconds: float,
+        force_labels: tuple[str, str, str] = ("Fx", "Fy", "Fz"),
+        torque_labels: tuple[str, str, str] = ("Tx", "Ty", "Tz"),
+    ) -> None:
         import matplotlib.pyplot as plt
 
         self._plt = plt
@@ -664,10 +680,10 @@ class LiveWrenchPlot:
         )
         self._fig.canvas.manager.set_window_title("BotaSys MiniOne wrench")
         self._force_lines = tuple(
-            self._force_ax.plot([], [], label=label)[0] for label in ("Fx", "Fy", "Fz")
+            self._force_ax.plot([], [], label=label)[0] for label in force_labels
         )
         self._torque_lines = tuple(
-            self._torque_ax.plot([], [], label=label)[0] for label in ("Tx", "Ty", "Tz")
+            self._torque_ax.plot([], [], label=label)[0] for label in torque_labels
         )
         self._force_ax.set_ylabel("Force [N]")
         self._torque_ax.set_ylabel("Torque [Nm]")
@@ -814,10 +830,17 @@ def main() -> int:
     if str(args.compensation_mode) == "calibrated":
         wrench_calibration = _load_wrench_calibration(args.wrench_calibration)
 
+    if str(args.compensation_mode) == "raw":
+        force_labels = ("Fx_sensor", "Fy_sensor", "Fz_sensor")
+        torque_labels = ("Tx_sensor", "Ty_sensor", "Tz_sensor")
+    else:
+        force_labels, torque_labels = _axis_corrected_labels(base_axis_map, base_axis_signs)
+
     plot = None
     if not args.no_plot:
         try:
-            plot = LiveWrenchPlot(args.buffer_seconds)
+            plot = LiveWrenchPlot(args.buffer_seconds, force_labels, torque_labels)
+            print(f"[PLOT] force labels={list(force_labels)} torque labels={list(torque_labels)}")
         except Exception as exc:
             print(f"Live plot disabled: {exc}", file=sys.stderr)
 

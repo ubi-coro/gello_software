@@ -614,6 +614,7 @@ def _run_recording_loop_phase_b(
     corr_steps = 0
     cache_lock = state_cache["lock"]
     last_frame_start: float | None = None
+    last_obs_snap_write_t = -float("inf")
 
     while True:
         frame_start = time.perf_counter()
@@ -773,16 +774,21 @@ def _run_recording_loop_phase_b(
             obs_image = next(iter(images.values())) if len(images) > 0 else None
 
         if obs_snap is not None:
-            obs_snap.write(
-                timestamp=t_mono,
-                q=q_follower,
-                dq=dq_follower,
-                grip=gripper_follower,
-                tau_ext=tau_ext,
-                wrench=wrench_ur5e,
-                image=obs_image,
-                images=images,
-            )
+            timing_for_obs = diag.get("timing", {}) if isinstance(diag, dict) else {}
+            phase_b_target_dt_s = float(timing_for_obs.get("phase_b_target_dt_s", 1.0 / 300.0))
+            obs_write_interval_s = max(0.0, int(args.obs_decimation) * phase_b_target_dt_s)
+            if t_mono - last_obs_snap_write_t >= obs_write_interval_s - 1e-9:
+                obs_snap.write(
+                    timestamp=t_mono,
+                    q=q_follower,
+                    dq=dq_follower,
+                    grip=gripper_follower,
+                    tau_ext=tau_ext,
+                    wrench=wrench_ur5e,
+                    image=obs_image,
+                    images=images,
+                )
+                last_obs_snap_write_t = t_mono
 
         if npz_recorder is not None:
             npz_recorder.record(
@@ -1113,10 +1119,10 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--amplitude", type=float, default=0.05)
     p.add_argument("--frequency", type=float, default=0.15)
-    p.add_argument("--horizon", type=int, default=32)
-    p.add_argument("--action-dt", type=float, default=0.1)
-    p.add_argument("--min-votes", type=int, default=2)
-    p.add_argument("--obs-decimation", type=int, default=33)
+    p.add_argument("--horizon", type=int, default=None)
+    p.add_argument("--action-dt", type=float, default=None)
+    p.add_argument("--min-votes", type=int, default=None)
+    p.add_argument("--obs-decimation", type=int, default=None)
 
     # ── Foot pedal ────────────────────────────────────────────────────────
     p.add_argument(
@@ -1166,6 +1172,18 @@ def main() -> int:
         defaults_path = (REPO_ROOT / defaults_path).resolve()
     defaults_cfg = _load_default_config(defaults_path)
     phase_b_cfg = defaults_cfg.get("phase_b", {}) if isinstance(defaults_cfg.get("phase_b", {}), dict) else {}
+    policy_defaults = defaults_cfg.get("policy", {}) if isinstance(defaults_cfg.get("policy", {}), dict) else {}
+    ipc_defaults = defaults_cfg.get("ipc", {}) if isinstance(defaults_cfg.get("ipc", {}), dict) else {}
+    intervention_defaults = defaults_cfg.get("intervention", {}) if isinstance(defaults_cfg.get("intervention", {}), dict) else {}
+
+    if args.horizon is None:
+        args.horizon = int(policy_defaults.get("horizon", 32))
+    if args.action_dt is None:
+        args.action_dt = float(policy_defaults.get("action_dt", 0.1))
+    if args.obs_decimation is None:
+        args.obs_decimation = int(ipc_defaults.get("obs_write_decimation", 33))
+    if args.min_votes is None:
+        args.min_votes = int(intervention_defaults.get("min_votes", 2))
 
     if str(args.policy_type) in ("lerobot_act", "act") and not args.policy_path:
         print("[ERROR] --policy-path is required for --policy-type lerobot_act/act")
@@ -1556,6 +1574,11 @@ def main() -> int:
         print(
             f"[DATASET] control_hz={control_hz:.1f}, dataset_fps={dataset_fps}, "
             f"record_interval={record_interval:.6f}s"
+        )
+        print(
+            f"[POLICY] action_dt={float(args.action_dt):.3f}s "
+            f"target_hz={1.0 / max(float(args.action_dt), 1e-9):.1f}, "
+            f"horizon={int(args.horizon)}, obs_decimation={int(args.obs_decimation)}"
         )
 
         if args.interventions:
