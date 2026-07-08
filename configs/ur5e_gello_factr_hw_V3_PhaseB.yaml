@@ -1,7 +1,10 @@
+# Phase B hardware config: CR-DAgger intervention collection.
+# Used by gello/cr_dagger/scripts/run_cr_dagger_collection.py --interventions.
+# Keep all angles in radians.
 name: grav_comp_hw
 
 dynamixel:
-  # USB port name given by the command: ls /dev/serial/by-id/
+  # GELLO Dynamixel bus. On Linux this should be a stable udev alias.
   dynamixel_port: /dev/ttyDXL_gello
   baudrate: 4000000
   # EMA alpha for Dynamixel Present Velocity before control code sees dq.
@@ -17,24 +20,31 @@ dynamixel:
   torque_signs: [1, 1, 1, 1, 1, 1, 1]
 
 arm_teleop:
-  # URDF used for creating leader arm dynamics model to compute gravity compensation
+  # Leader dynamics model for GELLO gravity compensation, BOTA frame kinematics
+  # and Phase-B task-space admittance. This Phase-B config must use the
+  # sensorFrame URDF because cr_dagger_defaults.yaml selects bota_sensor_frame.
   leader_urdf: "gello/factr/urdf/gello_urdf_minione_sensorFrame/robot.urdf"
   num_arm_joints: 6
   arm_joint_limits_max: [6.28318, 3.14159, 7.0, 4.53786, 6.28318, 2.0]
   arm_joint_limits_min: [3.14159, -1.571, 3.4, 0.0, 3.14159, -1.0]
   arm_joint_limits_safety_margin: 0.1
   initialization:
-    # These are your start positions (URDF coordinates) - offsets will be auto-calculated
-    # Target decoded leader pose matching UR reference posture [0, -90, +90, -90, -90, +180] deg
+    # Mandatory startup pose in decoded GELLO/URDF coordinates.
+    # Hold the leader and UR5e in this pose before starting. This is the
+    # reference used by per-boot turn disambiguation and by safe follower handoff.
+    # Target decoded leader pose matching UR reference posture [0, -90, +90, -90, -90, +180] deg.
+    # The last wrist joint can sit slightly above or below 0 rad in this pose;
+    # that is expected and is handled by turn_disambiguation.
     calibration_joint_pos: [ 4.7, 3.14159, 1.57, 0.0, 1.57, -0.03 ]
     initial_match_joint_pos: [ 4.7, 3.14159, 1.57, 0.0, 1.57, -0.03 ]
-    # Optional persistent leader offsets (raw -> decoded): q = sign * (raw - offset)
-    # Measured with scripts/gello_get_offset.py (median over multiple runs)
+    # Permanent leader offsets (raw -> decoded): q = sign * (raw - offset).
+    # If the physical build changes, recompute/verify with scripts/turn_disambiguation.py
+    # or scripts/gello_get_offset.py before commanding the UR5e.
     joint_offsets: [-0.0398, -0.0766, 0.0776, -0.0260, -0.1260, 3.1163]
     # If true, use joint_offsets above instead of running per-start offset search.
     use_precomputed_offsets: true
-    # Per-boot turn-index disambiguation on top of permanent offsets (recommended for reproducibility).
-    # Disable to fall back to previous behavior that applies precomputed offsets as-is.
+    # Per-boot integer-turn correction on top of permanent offsets.
+    # Keep enabled: this prevents 2*pi branch mistakes between leader and follower.
     turn_disambiguation:
       enable: true
     # Set true to block until user manually moves to initial_match_joint_pos
@@ -63,6 +73,9 @@ controller:
     kd: 0.01           # Velocity error damping (Nm*s/rad)
     max_torque: 1.5   # Safety limit per joint (Nm)
   gravity_comp:
+    # Phase B needs high leader gravity compensation for stable policy tracking.
+    # Tune gravcomp stability first, then impedance. Weak gravcomp plus high Kp
+    # can oscillate.
     enable: True
     gain: 0.7
     gain_per_joint: [0.5, 0.8, 1.0, 1.2, 2.0, 2.0]
@@ -115,6 +128,8 @@ controller:
     max_torque: 0.2
 
 teleop:
+  # Direct RTDE path to the UR5e. In Phase B the active command path is
+  # q_cmd_ur5e = q_ref_policy + delta_human; GELLO mirrors the command.
   enable: true
   use_direct_rtde: true
   hz: 250
@@ -146,17 +161,21 @@ teleop:
     filter_min_cutoff: 1.5  # Lower = more stable when still (anti-jitter)
     filter_beta: 0.05      # Higher = less lag when moving
   mapping:
-    # Map leader joints to follower joints
+    # Map decoded leader joints to UR5e follower joints:
+    # q_follower = signs * q_leader[index_map] + offsets.
     index_map: [0, 1, 2, 3, 4, 5]
     # Signs to align sim/hardware with leader frames
     signs: [1, 1, -1, 1, 1, 1]
-    # Additional offsets (radians) applied to follower after signs
+    # Permanent leader->follower alignment offsets. Treat as calibrated data.
+    # Do not "fix" startup mismatch by enabling legacy auto_align; run
+    # scripts/turn_disambiguation.py read --config <this file> instead.
     offsets: [-4.7162, -4.7196, 3.2220, -1.6382, -3.1613, 3.1194]
     # Alignment mode at startup:
     # - legacy_auto_align: old behavior (offsets = follower - mapped leader)
     # - turn_disambiguate: preserve configured offsets and only correct by integer 2pi turns
     alignment_mode: turn_disambiguate
     # Keep integer-turn correction active even if auto_align is false.
+    # This preserves calibrated offsets and only adjusts by exact 2*pi turns.
     turn_disambiguate_offsets: true
     # Build follower targets with nearest-turn continuity to avoid command jumps.
     turn_safe_targets: true
